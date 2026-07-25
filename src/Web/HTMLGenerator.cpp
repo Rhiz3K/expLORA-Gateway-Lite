@@ -135,7 +135,8 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     html += "</head><body>";
     html += "<header><h1>expLORA Gateway Lite</h1><h2>" + escapeHtml(title) + "</h2></header>";
 
-    // Navigation: full in STA, minimal in AP (Config + Reboot)
+    // Recovery AP keeps the authenticated security and signed-OTA controls
+    // available, so a broken STA configuration can still be repaired safely.
     if (!isAPMode)
     {
         addNavigation(html, title);
@@ -144,6 +145,8 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     {
         html += "<nav>";
         html += "<a href='/config' class='" + String(title == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
+        html += "<a href='/firmware' class='" + String(title == "Firmware" ? "active" : "") + "'>Firmware</a>";
+        html += "<a href='/security' class='" + String(title == "Security" ? "active" : "") + "'>Security</a>";
         html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
         html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
         html += "</nav>";
@@ -190,25 +193,32 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "      .then(function(res){";
     html += "        if(!res.ok){ throw new Error((res.data && (res.data.error||res.data.message)) || ('HTTP '+res.status)); }";
     html += "        var d=res.data; if(!d){ throw new Error('Bad JSON: '+res.raw); }";
-    html += "        if(d.version && d.version !== '" + String(FIRMWARE_VERSION) + "'){";
+    html += "        if(d.installable){";
     html += "          if(confirm('New version '+d.version+' available. Update now?')){";
-    html += "            window.updateFirmware(d.url,d.sha256||'');";
+    html += "            window.updateFirmware(d.url,d.version,d.sha256,d.signature);";
     html += "          }";
     html += "        } else {";
-    html += "          alert('You have the latest version: " + String(FIRMWARE_VERSION) + "');";
+    html += "          alert(d.reason||'No trusted update is available.');";
     html += "        }";
     html += "      })";
     html += "      .catch(function(err){ alert('Update check failed: '+err.message); });";
     html += "  };";
 
-    html += "  window.updateFirmware = function(url,sha256){";
+    html += "  window.pollFirmwareStatus = function(){";
+    html += "    fetch('/firmware/status').then(function(r){return r.json();}).then(function(d){";
+    html += "      window.showNotice((d.message||d.status)+(typeof d.progress==='number'?' ('+d.progress+'%)':''));";
+    html += "      if(d.inProgress){setTimeout(window.pollFirmwareStatus,1500);}else if(d.status==='failed'){var b=document.getElementById('btnUpdate');if(b)b.disabled=false;}";
+    html += "      else if(d.status==='rebooting'){setTimeout(function(){location.reload();},8000);}";
+    html += "    }).catch(function(){setTimeout(window.pollFirmwareStatus,2500);});";
+    html += "  };";
+
+    html += "  window.updateFirmware = function(url,version,sha256,signature){";
     html += "    var btn=document.getElementById('btnUpdate'); if(btn) btn.disabled=true;";
-    html += "    window.showNotice('Firmware update started. Please wait ~2 minutes. Do not power off.');";
-    html += "    if (typeof startAutoRefresh==='function') { startAutoRefresh(120000); } else { setTimeout(function(){ location.reload(); },120000); }";
+    html += "    window.showNotice('Starting signed firmware update. Do not power off.');";
     html += "    fetch('/firmware/update',{";
     html += "      method:'POST',";
     html += "      headers:{'Content-Type':'application/x-www-form-urlencoded'},";
-    html += "      body:'url='+encodeURIComponent(url)+(sha256?'&sha256='+encodeURIComponent(sha256):'')";
+    html += "      body:'url='+encodeURIComponent(url)+'&version='+encodeURIComponent(version)+'&sha256='+encodeURIComponent(sha256)+'&signature='+encodeURIComponent(signature)";
     html += "    })";
     html += "    .then(function(response){";
     html += "      return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
@@ -216,10 +226,11 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "    .then(function(res){";
     html += "      if(!res.ok){ throw new Error((res.data && (res.data.error||res.data.message)) || ('HTTP '+res.status)); }";
     html += "      if(res.data && res.data.message){ window.showNotice(res.data.message); }";
+    html += "      setTimeout(window.pollFirmwareStatus,500);";
     html += "    })";
     html += "    .catch(function(err){";
     html += "      console.error('Firmware update error:', err);";
-    html += "      window.showNotice('Update request sent. Device may already be updating. If nothing happens, retry. Error: '+err.message);";
+    html += "      window.showNotice('Update was not started: '+err.message);";
     html += "    })";
     html += "    .finally(function(){ if(btn) btn.disabled=false; });";
     html += "  };";
@@ -334,6 +345,7 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
     html += "<a href='/sensors' class='" + String(activePage == "Sensors" ? "active" : "") + "'>Sensors</a>";
     html += "<a href='/mqtt' class='" + String(activePage == "MQTT" ? "active" : "") + "'>MQTT</a>";
     html += "<a href='/firmware' class='" + String(activePage == "Firmware" ? "active" : "") + "'>Firmware</a>";
+    html += "<a href='/security' class='" + String(activePage == "Security" ? "active" : "") + "'>Security</a>";
     html += "<a href='/logs' class='" + String(activePage == "Logs" ? "active" : "") + "'>Logs</a>";
     html += "<a href='/api' class='" + String(activePage == "API" ? "active" : "") + "'>API</a>";
     html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
@@ -791,27 +803,31 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
 
 String HTMLGenerator::generateFirmwarePage() {
     String html;
-    html.reserve(4096);
-    addHtmlHeader(html, "Firmware");
+    html.reserve(6144);
+    const bool apMode = WiFi.status() != WL_CONNECTED;
+    addHtmlHeader(html, "Firmware", apMode);
 
     // card: Online update
     html += "<div class='card'>";
     html += "<h2>Online Update</h2>";
     html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong></p>";
     html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn'>Check for update</button></p>";
-    html += "<hr>";
-    html += "<label for='fwUrl'>Official firmware URL:</label>";
-    html += "<input type='text' id='fwUrl' placeholder='https://pajenicko.cz/webflash/explora-gw-lite/firmware.bin'>";
-    html += "<p><small>Only HTTPS URLs under the official pajenicko.cz firmware directory are accepted.</small></p>";
-    html += "<button class='btn' onclick='(function(){var u=document.getElementById(\"fwUrl\").value.trim(); if(u){ updateFirmware(u); } else { alert(\"Enter firmware URL first\"); }})()'>Update from URL</button>";
+    html += "<p><small>The gateway accepts only a newer release from the official HTTPS origin with a valid expLORA firmware signature.</small></p>";
     html += "</div>";
 
-    // Card: Manual upload (.bin)
+    // Card: Manual upload (.bin plus detached metadata signature)
     html += "<div class='card'>";
-    html += "<h2>Manual Upload (.bin)</h2>";
+    html += "<h2>Manual Signed Upload</h2>";
     html += "<form id='uploadForm' enctype='multipart/form-data'>";
+    html += "  <label for='fwVersion'>Firmware version:</label>";
+    html += "  <input type='text' id='fwVersion' placeholder='1.2.0' pattern='[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.-]+)?' required>";
+    html += "  <label for='fwFile'>Firmware image (.bin):</label>";
     html += "  <input type='file' name='bin' id='fwFile' accept='.bin,application/octet-stream' required>";
-    html += "  <p><small>Do not power off the device during upload and install.</small></p>";
+    html += "  <label for='fwSignature'>Detached metadata signature (.sig):</label>";
+    html += "  <input type='file' id='fwSignature' accept='.sig,text/plain' required>";
+    html += "  <label for='fwDigest'>Image digest (.sha256):</label>";
+    html += "  <input type='file' id='fwDigest' accept='.sha256,text/plain' required>";
+    html += "  <p><small>Use the .sig and .sha256 files produced together by the release signer.</small></p>";
     html += "  <button type='submit' id='btnUpload' class='btn'>Upload & Install</button>";
     html += "</form>";
     html += "</div>";
@@ -824,21 +840,29 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "  if(f){";
     html += "    f.addEventListener('submit', function(ev){";
     html += "      ev.preventDefault();";
-    html += "      if(!document.getElementById('fwFile').files.length){ alert('Select .bin file first'); return; }";
+    html += "      var image=document.getElementById('fwFile').files[0];";
+    html += "      var sigFile=document.getElementById('fwSignature').files[0];";
+    html += "      var digestFile=document.getElementById('fwDigest').files[0];";
+    html += "      var version=document.getElementById('fwVersion').value.trim();";
+    html += "      if(!image||!sigFile||!digestFile||!version){ alert('Select the .bin, .sig, and .sha256 files, then enter the signed version'); return; }";
     html += "      if(b) b.disabled=true;";
-    html += "      if(window.showNotice){ window.showNotice('Uploading firmware… Please wait ~2 minutes. Do not power off.'); }";
-    html += "      if (typeof startAutoRefresh==='function') { startAutoRefresh(120000); } else { setTimeout(function(){ location.reload(); },120000); }";
-    html += "      var fd=new FormData(f);";
-    html += "      fetch('/firmware',{ method:'POST', body:fd })";
+    html += "      if(window.showNotice){ window.showNotice('Reading signed metadata…'); }";
+    html += "      Promise.all([sigFile.text(),digestFile.text()]).then(function(parts){";
+    html += "        var signature=parts[0].trim();var sha=parts[1].trim().toLowerCase();";
+    html += "        if(!/^[0-9a-f]{64}$/.test(sha)){throw new Error('Invalid .sha256 file');}";
+    html += "        var fd=new FormData();fd.append('bin',image,image.name);";
+    html += "        if(window.showNotice){window.showNotice('Uploading signed firmware… Do not power off.');}";
+    html += "        return fetch('/firmware',{method:'POST',headers:{'X-Firmware-Version':version,'X-Firmware-SHA256':sha,'X-Firmware-Signature':signature},body:fd});";
+    html += "      })";
     html += "        .then(function(resp){ return resp.text().then(function(t){ return {ok:resp.ok,status:resp.status,data:parseJsonSafe(t),raw:t}; }); })";
     html += "        .then(function(res){";
     html += "          if(!res.ok){ throw new Error((res.data&&(res.data.error||res.data.message))||('HTTP '+res.status)); }";
-    html += "          var msg=(res.data&&res.data.message)?res.data.message:'Firmware uploaded. Installing… device will reboot automatically.';";
+    html += "          var msg=(res.data&&res.data.message)?res.data.message:'Signed firmware installed; device will reboot.';";
     html += "          if(window.showNotice){ window.showNotice(msg); } else { alert(msg); }";
     html += "        })";
     html += "        .catch(function(err){";
     html += "          console.error('Upload error:',err);";
-    html += "          if(window.showNotice){ window.showNotice('Upload request sent. Device may already be updating. Error: '+err.message); }";
+    html += "          if(window.showNotice){ window.showNotice('Upload failed: '+err.message); }";
     html += "          else { alert('Upload failed: '+err.message); }";
     html += "        })";
     html += "        .finally(function(){ if(b) b.disabled=false; });";
@@ -847,7 +871,56 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "})();";
     html += "</script>";
 
-    addHtmlFooter(html);
+    addHtmlFooter(html, apMode);
+    return html;
+}
+
+String HTMLGenerator::generateSecurityPage(const String &apName)
+{
+    String html;
+    html.reserve(4096);
+    addHtmlHeader(html, "Security", WiFi.status() != WL_CONNECTED);
+
+    html += "<div class='card'>";
+    html += "<h2>Device access</h2>";
+    html += "<p>The recovery access point <strong>" + escapeHtml(apName) +
+            "</strong> and the web administrator use separate per-device credentials.</p>";
+    html += "<p>Rotated credentials are displayed exactly once. Save them before leaving this page.</p>";
+    html += "</div>";
+
+    html += "<div class='card'><h2>Administrator credential</h2>";
+    html += "<p>Used with username <strong>" + String(HTTP_ADMIN_USERNAME) +
+            "</strong> for every management and firmware endpoint.</p>";
+    html += "<button class='btn rotateCredential' data-kind='admin'>Rotate administrator credential</button></div>";
+
+    html += "<div class='card'><h2>Recovery AP credential</h2>";
+    html += "<p>Used only for WPA2 access to <strong>" + escapeHtml(apName) + "</strong>.</p>";
+    html += "<p>Rotating it reboots the gateway so the AP can restart with the new credential.</p>";
+    html += "<button class='btn rotateCredential' data-kind='ap'>Rotate recovery AP credential</button></div>";
+
+    html += "<div id='credentialResult' class='card' style='display:none'>";
+    html += "<h2>New credential — save it now</h2>";
+    html += "<p><code id='newCredential' style='font-size:1.15em;word-break:break-all'></code></p>";
+    html += "<p id='credentialNote'></p></div>";
+
+    html += "<script>(function(){";
+    html += "function parse(t){try{return JSON.parse(t);}catch(e){return null;}}";
+    html += "Array.prototype.forEach.call(document.querySelectorAll('.rotateCredential'),function(button){";
+    html += "button.addEventListener('click',function(){";
+    html += "var kind=button.getAttribute('data-kind');";
+    html += "if(!confirm('Rotate the '+kind+' credential now?'))return;";
+    html += "button.disabled=true;";
+    html += "fetch('/security/rotate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'kind='+encodeURIComponent(kind)})";
+    html += ".then(function(r){return r.text().then(function(t){return {ok:r.ok,status:r.status,data:parse(t)};});})";
+    html += ".then(function(r){if(!r.ok||!r.data)throw new Error((r.data&&r.data.error)||('HTTP '+r.status));";
+    html += "document.getElementById('newCredential').textContent=r.data.credential;";
+    html += "document.getElementById('credentialNote').textContent=r.data.rebooting?'The gateway will reboot. Reconnect using the new AP credential.':'Your current browser session may continue briefly, but future requests require the new administrator credential.';";
+    html += "document.getElementById('credentialResult').style.display='block';";
+    html += "button.disabled=false;})";
+    html += ".catch(function(e){button.disabled=false;alert('Rotation failed: '+e.message);});";
+    html += "});});})();</script>";
+
+    addHtmlFooter(html, WiFi.status() != WL_CONNECTED);
     return html;
 }
 

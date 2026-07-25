@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <limits>
 #include <string>
 
 namespace SecurityPolicy
@@ -210,10 +211,172 @@ inline bool isAllowedFirmwareUrl(const std::string &url)
     return path.size() > requiredPathPrefix.size();
 }
 
+/**
+ * The release manifest intentionally lives at a legacy flat path while
+ * firmware artifacts live below the narrower directory accepted above.
+ * Keep the policies separate so widening the manifest rule can never widen
+ * the artifact download surface.
+ */
+inline bool isAllowedManifestUrl(const std::string &url)
+{
+    static const std::string allowed =
+        "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json";
+    return !hasUnsafeUrlCharacter(url) && url.find('#') == std::string::npos &&
+           asciiLower(url) == allowed;
+}
+
+inline bool isBase64SignatureShape(const std::string &value)
+{
+    // DER-encoded ECDSA P-256 signatures are normally 70-72 bytes, or roughly
+    // 96 base64 characters. Keep a bounded envelope and leave canonical DER
+    // validation to mbedTLS.
+    if (value.size() < 80 || value.size() > 128 || value.size() % 4 != 0)
+    {
+        return false;
+    }
+
+    std::size_t padding = 0;
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        const unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (ch == '=')
+        {
+            ++padding;
+            if (i < value.size() - 2)
+            {
+                return false;
+            }
+            continue;
+        }
+        if (padding > 0 ||
+            !(std::isalnum(ch) != 0 || ch == '+' || ch == '/'))
+        {
+            return false;
+        }
+    }
+    return padding <= 2;
+}
+
+struct SemanticVersion
+{
+    unsigned long major = 0;
+    unsigned long minor = 0;
+    unsigned long patch = 0;
+    bool prerelease = false;
+    std::string prereleaseText;
+    bool valid = false;
+};
+
+inline bool parseVersionNumber(const std::string &text, std::size_t &position,
+                               unsigned long &result)
+{
+    if (position >= text.size() ||
+        std::isdigit(static_cast<unsigned char>(text[position])) == 0)
+    {
+        return false;
+    }
+
+    result = 0;
+    while (position < text.size() &&
+           std::isdigit(static_cast<unsigned char>(text[position])) != 0)
+    {
+        const unsigned long digit =
+            static_cast<unsigned long>(text[position] - '0');
+        if (result > (std::numeric_limits<unsigned long>::max() - digit) / 10UL)
+        {
+            return false;
+        }
+        result = result * 10UL + digit;
+        ++position;
+    }
+    return true;
+}
+
+inline SemanticVersion parseSemanticVersion(const std::string &text)
+{
+    SemanticVersion version;
+    std::size_t position = 0;
+    if (!parseVersionNumber(text, position, version.major) ||
+        position >= text.size() || text[position++] != '.' ||
+        !parseVersionNumber(text, position, version.minor) ||
+        position >= text.size() || text[position++] != '.' ||
+        !parseVersionNumber(text, position, version.patch))
+    {
+        return version;
+    }
+
+    if (position < text.size() && text[position] == '-')
+    {
+        ++position;
+        const std::size_t start = position;
+        while (position < text.size() && text[position] != '+')
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[position]);
+            if (!(std::isalnum(ch) != 0 || ch == '.' || ch == '-'))
+            {
+                return version;
+            }
+            ++position;
+        }
+        if (position == start)
+        {
+            return version;
+        }
+        version.prerelease = true;
+        version.prereleaseText = text.substr(start, position - start);
+    }
+
+    if (position < text.size() && text[position] == '+')
+    {
+        ++position;
+        const std::size_t start = position;
+        while (position < text.size())
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[position]);
+            if (!(std::isalnum(ch) != 0 || ch == '.' || ch == '-'))
+            {
+                return version;
+            }
+            ++position;
+        }
+        if (position == start)
+        {
+            return version;
+        }
+    }
+
+    version.valid = position == text.size();
+    return version;
+}
+
+inline bool isVersionNewer(const std::string &candidateText,
+                           const std::string &currentText)
+{
+    const SemanticVersion candidate = parseSemanticVersion(candidateText);
+    const SemanticVersion current = parseSemanticVersion(currentText);
+    if (!candidate.valid || !current.valid)
+    {
+        return false;
+    }
+
+    if (candidate.major != current.major)
+        return candidate.major > current.major;
+    if (candidate.minor != current.minor)
+        return candidate.minor > current.minor;
+    if (candidate.patch != current.patch)
+        return candidate.patch > current.patch;
+    if (candidate.prerelease != current.prerelease)
+        return current.prerelease && !candidate.prerelease;
+    if (!candidate.prerelease)
+        return false;
+    return candidate.prereleaseText > current.prereleaseText;
+}
+
 struct Authority
 {
     std::string host;
     unsigned int port = 0;
+    bool explicitPort = false;
     bool valid = false;
 };
 
@@ -272,6 +435,7 @@ inline Authority parseHttpAuthority(const std::string &rawAuthority, unsigned in
     unsigned int port = defaultPort;
     if (!portText.empty())
     {
+        result.explicitPort = true;
         unsigned int parsed = 0;
         for (const unsigned char ch : portText)
         {
@@ -315,13 +479,30 @@ inline bool isAllowedBrowserOrigin(const std::string &origin, const std::string 
     }
 
     static const std::string httpScheme = "http://";
-    if (origin.compare(0, httpScheme.size(), httpScheme) != 0 ||
-        hasUnsafeUrlCharacter(origin))
+    static const std::string httpsScheme = "https://";
+    unsigned int defaultPort = 0;
+    std::size_t schemeLength = 0;
+    if (origin.compare(0, httpScheme.size(), httpScheme) == 0)
+    {
+        defaultPort = 80;
+        schemeLength = httpScheme.size();
+    }
+    else if (origin.compare(0, httpsScheme.size(), httpsScheme) == 0)
+    {
+        defaultPort = 443;
+        schemeLength = httpsScheme.size();
+    }
+    else
     {
         return false;
     }
 
-    const std::string originAuthorityText = origin.substr(httpScheme.size());
+    if (hasUnsafeUrlCharacter(origin))
+    {
+        return false;
+    }
+
+    const std::string originAuthorityText = origin.substr(schemeLength);
     if (originAuthorityText.empty() || originAuthorityText.find('/') != std::string::npos ||
         originAuthorityText.find('?') != std::string::npos ||
         originAuthorityText.find('#') != std::string::npos)
@@ -329,8 +510,13 @@ inline bool isAllowedBrowserOrigin(const std::string &origin, const std::string 
         return false;
     }
 
-    const Authority originAuthority = parseHttpAuthority(originAuthorityText, 80);
-    const Authority requestAuthority = parseHttpAuthority(hostHeader, 80);
+    const Authority originAuthority =
+        parseHttpAuthority(originAuthorityText, defaultPort);
+    // A reverse proxy normally forwards a Host header without the default
+    // external port. Use the Origin scheme's default for that case, while an
+    // explicit Host port still has to match exactly.
+    const Authority requestAuthority =
+        parseHttpAuthority(hostHeader, defaultPort);
     return originAuthority.valid && requestAuthority.valid &&
            originAuthority.host == requestAuthority.host &&
            originAuthority.port == requestAuthority.port;

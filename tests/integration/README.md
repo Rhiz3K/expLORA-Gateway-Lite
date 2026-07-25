@@ -19,29 +19,29 @@ $EDITOR tests/integration/config.ini
 python3 tests/integration/test_gateway.py --config tests/integration/config.ini
 ```
 
-`config.ini` is gitignored — your per-device access credential, home WiFi
-password, and sensor device key never get committed.
+`config.ini` is gitignored — your separate per-device AP/admin credentials,
+home WiFi password, and sensor device key never get committed.
 
 ## What it tests
 
 | Section | Cases | What it covers |
 |---|---|---|
-| Authentication/read-only smoke | 12 | unauthenticated 401 challenge on `/config`, unauthenticated 401 challenge on `POST /firmware` upload (chunk-callback auth), plus authenticated `/firmware/version`, `/api?format=json|csv`, `/sensors`, `/config`, `/`, `/diag/heap`, `/logs`, 404 handling |
+| Authentication/read-only smoke | 15 | unauthenticated 401 challenge on `/config` and `POST /firmware`, authenticated firmware version/manifest/status, rejected bad-signature cleanup, API, UI, diagnostics, logs, and 404 handling |
 | POST validation/security | 5  | Empty SSID, short password, missing param, SSID > 32 chars, and authenticated cross-origin POST rejection |
 | Live sensor round-trip | 4 | Adds the sensor → waits up to 20 min for a real LoRa packet → checks decoded values are in physical ranges → confirms sensor appears in `/sensors` HTML |
 | Reboot recovery | 1 | authenticated `POST /reboot` → waits for device to drop off → waits up to 60 s for it to come back with the same version |
 
-22 tests total when fully configured (sensor SN set, reboot enabled).
+25 tests total when fully configured (sensor SN set, reboot enabled).
 
 ## Provisioning flow (first run, gateway with no STA config)
 
 When `[gateway].ip` is empty or unreachable, the script provisions the
 device automatically:
 
-1. Reads UART to discover the actual AP SSID (`expLORA-GW-XXXXXX`) and random
-   per-device access credential.
+1. Reads UART to discover the actual AP SSID (`expLORA-GW-XXXXXX`) and any
+   newly generated AP/admin credentials.
 2. macOS: switches WiFi via
-   `networksetup -setairportnetwork en0 <ssid> <access-credential>`
+   `networksetup -setairportnetwork en0 <ssid> <ap-credential>`
    Linux/Windows: prints `Connect to <ssid>` and waits for ENTER
 3. Authenticates as `admin` and POSTs `[wifi].ssid` + `[wifi].password` to
    `http://192.168.4.1/config`
@@ -61,8 +61,9 @@ required fields:
 
 ```ini
 [gateway]
-# Optional on first provisioning: discovered from USB serial when blank.
-access_credential =
+# Printed only when generated; persist them in this gitignored file.
+ap_credential =
+admin_credential =
 
 [wifi]
 ssid = my-home-wifi
@@ -75,9 +76,9 @@ type = 1
 ```
 
 If `[gateway].ip` is empty, the script will provision. For an already
-provisioned IP, set the credential in the gitignored config or allow the script
-to reset/read USB serial and rediscover it. If `[test_sensor].sn` is empty, the
-live-packet test is skipped.
+provisioned IP, set both credentials in the gitignored config. Existing values
+are deliberately not repeated over serial on each boot. If `[test_sensor].sn`
+is empty, the live-packet test is skipped.
 
 ## CLI overrides
 
@@ -98,7 +99,7 @@ the start of each run. Three independent toggles:
 |---|---|
 | `before_test = true` | `pio run -e <env> -t upload` — preserves LittleFS so saved WiFi config still works on reboot |
 | `+ rebuild = true`   | `pio run -e <env>` first — picks up any source edits |
-| `+ erase = true`     | `pio run -e <env> -t erase` first — wipes LittleFS and NVS, generates a new access credential, and **forces re-provisioning** |
+| `+ erase = true`     | `pio run -e <env> -t erase` first — wipes LittleFS and NVS, generates new AP/admin credentials, and **forces re-provisioning** |
 
 CLI equivalents:
 
@@ -125,7 +126,7 @@ network, no UART, no WiFi switching):
 ```bash
 python3 tests/integration/test_gateway.py \
     --url http://192.168.1.42 \
-    --access-credential '<value-read-from-USB-serial>' \
+    --admin-credential '<value-read-from-USB-serial>' \
     --test-sensor-sn 475481 \
     --test-sensor-key D43C2780
 ```
@@ -136,7 +137,7 @@ python3 tests/integration/test_gateway.py \
 |---|---|---|
 | `no serial port — set [gateway].serial_port` | Device not plugged in / wrong USB cable (charge-only) / autodetect missed it | Plug in via data cable; or set `[gateway].serial_port = /dev/cu.usbmodem...` |
 | `WiFi switched but http://192.168.4.1 unreachable` | Gateway didn't actually broadcast AP, or macOS associated with a different network | Power-cycle the gateway; check `[gateway].wifi_interface` (usually `en0`) |
-| `could not discover the per-device access credential` | Serial capture began too late or the wrong port was selected | Reset while monitoring USB at 115200 baud; copy `Access credential:` into the gitignored config |
+| `could not obtain both per-device credentials` | Serial capture began too late or credentials were already provisioned | Save `New AP credential` and `New admin credential` on first boot; otherwise rotate them in the Security page or erase NVS over USB |
 | `device rebooted but did not join home WiFi within 30 s` | Wrong WiFi password, SSID typo, or gateway out of range of router | Double-check `[wifi].ssid` + `[wifi].password` |
 | `no fresh packet from sensor … within 1200s` | Sensor offline / wrong key / out of range / too aggressive `packet_timeout` | Confirm sensor is alive (CR2032 battery), key matches gateway-side, increase `[options].packet_timeout` |
 | `networksetup` prompts for password | macOS hasn't seen this network before | Type your user password once; subsequent runs are passwordless |
@@ -147,13 +148,14 @@ python3 tests/integration/test_gateway.py \
 - **Never deletes sensors.** Adding the test sensor is idempotent — re-runs
   skip the add step. Remove the sensor manually via `/sensors` if you want
   it gone.
-- **Never flashes firmware.** The reboot test only restarts the running
-  binary; OTA flow is not exercised.
+- **Flashes only when explicitly requested.** `--flash`, `--rebuild`, or
+  `[flash].before_test` are opt-in. The normal suite never installs an image;
+  it does verify that a fake signature is rejected and the OTA lock is freed.
 
 All management requests made by the suite use HTTP Basic authentication.
 Browser-style mutations are protected by the firmware's strict Origin/Host
 check; the Python client omits `Origin`, which is the documented policy for
 direct authenticated clients. Reboot, sensor deletion, and log clear are
-POST-only. Hardware validation is still required for AP shutdown after
-timeout/late reconnect, TLS trust-chain behavior, OTA upload/rollback, and any
-future maintainer firmware-signing flow.
+POST-only. Release validation should additionally exercise WPA2/AP shutdown,
+the public CA chain, successful signed manual and URL OTA, and rollback on the
+target hardware.

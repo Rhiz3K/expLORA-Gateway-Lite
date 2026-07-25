@@ -68,17 +68,22 @@ private:
     String &timezone;
 
 
-    // Firmware upload state
-    bool otaUploadHasError = false;
-    String otaUploadErrorMsg = "";
-    size_t otaUploadExpected = 0;
-    size_t otaUploadWritten  = 0;
-    bool otaUploadRejected = false;
-
     // Single-flight OTA: only one authenticated OTA (URL update or multipart
     // upload) may be in flight at a time. Async handlers run on a worker task
     // and the global `Update`/FS state is not re-entrant.
-    volatile bool otaInProgress = false;
+    bool otaInProgress = false;
+    void *otaOwner = nullptr;
+    SemaphoreHandle_t otaStateMutex = nullptr;
+    String otaStatus = "idle";
+    String otaStatusMessage = "No firmware update is running";
+    int otaProgress = 0;
+
+    bool tryBeginOta(void *owner);
+    void finishOta(void *owner, const String &status,
+                   const String &message, int progress);
+    void setOtaStatus(const String &status, const String &message, int progress);
+    void cleanupFirmwareUpload(AsyncWebServerRequest *request, bool disconnected);
+    static void firmwareUpdateTask(void *parameter);
 
     // Bring the AP up additively without disturbing an active STA. Idempotent.
     bool ensureAPUp();
@@ -126,8 +131,11 @@ private:
     void handleAPI(AsyncWebServerRequest *request);
     void handleMqtt(AsyncWebServerRequest *request);
     void handleMqttPost(AsyncWebServerRequest *request);
+    void handleSecurity(AsyncWebServerRequest *request);
+    void handleSecurityRotate(AsyncWebServerRequest *request);
     void handleFirmwareVersion(AsyncWebServerRequest *request);
     void handleFirmwareCheck(AsyncWebServerRequest *request);
+    void handleFirmwareStatus(AsyncWebServerRequest *request);
     void handleFirmwareUpdate(AsyncWebServerRequest *request);
     void handleReboot(AsyncWebServerRequest *request);
     void handleNotFound(AsyncWebServerRequest *request);

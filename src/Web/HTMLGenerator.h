@@ -99,6 +99,9 @@ public:
     // Generate firmware update page
     static String generateFirmwarePage();
 
+    // Generate credential rotation page
+    static String generateSecurityPage(const String &apName);
+
     // Optimized versions using buffer
     static void generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors);
     static void generateLogTable(char *buffer, size_t &maxLen, const LogEntry *logs, size_t logCount);

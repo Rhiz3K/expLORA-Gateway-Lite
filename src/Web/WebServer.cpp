@@ -23,14 +23,9 @@
 #include "HTMLGenerator.h"
 #include <WiFi.h>
 #include <esp_ota_ops.h>
-#include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
-#include <HTTPClient.h>
-#include <Update.h>
-#include <WiFiClientSecure.h>
-#include <mbedtls/sha256.h>
+#include <ArduinoJson.h>
 #include "../config.h"
-#include "../Security/OtaTrust.h"
 #include "../Security/SecurityPolicy.h"
 
 // Constructor
@@ -40,6 +35,7 @@ WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &
       apRadioActive(false), wifiSSID(ssid), wifiPassword(password), configMode(config_mode),
       timezone(tz), configManager(config), mqttManager(nullptr)
 {
+    otaStateMutex = xSemaphoreCreateMutex();
 }
 
 // Add this static task function to WebPortal in WebServer.cpp
@@ -142,6 +138,10 @@ void WebPortal::setupRoutes()
     server.on("/mqtt", HTTP_GET, std::bind(&WebPortal::handleMqtt, this, std::placeholders::_1));
     server.on("/mqtt", HTTP_POST, std::bind(&WebPortal::handleMqttPost, this, std::placeholders::_1));
 
+    // Device access credentials
+    server.on("/security", HTTP_GET, std::bind(&WebPortal::handleSecurity, this, std::placeholders::_1));
+    server.on("/security/rotate", HTTP_POST, std::bind(&WebPortal::handleSecurityRotate, this, std::placeholders::_1));
+
     // API
     server.on("/api", HTTP_GET, std::bind(&WebPortal::handleAPI, this, std::placeholders::_1));
 
@@ -151,6 +151,7 @@ void WebPortal::setupRoutes()
     // Firmware update endpoints
     server.on("/firmware/version", HTTP_GET, std::bind(&WebPortal::handleFirmwareVersion, this, std::placeholders::_1));
     server.on("/firmware/check", HTTP_GET, std::bind(&WebPortal::handleFirmwareCheck, this, std::placeholders::_1));
+    server.on("/firmware/status", HTTP_GET, std::bind(&WebPortal::handleFirmwareStatus, this, std::placeholders::_1));
     server.on("/firmware/update", HTTP_POST, std::bind(&WebPortal::handleFirmwareUpdate, this, std::placeholders::_1));
     server.on("/firmware", HTTP_GET, std::bind(&WebPortal::handleFirmwarePage, this, std::placeholders::_1));
     server.on("/firmware", HTTP_POST,
@@ -173,7 +174,7 @@ void WebPortal::setupRoutes()
 bool WebPortal::isRequestAuthorized(AsyncWebServerRequest *request, bool stateChanging) const
 {
     if (!request->authenticate(HTTP_ADMIN_USERNAME,
-                               configManager.getAccessCredential().c_str()))
+                               configManager.getAdminCredential().c_str()))
     {
         return false;
     }
@@ -192,7 +193,7 @@ bool WebPortal::isRequestAuthorized(AsyncWebServerRequest *request, bool stateCh
 bool WebPortal::authorizeRequest(AsyncWebServerRequest *request, bool stateChanging)
 {
     if (!request->authenticate(HTTP_ADMIN_USERNAME,
-                               configManager.getAccessCredential().c_str()))
+                               configManager.getAdminCredential().c_str()))
     {
         request->requestAuthentication("expLORA Gateway", false);
         return false;
@@ -235,6 +236,11 @@ WebPortal::~WebPortal()
 
     // Stop DNS server
     dnsServer.stop();
+    if (otaStateMutex != nullptr)
+    {
+        vSemaphoreDelete(otaStateMutex);
+        otaStateMutex = nullptr;
+    }
 }
 
 // Process DNS requests
@@ -267,7 +273,7 @@ bool WebPortal::ensureAPUp()
     if (needsApStart)
     {
         WiFi.setTxPower(WIFI_POWER_19_5dBm);
-        const String &credential = configManager.getAccessCredential();
+        const String &credential = configManager.getApCredential();
         if (!SecurityPolicy::isAccessCredentialFormat(credential.c_str()))
         {
             logger.error("Refusing to start AP without a valid per-device credential");
@@ -1211,6 +1217,12 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     float frag = (free8 > 0) ? (1.0f - (float)largest8 / (float)free8) : 0.0f;
+    const esp_partition_t *runningPartition = esp_ota_get_running_partition();
+    esp_ota_img_states_t otaImageState = ESP_OTA_IMG_UNDEFINED;
+    if (runningPartition != nullptr)
+    {
+        esp_ota_get_state_partition(runningPartition, &otaImageState);
+    }
 
     AsyncResponseStream *res = request->beginResponseStream("application/json");
     res->print("{");
@@ -1223,9 +1235,149 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     res->print("\"psramFree\":"); res->print((unsigned long)psramFree); res->print(",");
     res->print("\"uptimeMs\":"); res->print((unsigned long)millis()); res->print(",");
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
-    res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false");
+    res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
+    res->print("\"otaImageState\":"); res->print((int)otaImageState); res->print(",");
+    res->print("\"runningPartition\":\"");
+    res->print(runningPartition != nullptr ? runningPartition->label : "unknown");
+    res->print("\"");
     res->print("}");
     request->send(res);
+}
+
+void WebPortal::handleSecurity(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: GET /security");
+    if (!authorizeRequest(request, false)) return;
+    request->send(200, "text/html", HTMLGenerator::generateSecurityPage(apName));
+}
+
+void WebPortal::handleSecurityRotate(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /security/rotate");
+    if (!authorizeRequest(request, true)) return;
+    if (!request->hasParam("kind", true))
+    {
+        request->send(400, "application/json", "{\"error\":\"Missing credential kind\"}");
+        return;
+    }
+
+    const String kind = request->getParam("kind", true)->value();
+    String credential;
+    bool ok = false;
+    if (kind == "admin")
+    {
+        ok = configManager.rotateAdminCredential(credential);
+    }
+    else if (kind == "ap")
+    {
+        ok = configManager.rotateApCredential(credential);
+    }
+    else
+    {
+        request->send(400, "application/json", "{\"error\":\"Unknown credential kind\"}");
+        return;
+    }
+
+    if (!ok)
+    {
+        request->send(500, "application/json", "{\"error\":\"Credential rotation could not be persisted\"}");
+        return;
+    }
+
+    String response = "{\"kind\":\"" + kind + "\",\"credential\":\"" +
+                      credential + "\",\"oneTimeDisplay\":true";
+    if (kind == "ap")
+    {
+        response += ",\"rebooting\":true";
+        restartAt = millis() + 3000;
+        restartRequested = true;
+    }
+    response += "}";
+    request->send(200, "application/json", response);
+}
+
+bool WebPortal::tryBeginOta(void *owner)
+{
+    if (otaStateMutex == nullptr ||
+        xSemaphoreTake(otaStateMutex, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        return false;
+    }
+    const bool available = !otaInProgress;
+    if (available)
+    {
+        otaInProgress = true;
+        otaOwner = owner;
+        otaStatus = "starting";
+        otaStatusMessage = "Firmware update is starting";
+        otaProgress = 0;
+    }
+    xSemaphoreGive(otaStateMutex);
+    return available;
+}
+
+void WebPortal::setOtaStatus(const String &status, const String &message,
+                             int progress)
+{
+    if (otaStateMutex == nullptr ||
+        xSemaphoreTake(otaStateMutex, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        return;
+    }
+    otaStatus = status;
+    otaStatusMessage = message;
+    otaProgress = constrain(progress, 0, 100);
+    xSemaphoreGive(otaStateMutex);
+}
+
+void WebPortal::finishOta(void *owner, const String &status,
+                          const String &message, int progress)
+{
+    if (otaStateMutex == nullptr ||
+        xSemaphoreTake(otaStateMutex, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        return;
+    }
+    if (otaOwner == owner)
+    {
+        otaInProgress = false;
+        otaOwner = nullptr;
+        otaStatus = status;
+        otaStatusMessage = message;
+        otaProgress = constrain(progress, 0, 100);
+    }
+    xSemaphoreGive(otaStateMutex);
+}
+
+void WebPortal::handleFirmwareStatus(AsyncWebServerRequest *request)
+{
+    if (!authorizeRequest(request, false)) return;
+
+    bool inProgress = false;
+    String status;
+    String message;
+    int progress = 0;
+    if (otaStateMutex == nullptr ||
+        xSemaphoreTake(otaStateMutex, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        request->send(503, "application/json",
+                      "{\"error\":\"Firmware status is temporarily unavailable\"}");
+        return;
+    }
+    inProgress = otaInProgress;
+    status = otaStatus;
+    message = otaStatusMessage;
+    progress = otaProgress;
+    xSemaphoreGive(otaStateMutex);
+
+    DynamicJsonDocument document(384);
+    document["status"] = status;
+    document["message"] = message;
+    document["progress"] = progress;
+    document["inProgress"] = inProgress;
+    String response;
+    serializeJson(document, response);
+    request->send(200, "application/json", response);
 }
 
 // Handle firmware version request
@@ -1233,470 +1385,7 @@ void WebPortal::handleFirmwareVersion(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /firmware/version");
     if (!authorizeRequest(request, false)) return;
-    if (guardAPOnly(request)) return;
-    
+
     String json = "{\"version\":\"" + String(FIRMWARE_VERSION) + "\"}";
     request->send(200, "application/json", json);
-}
-
-// Handle firmware check request
-void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
-{
-    logger.debug("HTTP request: GET /firmware/check");
-    if (!authorizeRequest(request, false)) return;
-    if (guardAPOnly(request)) return;
-
-    if (!SecurityPolicy::isAllowedFirmwareUrl(FIRMWARE_UPDATE_URL))
-    {
-        logger.error("Built-in firmware manifest URL violates OTA policy");
-        request->send(500, "application/json", "{\"error\":\"Invalid built-in firmware manifest URL\"}");
-        return;
-    }
-
-    WiFiClientSecure tlsClient;
-    tlsClient.setCACert(OTA_ROOT_CA);
-    HTTPClient http;
-    http.setTimeout(5000);
-    http.setReuse(false);
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    if (!http.begin(tlsClient, FIRMWARE_UPDATE_URL))
-    {
-        request->send(500, "application/json", "{\"error\":\"Firmware check TLS initialization failed\"}");
-        return;
-    }
-    http.addHeader("User-Agent", "expLORA-Gateway/" + String(FIRMWARE_VERSION));
-
-    int httpCode = http.GET();
-    String response = "";
-
-    if (httpCode == HTTP_CODE_OK)
-    {
-        response = http.getString();
-        logger.info("Firmware check successful");
-    }
-    else
-    {
-        logger.error("Firmware check failed: HTTP " + String(httpCode));
-        response = "{\"error\":\"Failed to check remote version\",\"code\":" + String(httpCode) + "}";
-    }
-
-    http.end();
-    request->send(httpCode == HTTP_CODE_OK ? 200 : 500, "application/json", response);
-}
-
-// Handle firmware update request
-void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
-{
-    logger.debug("HTTP request: POST /firmware/update");
-    if (!authorizeRequest(request, true)) return;
-    if (guardAPOnly(request)) return;
-
-    if (otaInProgress)
-    {
-        request->send(409, "application/json",
-                      "{\"error\":\"Another OTA operation is already in progress\"}");
-        return;
-    }
-    otaInProgress = true;
-
-    if (!request->hasParam("url", true))
-    {
-        request->send(400, "application/json", "{\"error\":\"Missing firmware URL\"}");
-        otaInProgress = false;
-        return;
-    }
-
-    const String firmwareUrl = request->getParam("url", true)->value();
-    if (!SecurityPolicy::isAllowedFirmwareUrl(firmwareUrl.c_str()))
-    {
-        request->send(400, "application/json", "{\"error\":\"Firmware URL is outside the official HTTPS origin\"}");
-        otaInProgress = false;
-        return;
-    }
-
-    String expectedSha256;
-    if (request->hasParam("sha256", true))
-    {
-        expectedSha256 = request->getParam("sha256", true)->value();
-        expectedSha256.trim();
-        expectedSha256.toLowerCase();
-        if (expectedSha256.length() > 0 &&
-            !SecurityPolicy::isHexString(expectedSha256.c_str(), 64))
-        {
-            request->send(400, "application/json", "{\"error\":\"Invalid SHA-256 digest\"}");
-            otaInProgress = false;
-            return;
-        }
-    }
-
-    logger.info("Starting authenticated firmware update from official origin");
-
-    WiFiClientSecure tlsClient;
-    tlsClient.setCACert(OTA_ROOT_CA);
-    HTTPClient http;
-    http.setTimeout(10000);
-    http.setReuse(false);
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    if (!http.begin(tlsClient, firmwareUrl))
-    {
-        request->send(500, "application/json", "{\"error\":\"TLS initialization failed\"}");
-        otaInProgress = false;
-        return;
-    }
-    http.addHeader("User-Agent", "explora-gw-lite/" + String(FIRMWARE_VERSION));
-
-    const int httpCode = http.GET();
-    if (httpCode != HTTP_CODE_OK)
-    {
-        logger.error("Firmware download rejected or failed: HTTP " + String(httpCode));
-        request->send(502, "application/json", "{\"error\":\"Firmware download failed; redirects are not allowed\"}");
-        http.end();
-        otaInProgress = false;
-        return;
-    }
-
-    const int contentLength = http.getSize();
-    const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
-    if (!ota)
-    {
-        request->send(500, "application/json", "{\"error\":\"No OTA partition\"}");
-        http.end();
-        otaInProgress = false;
-        return;
-    }
-    if (contentLength > 0 && static_cast<size_t>(contentLength) > ota->size)
-    {
-        logger.error("Firmware exceeds OTA partition");
-        request->send(413, "application/json", "{\"error\":\"Firmware too large for OTA slot\"}");
-        http.end();
-        otaInProgress = false;
-        return;
-    }
-
-    const size_t beginSize = contentLength > 0
-                                 ? static_cast<size_t>(contentLength)
-                                 : static_cast<size_t>(UPDATE_SIZE_UNKNOWN);
-    if (!Update.begin(beginSize))
-    {
-        logger.error("Update.begin failed: " + String(Update.getError()));
-        request->send(500, "application/json", "{\"error\":\"Update begin failed\"}");
-        http.end();
-        otaInProgress = false;
-        return;
-    }
-
-    mbedtls_sha256_context shaContext;
-    mbedtls_sha256_init(&shaContext);
-    mbedtls_sha256_starts_ret(&shaContext, 0);
-
-    WiFiClient *stream = http.getStreamPtr();
-    static const size_t bufferSize = 2048;
-    uint8_t buffer[bufferSize];
-    int remaining = contentLength;
-    size_t totalWritten = 0;
-    bool transferComplete = true;
-    uint32_t lastDataMs = millis();
-    const uint32_t noDataTimeoutMs = 15000;
-
-    while (true)
-    {
-        int available = stream->available();
-        if (available > 0)
-        {
-            if (available > static_cast<int>(bufferSize))
-            {
-                available = static_cast<int>(bufferSize);
-            }
-            const int read = stream->readBytes(reinterpret_cast<char *>(buffer), available);
-            if (read <= 0)
-            {
-                delay(1);
-                esp_task_wdt_reset();
-                continue;
-            }
-
-            if (totalWritten + static_cast<size_t>(read) > ota->size)
-            {
-                logger.error("Firmware stream exceeds OTA partition");
-                transferComplete = false;
-                break;
-            }
-
-            mbedtls_sha256_update_ret(&shaContext, buffer, static_cast<size_t>(read));
-            const size_t written = Update.write(buffer, static_cast<size_t>(read));
-            if (written != static_cast<size_t>(read))
-            {
-                logger.error("Short firmware flash write");
-                transferComplete = false;
-                break;
-            }
-
-            totalWritten += written;
-            lastDataMs = millis();
-            if (remaining > 0)
-            {
-                remaining -= read;
-            }
-            esp_task_wdt_reset();
-            delay(0);
-        }
-        else
-        {
-            delay(1);
-            esp_task_wdt_reset();
-        }
-
-        if (contentLength > 0 && remaining <= 0)
-        {
-            break;
-        }
-        if (!http.connected() && stream->available() == 0)
-        {
-            break;
-        }
-        if (millis() - lastDataMs > noDataTimeoutMs)
-        {
-            logger.error("Firmware download timed out");
-            transferComplete = false;
-            break;
-        }
-    }
-
-    uint8_t actualDigest[32];
-    mbedtls_sha256_finish_ret(&shaContext, actualDigest);
-    mbedtls_sha256_free(&shaContext);
-    http.end();
-
-    if (contentLength > 0 && totalWritten != static_cast<size_t>(contentLength))
-    {
-        transferComplete = false;
-    }
-    if (totalWritten == 0)
-    {
-        transferComplete = false;
-    }
-
-    if (transferComplete && expectedSha256.length() == 64)
-    {
-        static const char hex[] = "0123456789abcdef";
-        char actualHex[65];
-        for (size_t i = 0; i < sizeof(actualDigest); ++i)
-        {
-            actualHex[i * 2] = hex[(actualDigest[i] >> 4) & 0x0f];
-            actualHex[i * 2 + 1] = hex[actualDigest[i] & 0x0f];
-        }
-        actualHex[64] = '\0';
-        if (expectedSha256 != actualHex)
-        {
-            logger.error("Firmware SHA-256 mismatch");
-            transferComplete = false;
-        }
-        else
-        {
-            logger.info("Firmware SHA-256 verified");
-        }
-    }
-
-    if (!transferComplete)
-    {
-        Update.abort();
-        request->send(502, "application/json", "{\"error\":\"Firmware transfer or integrity verification failed\"}");
-        otaInProgress = false;
-        return;
-    }
-
-    if (!Update.end() || !Update.isFinished())
-    {
-        logger.error("Firmware image validation failed: " + String(Update.getError()));
-        request->send(500, "application/json", "{\"error\":\"Firmware image validation failed\"}");
-        otaInProgress = false;
-        return;
-    }
-
-    logger.info("OTA image installed; scheduling reboot");
-    request->send(200, "application/json",
-                  "{\"status\":\"installed\",\"message\":\"Firmware verified and installed; device will reboot.\"}");
-    restartAt = millis() + 1500;
-    restartRequested = true;
-    // The reboot is scheduled; the next OTA attempt must wait until the new
-    // image has actually booted. `otaInProgress` stays true so an early
-    // retry is rejected with 409. `setup()` clears it after a successful
-    // boot of the new image.
-}
-
-void WebPortal::handleFirmwarePage(AsyncWebServerRequest *request)
-{
-    logger.debug("HTTP request: GET /firmware");
-    if (!authorizeRequest(request, false)) return;
-    if (guardAPOnly(request)) return;
-    String html = HTMLGenerator::generateFirmwarePage();
-    request->send(200, "text/html", html);
-}
-
-// POST /firmware - completion callback (sending response)
-void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
-{
-    logger.debug("HTTP request: POST /firmware (complete)");
-    if (!authorizeRequest(request, true)) return;
-    if (guardAPOnly(request)) return;
-
-    if (otaUploadRejected)
-    {
-        otaUploadRejected = false;
-        request->send(403, "application/json", "{\"error\":\"Firmware upload authorization failed\"}");
-        return;
-    }
-
-    if (otaUploadHasError)
-    {
-        String msg = "{\"error\":\"" + otaUploadErrorMsg + "\"}";
-        request->send(500, "application/json", msg);
-        // reset state for next attempts
-        otaUploadHasError = false;
-        otaUploadErrorMsg = "";
-        otaUploadExpected = otaUploadWritten = 0;
-        otaInProgress = false;
-        return;
-    }
-
-    // Success
-    String msg = "{\"status\":\"update-started\",\"message\":\"Firmware uploaded. Installing… device will reboot automatically.\",\"bytes\":" + String(otaUploadWritten) + "}";
-    request->send(200, "application/json", msg);
-
-    restartAt = millis() + 1500;
-    restartRequested = true;
-}
-
-// Upload chunk callback
-void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
-{
-    (void)filename;
-    if (!isRequestAuthorized(request, true))
-    {
-        otaUploadRejected = true;
-        return;
-    }
-    if (guardAPOnly(request)) return;
-    if (index == 0)
-    {
-        // Upload start (first chunk). Enforce single-flight: a URL update or
-        // another upload in progress means we must not start a new OTA.
-        if (otaInProgress)
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Another OTA operation is already in progress";
-            return;
-        }
-        otaInProgress = true;
-        otaUploadRejected = false;
-        otaUploadHasError = false;
-        otaUploadErrorMsg = "";
-        otaUploadExpected = request->contentLength(); // HINT: may be inaccurate with multipart
-        otaUploadWritten = 0;
-
-        logger.info("Firmware upload started; request size hint=" +
-                    String(otaUploadExpected));
-
-        // Target OTA slot
-        const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
-        if (!ota)
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "No OTA partition";
-            otaInProgress = false;
-            return;
-        }
-
-        // If server/client specified expected size, at least verify it fits in slot
-        if (otaUploadExpected > 0 && otaUploadExpected > ota->size)
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Firmware too large for OTA slot";
-            otaInProgress = false;
-            return;
-        }
-
-        // IMPORTANT: use size UNKNOWN for multipart - otherwise risk "premature end"
-        if (!Update.begin((size_t)UPDATE_SIZE_UNKNOWN))
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Update.begin failed: " + String(Update.getError());
-            otaInProgress = false;
-            return;
-        }
-    }
-
-    if (otaUploadHasError)
-        return;
-
-    // Write chunk
-    if (len)
-    {
-        // Safety: never overwrite OTA slot size
-        const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
-        if (ota && (otaUploadWritten + len) > ota->size)
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Data exceed OTA slot size";
-            otaInProgress = false;
-            return;
-        }
-
-        size_t w = Update.write(data, len);
-        if (w != len)
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Short write: " + String(w) + "/" + String(len);
-            otaInProgress = false;
-            return;
-        }
-        otaUploadWritten += w;
-
-        // Progress log
-        if (otaUploadExpected > 0)
-        {
-            int pct = (int)((otaUploadWritten * 100ULL) / (size_t)otaUploadExpected);
-            if (pct == 1 || pct % 5 == 0 || pct >= 99)
-            {
-                logger.info("OTA progress: " + String(pct) + "% (" + String(otaUploadWritten) + " / " + String(otaUploadExpected) + " bytes)");
-            }
-        }
-        else if ((otaUploadWritten % (128 * 1024)) < len)
-        {
-            logger.info("OTA written: " + String(otaUploadWritten) + " bytes (chunked)");
-        }
-
-        // Yield + WDT
-        esp_task_wdt_reset();
-        delay(0);
-    }
-
-    if (final)
-    {
-        logger.info("Firmware upload finished: total " + String(otaUploadWritten) + " bytes");
-
-        if (otaUploadExpected > 0 && otaUploadWritten != otaUploadExpected)
-        {
-            logger.warning("Upload size hint mismatch: written=" + String(otaUploadWritten) + " expected=" + String(otaUploadExpected));
-        }
-
-        // IMPORTANT: finish multipart upload with evenIfRemaining=true
-        if (!Update.end(true))
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Update.end error: " + String(Update.getError());
-            otaInProgress = false;
-            return;
-        }
-        if (!Update.isFinished())
-        {
-            otaUploadHasError = true;
-            otaUploadErrorMsg = "Update not finished";
-            otaInProgress = false;
-            return;
-        }
-        // response will be sent by handleFirmwareUploadComplete().
-        // Keep otaInProgress = true: a successful install schedules a reboot
-        // and the new image must boot before the next OTA is allowed.
-    }
 }

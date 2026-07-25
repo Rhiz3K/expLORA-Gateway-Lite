@@ -63,9 +63,9 @@ bool ConfigManager::init()
 
     logger.debug("Preferences initialized successfully");
 
-    if (!ensureAccessCredential())
+    if (!ensureDeviceCredentials())
     {
-        logger.error("Per-device access credential unavailable; refusing insecure startup");
+        logger.error("Per-device security credentials unavailable; refusing insecure startup");
         return false;
     }
 
@@ -73,49 +73,110 @@ bool ConfigManager::init()
     return load();
 }
 
-bool ConfigManager::ensureAccessCredential()
+String ConfigManager::generateCredential() const
 {
-    static const char *key = "accessCred";
-
-    if (preferences.isKey(key))
-    {
-        accessCredential = preferences.getString(key, "");
-        if (!SecurityPolicy::isAccessCredentialFormat(accessCredential.c_str()))
-        {
-            logger.error("Stored access credential is invalid; erase or repair NVS over USB");
-            accessCredential = "";
-            return false;
-        }
-        return true;
-    }
-
-    accessCredential.reserve(SecurityPolicy::ACCESS_CREDENTIAL_LENGTH);
-    const size_t alphabetSize = sizeof(SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET) - 1;
+    String credential;
+    credential.reserve(SecurityPolicy::ACCESS_CREDENTIAL_LENGTH);
+    const size_t alphabetSize =
+        sizeof(SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET) - 1;
     static_assert((alphabetSize & (alphabetSize - 1)) == 0,
                   "Credential alphabet must be a power of two");
     for (size_t i = 0; i < SecurityPolicy::ACCESS_CREDENTIAL_LENGTH; ++i)
     {
-        accessCredential +=
-            SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET[esp_random() & (alphabetSize - 1)];
+        credential += SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET[
+            esp_random() & (alphabetSize - 1)];
+    }
+    return credential;
+}
+
+bool ConfigManager::persistCredential(const char *key,
+                                      const String &credential)
+{
+    if (!SecurityPolicy::isAccessCredentialFormat(credential.c_str()) ||
+        preferences.putString(key, credential) == 0)
+    {
+        return false;
+    }
+    return preferences.getString(key, "") == credential;
+}
+
+bool ConfigManager::ensureDeviceCredentials()
+{
+    static const char *adminKey = "adminCred";
+    static const char *apKey = "apCred";
+    static const char *legacyKey = "accessCred";
+
+    adminCredentialGeneratedThisBoot = false;
+    apCredentialGeneratedThisBoot = false;
+
+    if (preferences.isKey(adminKey))
+    {
+        adminCredential = preferences.getString(adminKey, "");
+    }
+    else if (preferences.isKey(legacyKey))
+    {
+        // Preserve the already-issued HTTP password during migration. A new,
+        // distinct AP credential is generated below.
+        adminCredential = preferences.getString(legacyKey, "");
+        if (!SecurityPolicy::isAccessCredentialFormat(adminCredential.c_str()) ||
+            !persistCredential(adminKey, adminCredential))
+        {
+            logger.error("Failed to migrate legacy administrator credential");
+            adminCredential = "";
+            return false;
+        }
+        preferences.remove(legacyKey);
+        logger.info("Migrated legacy credential to administrator-only credential");
+    }
+    else
+    {
+        adminCredential = generateCredential();
+        if (!persistCredential(adminKey, adminCredential))
+        {
+            logger.error("Failed to persist generated administrator credential");
+            adminCredential = "";
+            return false;
+        }
+        adminCredentialGeneratedThisBoot = true;
+        logger.info("Generated and persisted a new administrator credential");
     }
 
-    if (!SecurityPolicy::isAccessCredentialFormat(accessCredential.c_str()) ||
-        preferences.putString(key, accessCredential) == 0)
+    if (!SecurityPolicy::isAccessCredentialFormat(adminCredential.c_str()))
     {
-        logger.error("Failed to persist generated access credential to Preferences");
-        accessCredential = "";
+        logger.error("Stored administrator credential is invalid");
+        adminCredential = "";
         return false;
     }
 
-    const String persisted = preferences.getString(key, "");
-    if (persisted != accessCredential)
+    if (preferences.isKey(apKey))
     {
-        logger.error("Access credential failed Preferences read-back verification");
-        accessCredential = "";
+        apCredential = preferences.getString(apKey, "");
+    }
+    else
+    {
+        do
+        {
+            apCredential = generateCredential();
+        } while (apCredential == adminCredential);
+
+        if (!persistCredential(apKey, apCredential))
+        {
+            logger.error("Failed to persist generated AP credential");
+            apCredential = "";
+            return false;
+        }
+        apCredentialGeneratedThisBoot = true;
+        logger.info("Generated and persisted a distinct AP credential");
+    }
+
+    if (!SecurityPolicy::isAccessCredentialFormat(apCredential.c_str()) ||
+        apCredential == adminCredential)
+    {
+        logger.error("Stored AP credential is invalid or not distinct");
+        apCredential = "";
         return false;
     }
 
-    logger.info("Generated and persisted a new per-device access credential");
     return true;
 }
 
@@ -488,9 +549,56 @@ String ConfigManager::getDeviceName() const
     return result;
 }
 
-const String &ConfigManager::getAccessCredential() const
+const String &ConfigManager::getAdminCredential() const
 {
-    return accessCredential;
+    return adminCredential;
+}
+
+const String &ConfigManager::getApCredential() const
+{
+    return apCredential;
+}
+
+bool ConfigManager::wasAdminCredentialGeneratedThisBoot() const
+{
+    return adminCredentialGeneratedThisBoot;
+}
+
+bool ConfigManager::wasApCredentialGeneratedThisBoot() const
+{
+    return apCredentialGeneratedThisBoot;
+}
+
+bool ConfigManager::rotateAdminCredential(String &newCredential)
+{
+    do
+    {
+        newCredential = generateCredential();
+    } while (newCredential == apCredential);
+
+    if (!persistCredential("adminCred", newCredential))
+    {
+        newCredential = "";
+        return false;
+    }
+    adminCredential = newCredential;
+    return true;
+}
+
+bool ConfigManager::rotateApCredential(String &newCredential)
+{
+    do
+    {
+        newCredential = generateCredential();
+    } while (newCredential == adminCredential);
+
+    if (!persistCredential("apCred", newCredential))
+    {
+        newCredential = "";
+        return false;
+    }
+    apCredential = newCredential;
+    return true;
 }
 
 // Set WiFi configuration

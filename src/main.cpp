@@ -24,6 +24,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 
@@ -198,15 +199,28 @@ void setup()
     // Setting logging level according to configuration
     logger.setLogLevel(configManager->logLevel);
 
-    // Physical ownership/bootstrap channel. The credential is never emitted
-    // through the web interface or Logger, but is printed on USB serial at
-    // every boot so the device owner can recover access.
+    // Physical ownership/bootstrap channel. Secrets are printed only when
+    // first generated. Existing credentials can be rotated from the
+    // authenticated Security page without erasing unrelated NVS settings.
     const String uniqueSSID = makeApName();
     Serial.println("\nSecure device access");
     Serial.println("AP SSID: " + uniqueSSID);
     Serial.println("Admin username: " + String(HTTP_ADMIN_USERNAME));
-    Serial.println("Access credential: " + configManager->getAccessCredential());
-    Serial.println("Keep this credential private; it protects both WiFi AP and HTTP administration.\n");
+    if (configManager->wasApCredentialGeneratedThisBoot())
+    {
+        Serial.println("New AP credential: " + configManager->getApCredential());
+    }
+    if (configManager->wasAdminCredentialGeneratedThisBoot())
+    {
+        Serial.println("New admin credential: " +
+                       configManager->getAdminCredential());
+    }
+    if (!configManager->wasApCredentialGeneratedThisBoot() &&
+        !configManager->wasAdminCredentialGeneratedThisBoot())
+    {
+        Serial.println("Credentials already provisioned; they are not repeated on every boot.");
+    }
+    Serial.println("Keep both credentials private. Rotate them from the authenticated Security page.\n");
 
     // SPI manager initialization
     spiManager = new SPIManager(logger);
@@ -350,6 +364,26 @@ void setup()
     esp_task_wdt_init(WDT_TIMEOUT, true); // Enable panic on timeout
     esp_task_wdt_add(NULL);               // Add current task to watchdog
     logger.info("Task watchdog initialized with timeout of " + String(WDT_TIMEOUT) + " seconds");
+
+    // A freshly installed image remains rollback-eligible until all critical
+    // storage, radio, protocol, and management components initialize. Only
+    // now confirm it to the bootloader; a crash/reset before here restores the
+    // previous known-good slot.
+    const esp_partition_t *runningPartition = esp_ota_get_running_partition();
+    esp_ota_img_states_t imageState;
+    if (runningPartition != nullptr &&
+        esp_ota_get_state_partition(runningPartition, &imageState) == ESP_OK &&
+        imageState == ESP_OTA_IMG_PENDING_VERIFY)
+    {
+        if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK)
+        {
+            logger.error("Could not confirm the pending OTA image; rebooting for rollback");
+            delay(250);
+            ESP.restart();
+            return;
+        }
+        logger.info("Pending OTA image passed initialization and was confirmed");
+    }
 
     logger.info("System initialization complete");
     systemReady = true;

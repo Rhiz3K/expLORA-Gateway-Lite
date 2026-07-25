@@ -10,7 +10,7 @@ Two operating modes:
    sensor SN, gateway IP, serial port. If the gateway's IP from the config
    responds, the script jumps straight to the test phase. If not, the script
    provisions the device automatically:
-     - reads UART to discover the gateway's AP SSID and access credential
+     - reads UART to discover the gateway's AP SSID and separate AP/admin credentials
      - (macOS) switches WiFi to that AP via `networksetup`
        (non-macOS) prints instructions and waits for ENTER
      - joins the protected AP and uses HTTP Basic auth for /config
@@ -43,7 +43,9 @@ Exit codes:
 """
 
 import argparse
+import base64
 import configparser
+import hashlib
 import os
 import platform
 import queue
@@ -102,6 +104,9 @@ class Config:
     serial_baud: int = 115200
     wifi_interface: str = "en0"
     admin_username: str = "admin"
+    admin_credential: str = ""
+    ap_credential: str = ""
+    # Backward-compatible alias for pre-split private config files.
     access_credential: str = ""
     # [wifi]
     home_ssid: str = ""
@@ -140,6 +145,12 @@ def load_config(path: str) -> Config:
         cfg.wifi_interface = parser.get("gateway", "wifi_interface", fallback="en0").strip()
         cfg.admin_username = parser.get("gateway", "admin_username", fallback="admin").strip()
         cfg.access_credential = parser.get("gateway", "access_credential", fallback="").strip()
+        cfg.admin_credential = parser.get(
+            "gateway", "admin_credential", fallback=cfg.access_credential
+        ).strip()
+        cfg.ap_credential = parser.get(
+            "gateway", "ap_credential", fallback=cfg.access_credential
+        ).strip()
     if parser.has_section("wifi"):
         cfg.home_ssid     = parser.get("wifi", "ssid", fallback="").strip()
         cfg.home_password = parser.get("wifi", "password", fallback="").strip()
@@ -275,7 +286,7 @@ class SerialMonitor:
                     # credential on local USB serial. Capture it for
                     # provisioning without duplicating it into test logs.
                     display_text = re.sub(
-                        r"(Access credential:\s*)\S+",
+                        r"((?:Access credential|New AP credential|New admin credential):\s*)\S+",
                         r"\1<redacted>",
                         text,
                     )
@@ -468,7 +479,10 @@ AP_PATTERNS = (
     (r"Temporary AP started with SSID: (\S+?)[,\s]",  "main.cpp AP+STA"),
     (r"Protected AP brought up: (\S+?) @",             "WebPortal::ensureAPUp"),
 )
-ACCESS_CREDENTIAL_PATTERN = r"Access credential: ([A-HJ-NP-Z2-9]{16,63})"
+AP_CREDENTIAL_PATTERN = r"New AP credential: ([A-HJ-NP-Z2-9]{16,63})"
+ADMIN_CREDENTIAL_PATTERN = (
+    r"(?:New admin credential|Access credential): ([A-HJ-NP-Z2-9]{16,63})"
+)
 
 
 def _strip_ssid(s: str) -> str:
@@ -538,30 +552,40 @@ def discover_ap_ssid(monitor: SerialMonitor, prefix: str, timeout: float = 20) -
 def discover_bootstrap(
     monitor: SerialMonitor,
     prefix: str,
-    configured_credential: str = "",
+    configured_ap_credential: str = "",
+    configured_admin_credential: str = "",
     timeout: float = 20,
-) -> tuple[Optional[str], Optional[str]]:
-    """Discover AP SSID and the per-device credential from one boot stream.
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Discover AP SSID and the separate AP/admin credentials.
 
-    Both values are printed only on USB serial. A credential already stored in
-    the gitignored config may be reused, but it is never printed by this test.
+    New credentials are printed once on USB serial. Already provisioned values
+    must come from the gitignored config and are never printed by this test.
     """
     ssid: Optional[str] = None
-    credential: Optional[str] = configured_credential or None
+    ap_credential: Optional[str] = configured_ap_credential or None
+    admin_credential: Optional[str] = configured_admin_credential or None
     ap_regexes = [re.compile(pattern) for pattern, _ in AP_PATTERNS]
-    credential_regex = re.compile(ACCESS_CREDENTIAL_PATTERN)
+    ap_credential_regex = re.compile(AP_CREDENTIAL_PATTERN)
+    admin_credential_regex = re.compile(ADMIN_CREDENTIAL_PATTERN)
     deadline = time.time() + timeout
     info_(f"  reading serial for protected AP bootstrap data (up to {int(timeout)}s) …")
 
-    while time.time() < deadline and (ssid is None or credential is None):
+    while time.time() < deadline and (
+        ssid is None or ap_credential is None or admin_credential is None
+    ):
         line = monitor.next_line(timeout=0.5)
         if line is None:
             continue
-        if credential is None:
-            match = credential_regex.search(line)
+        if ap_credential is None:
+            match = ap_credential_regex.search(line)
             if match:
-                credential = match.group(1)
-                info_("  serial access credential discovered (value hidden)")
+                ap_credential = match.group(1)
+                info_("  serial AP credential discovered (value hidden)")
+        if admin_credential is None:
+            match = admin_credential_regex.search(line)
+            if match:
+                admin_credential = match.group(1)
+                info_("  serial admin credential discovered (value hidden)")
         if ssid is None:
             for regex in ap_regexes:
                 match = regex.search(line)
@@ -582,7 +606,7 @@ def discover_bootstrap(
         except EOFError:
             ssid = None
 
-    return ssid, credential
+    return ssid, ap_credential, admin_credential
 
 
 def _http_alive(
@@ -632,10 +656,11 @@ def provision_gateway(cfg: Config) -> str:
         # 2. Discover the gateway's AP SSID. Tries serial log first, then
         # macOS WiFi scan, then prompts the user. Refuses to continue if
         # all three fail.
-        ap_ssid, access_credential = discover_bootstrap(
+        ap_ssid, ap_credential, admin_credential = discover_bootstrap(
             monitor,
             prefix=cfg.ap_ssid_prefix,
-            configured_credential=cfg.access_credential,
+            configured_ap_credential=cfg.ap_credential,
+            configured_admin_credential=cfg.admin_credential,
             timeout=20,
         )
         if not ap_ssid:
@@ -644,23 +669,25 @@ def provision_gateway(cfg: Config) -> str:
                 "the device powered on for 30+ s after flash so its AP shows "
                 "up in macOS' WiFi list."
             )
-        if not access_credential:
+        if not ap_credential or not admin_credential:
             raise RuntimeError(
-                "could not discover the per-device access credential from USB serial; "
-                "set [gateway].access_credential in the gitignored config"
+                "could not obtain both per-device credentials; set "
+                "[gateway].ap_credential and admin_credential in the gitignored config"
             )
-        cfg.access_credential = access_credential
+        cfg.ap_credential = ap_credential
+        cfg.admin_credential = admin_credential
+        cfg.access_credential = admin_credential
         info_(f"  using AP SSID: {ap_ssid}")
 
         # 3. Switch host WiFi to the gateway AP
-        if not wifi_switch(cfg.wifi_interface, ap_ssid, access_credential):
+        if not wifi_switch(cfg.wifi_interface, ap_ssid, ap_credential):
             raise RuntimeError(f"failed to switch WiFi to {ap_ssid!r}")
 
         # 4. Confirm the AP is reachable
         if not _http_alive(
             "http://192.168.4.1/config",
             cfg.admin_username,
-            access_credential,
+            admin_credential,
         ):
             raise RuntimeError(
                 "WiFi switched but http://192.168.4.1 unreachable — is the "
@@ -681,7 +708,7 @@ def provision_gateway(cfg: Config) -> str:
                     "password": cfg.home_password,
                     "timezone": cfg.timezone,
                 },
-                auth=(cfg.admin_username, access_credential),
+                auth=(cfg.admin_username, admin_credential),
                 timeout=5,
             )
         except requests.exceptions.RequestException as e:
@@ -717,7 +744,7 @@ def provision_gateway(cfg: Config) -> str:
             if _http_alive(
                 f"http://{new_ip}/firmware/version",
                 cfg.admin_username,
-                access_credential,
+                admin_credential,
             ):
                 info_(f"  reachable at http://{new_ip}")
                 return new_ip
@@ -923,6 +950,63 @@ def t_unauthorized_firmware_upload_rejected(r: Runner) -> str:
     )
     assert_status(follow, [200])
     return "401 + Basic challenge; server still healthy"
+
+
+def t_firmware_manifest_check(r: Runner) -> str:
+    resp = r.get("/firmware/check", timeout=10)
+    assert_status(resp, [200])
+    body = resp.json()
+    for key in ("version", "currentVersion", "installable", "keyId"):
+        if key not in body:
+            raise TestFailed(f"missing {key!r} in normalized manifest response")
+    if not isinstance(body["installable"], bool):
+        raise TestFailed("manifest 'installable' is not boolean")
+    if body["installable"]:
+        for key in ("url", "sha256", "signature"):
+            if not body.get(key):
+                raise TestFailed(f"installable manifest lacks {key!r}")
+    return f"normalized, installable={body['installable']}"
+
+
+def t_firmware_status(r: Runner) -> str:
+    resp = r.get("/firmware/status")
+    assert_status(resp, [200])
+    body = resp.json()
+    for key in ("status", "message", "progress", "inProgress"):
+        if key not in body:
+            raise TestFailed(f"missing {key!r} in OTA status")
+    return f"{body['status']}, inProgress={body['inProgress']}"
+
+
+def t_invalid_signed_upload_cleans_up(r: Runner) -> str:
+    current = r.get("/firmware/version").json()["version"]
+    version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(current))
+    if not version_match:
+        raise TestFailed(f"cannot derive candidate version from {current!r}")
+    candidate = (
+        f"{version_match.group(1)}.{version_match.group(2)}."
+        f"{int(version_match.group(3)) + 1}-integration"
+    )
+    image = b"not-an-esp32-firmware-image"
+    digest = hashlib.sha256(image).hexdigest()
+    fake_signature = base64.b64encode(bytes(64)).decode("ascii")
+    files = {"bin": ("firmware.bin", image, "application/octet-stream")}
+    resp = r.session.post(
+        f"{r.base}/firmware",
+        files=files,
+        headers={
+            "X-Firmware-Version": candidate,
+            "X-Firmware-SHA256": digest,
+            "X-Firmware-Signature": fake_signature,
+        },
+        timeout=8,
+    )
+    assert_status(resp, [400])
+    status = r.get("/firmware/status").json()
+    if status.get("inProgress"):
+        raise TestFailed(f"rejected upload left OTA busy: {status}")
+    assert_status(r.get("/firmware/version"), [200])
+    return "bad signature rejected; OTA lock released"
 
 
 def t_root(r: Runner) -> str:
@@ -1268,7 +1352,17 @@ def main():
     parser.add_argument(
         "--access-credential",
         default="",
-        help="Per-device credential read from USB serial (or config: [gateway].access_credential)",
+        help="Legacy alias for --admin-credential",
+    )
+    parser.add_argument(
+        "--admin-credential",
+        default="",
+        help="HTTP admin credential (or config: [gateway].admin_credential)",
+    )
+    parser.add_argument(
+        "--ap-credential",
+        default="",
+        help="WPA2 recovery AP credential used only during provisioning",
     )
     parser.add_argument(
         "--skip-reboot",
@@ -1345,7 +1439,13 @@ def main():
         packet_timeout  = args.packet_timeout if args.packet_timeout != 1200 else cfg.packet_timeout
         skip_reboot     = args.skip_reboot or cfg.skip_reboot
         admin_username  = args.admin_username or cfg.admin_username
-        access_credential = args.access_credential or cfg.access_credential
+        if args.ap_credential:
+            cfg.ap_credential = args.ap_credential
+        access_credential = (
+            args.admin_credential
+            or args.access_credential
+            or cfg.admin_credential
+        )
     else:
         # Legacy CLI-args mode: --url is required
         if not args.url:
@@ -1358,7 +1458,7 @@ def main():
         packet_timeout = args.packet_timeout
         skip_reboot    = args.skip_reboot
         admin_username = args.admin_username or "admin"
-        access_credential = args.access_credential
+        access_credential = args.admin_credential or args.access_credential
 
     if sensor_sn and not sensor_key:
         print(f"{RED}ERROR:{RESET} sensor key required when SN is set (CLI: --test-sensor-key, config: [test_sensor].key)")
@@ -1401,7 +1501,7 @@ def main():
                 discovered = provision_gateway(cfg)
                 url = f"http://{discovered}"
                 admin_username = cfg.admin_username
-                access_credential = cfg.access_credential
+                access_credential = cfg.admin_credential
             except Exception as e:  # noqa: BLE001
                 print(f"\n{RED}ERROR during provisioning:{RESET} {e}")
                 return 2
@@ -1412,8 +1512,8 @@ def main():
 
     if not access_credential:
         print(
-            f"{RED}ERROR:{RESET} access credential is required "
-            "(--access-credential or [gateway].access_credential)"
+            f"{RED}ERROR:{RESET} admin credential is required "
+            "(--admin-credential or [gateway].admin_credential)"
         )
         return 2
 
@@ -1435,6 +1535,12 @@ def main():
         return 2
 
     print(f"\n{BOLD}Testing gateway at {url}  (firmware v{current_version}){RESET}")
+    try:
+        has_configured_sensor = bool(
+            r.get("/api?format=json", timeout=3).json().get("sensors", [])
+        )
+    except Exception:
+        has_configured_sensor = bool(sensor_sn)
 
     # ----------------------------------------------- Phase 1: setup (mutates)
     # Adding the sensor first means downstream smoke tests see the table
@@ -1454,9 +1560,12 @@ def main():
     r.run("unauthenticated management request → 401", lambda: t_unauthorized_management_is_rejected(r))
     r.run("unauthenticated firmware upload → 401", lambda: t_unauthorized_firmware_upload_rejected(r))
     r.run("firmware version JSON", lambda: t_firmware_version(r))
+    r.run("firmware manifest policy", lambda: t_firmware_manifest_check(r))
+    r.run("firmware status JSON", lambda: t_firmware_status(r))
+    r.run("invalid signed upload cleanup", lambda: t_invalid_signed_upload_cleans_up(r))
     r.run("/api?format=json shape", lambda: t_api_json(r))
     r.run("/api?format=csv basics", lambda: t_api_csv(r))
-    if sensor_sn:
+    if has_configured_sensor:
         r.run("/sensors page (has health columns)", lambda: t_sensors_page_with_columns(r))
     else:
         r.run("/sensors page (empty state)", lambda: t_sensors_page_empty(r))

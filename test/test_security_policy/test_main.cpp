@@ -61,6 +61,33 @@ static void test_official_firmware_urls_are_allowed(void)
         "https://PAJENICKO.CZ:443/webflash/explora-gw-lite/release.bin?channel=stable"));
 }
 
+static void test_manifest_url_has_separate_exact_policy(void)
+{
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedManifestUrl(
+        "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedManifestUrl(
+        "https://PAJENICKO.CZ/webflash/explora-gw-lite-autoupdate.json"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedManifestUrl(
+        "https://pajenicko.cz/webflash/explora-gw-lite/firmware.bin"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedManifestUrl(
+        "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json?channel=dev"));
+}
+
+static void test_signature_shape_and_version_ordering(void)
+{
+    TEST_ASSERT_TRUE(SecurityPolicy::isBase64SignatureShape(
+        "MEUCIQDRrCbHUPE4lALWkZ16f0X1M4r0wKszGmrYcPiXxQIgQpM+utN4U1X1hMK2sYd5s7VY0P6V0D0s0vF6Xw=="));
+    TEST_ASSERT_FALSE(SecurityPolicy::isBase64SignatureShape("unsigned"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isBase64SignatureShape(
+        "MEUCIQDRrCbHUPE4lALWkZ16f0X1M4r0wKszGmrYcPiXxQIgQpM+utN4U1X1hMK2sYd5s7VY0P6V0D0s0vF6Xw=!"));
+
+    TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer("1.1.14", "1.1.14-dev-secure"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer("1.1.15", "1.1.14"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("1.1.13", "1.1.14-dev-secure"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("1.1.14", "1.1.14"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("not-a-version", "1.1.14"));
+}
+
 static void test_firmware_url_rejects_scheme_host_userinfo_and_port_bypasses(void)
 {
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
@@ -87,17 +114,21 @@ static void test_firmware_url_rejects_deceptive_or_encoded_paths(void)
         "https://pajenicko.cz/webflash/explora-gw-lite//evil.bin"));
 }
 
-static void test_browser_origin_policy_requires_exact_http_origin(void)
+static void test_browser_origin_policy_requires_exact_origin(void)
 {
     TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin("", "192.168.4.1"));
     TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
         "http://192.168.4.1", "192.168.4.1"));
     TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
         "http://gateway.local:8080", "GATEWAY.local:8080"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
+        "https://gateway.local", "GATEWAY.local"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
+        "https://gateway.local:8443", "GATEWAY.local:8443"));
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
         "http://evil.example", "192.168.4.1"));
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
-        "https://192.168.4.1", "192.168.4.1"));
+        "https://gateway.local", "gateway.local:80"));
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
         "http://192.168.4.1.evil.example", "192.168.4.1"));
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
@@ -134,9 +165,11 @@ int main(int, char **)
     RUN_TEST(test_csv_escape_quotes_fields_and_blocks_formula_prefixes);
     RUN_TEST(test_secret_update_preserves_replaces_and_clears);
     RUN_TEST(test_official_firmware_urls_are_allowed);
+    RUN_TEST(test_manifest_url_has_separate_exact_policy);
+    RUN_TEST(test_signature_shape_and_version_ordering);
     RUN_TEST(test_firmware_url_rejects_scheme_host_userinfo_and_port_bypasses);
     RUN_TEST(test_firmware_url_rejects_deceptive_or_encoded_paths);
-    RUN_TEST(test_browser_origin_policy_requires_exact_http_origin);
+    RUN_TEST(test_browser_origin_policy_requires_exact_origin);
     RUN_TEST(test_ap_lifecycle_decisions_cover_late_reconnect);
     return UNITY_END();
 }

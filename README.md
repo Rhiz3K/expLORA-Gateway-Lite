@@ -86,18 +86,18 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
 
 1. **First Boot**:
    - Connect the gateway to USB and open a 115200-baud serial monitor.
-   - The gateway creates a random per-device credential in ESP32 NVS on first
-     boot. It is reused across reboots and normal firmware updates.
-   - Record the printed `AP SSID`, `Admin username` (`admin`), and
-     `Access credential`. This is the ownership/bootstrap channel; the
-     credential is not available from an unauthenticated HTTP endpoint.
-   - Connect to the WPA2 network named `expLORA-GW-XXXXXX` using that access
-     credential. The firmware fails closed if NVS cannot store or reload it;
-     it never falls back to an open AP or shared password.
+   - The gateway creates separate random per-device credentials in ESP32 NVS
+     for its WPA2 recovery AP and HTTP administrator.
+   - Record the printed `AP SSID`, `Admin username` (`admin`),
+     `New AP credential`, and `New admin credential`. Existing secrets are not
+     repeated on later boots.
+   - Connect to the WPA2 network named `expLORA-GW-XXXXXX` using the AP
+     credential. The firmware fails closed if NVS cannot persist either
+     credential; it never falls back to an open AP or shared password.
 
 2. **Configure WiFi**:
    - Open a browser and navigate to 192.168.4.1
-   - Enter the serial-console administrator username and access credential
+   - Enter the serial-console administrator username and admin credential
      when the browser presents the HTTP Basic authentication prompt.
    - Enter your home WiFi credentials
    - Save and reboot
@@ -107,9 +107,10 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
    - Access the web interface by entering the IP in a browser
    - Use the same HTTP administrator credentials on the home network.
 
-Keep the access credential private. Erasing NVS creates a new credential and
-requires physical USB access to retrieve it. Erasing only LittleFS does not
-intentionally reset this NVS credential.
+Keep both credentials private. The authenticated **Security** page rotates
+either one and displays its replacement once; AP rotation reboots the gateway.
+Erasing NVS creates new credentials and requires physical USB access to
+retrieve them. Erasing only LittleFS does not intentionally reset them.
 
 ## Adding Sensors
 
@@ -163,7 +164,7 @@ sensor data. For example:
 curl --user admin http://192.168.1.42/api?format=json
 ```
 
-`curl` prompts for the per-device access credential when it is omitted from
+`curl` prompts for the per-device administrator credential when it is omitted from
 the command line.
 
 - **List all sensors**: `/api?format=json`
@@ -182,10 +183,13 @@ POST /sensors/delete   (form field: index)
 POST /logs/clear
 ```
 
-Browser POSTs carrying an `Origin` header are accepted only when that origin
-exactly matches the request `Host`. Authenticated non-browser clients that omit
-`Origin` remain supported. This strict Origin/Host check supplements Basic
-authentication with a practical CSRF defense.
+Browser POSTs carrying an `Origin` header are accepted only when its authority
+matches the request `Host`. Both direct HTTP and HTTPS terminated by a reverse
+proxy are supported; an explicitly supplied port must still match. Authenticated
+non-browser clients that omit `Origin` remain supported. This Origin/Host check
+supplements Basic authentication with a practical CSRF defense. HTTP Basic
+credentials are only transport-protected when the management connection itself
+uses HTTPS, so remote deployments should terminate TLS at a trusted local proxy.
 
 Stored WiFi and MQTT passwords and sensor device keys are never rendered back
 into HTML. Blank password/key fields preserve an existing secret. WiFi and
@@ -195,22 +199,36 @@ explicitly replaces the existing key.
 ## Firmware update security
 
 Both manual firmware uploads and URL-based updates require administrator
-authentication and the browser same-origin check before any flash operation.
+authentication, the browser same-origin check, a newer semantic version,
+SHA-256 integrity, and a trusted ECDSA P-256 metadata signature before the
+candidate image is activated. The signed canonical metadata binds the version
+to the exact image digest, preventing a signed older image from being
+relabeled as a new release.
+
 URL updates accept only verified HTTPS URLs on exactly `pajenicko.cz`, below
 `/webflash/explora-gw-lite/`; redirects, userinfo, non-default ports, encoded
-paths, and alternate hosts are rejected. HTTPS is validated against the
-embedded public trust anchor. When the official manifest supplies a
-`sha256` field, the downloaded image is checked against it before finalizing
-the update.
+paths, and alternate hosts are rejected. TLS uses ESP-IDF's Mozilla CA bundle
+instead of one pinned root. Downloads run in a dedicated FreeRTOS task so the
+management server remains responsive, with progress exposed at
+`GET /firmware/status`. Signed OTA remains available through the protected
+recovery AP.
 
-This repository does **not** contain maintainer firmware-signing infrastructure
-or a release public key, so application-level signed-image verification is not
-claimed. Manual uploads are protected by device authentication and ESP image
-validation, while URL updates additionally use the restricted authenticated
-TLS origin and optional manifest SHA-256. Before release, maintainers still
-need to establish an offline signing key/public-key verification flow (or
-ESP32 Secure Boot with protected eFuses) and validate certificate-chain,
-upload, rollback, and power-loss behavior on real hardware.
+Manual upload state is isolated per HTTP request. Oversize data, failed writes,
+bad digests/signatures, and client disconnects abort and release the OTA slot,
+so a failed attempt cannot wedge later updates. A newly installed image is
+confirmed only after critical initialization; ESP32 bootloader rollback remains
+available until then.
+
+The repository contains only the release public key. Keep the private key
+offline and outside the checkout. To generate a detached `.sig`, `.sha256`,
+and optionally a manifest:
+
+```bash
+EXPLORA_SIGNING_KEY=/secure/path/firmware-signing-p256.pem \
+python3 tools/sign_firmware.py .pio/build/esp32-s3-devkitc-1/firmware.bin \
+  --version 1.2.0 \
+  --url https://pajenicko.cz/webflash/explora-gw-lite/firmware-1.2.0.bin
+```
 
 Example API response:
 ```json
