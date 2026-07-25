@@ -519,7 +519,6 @@ void loop()
     }
 
     // Add a check for LoRa packet processing to publish to MQTT
-    static unsigned int lastProcessedIndex = -1;
     if (loraModule && loraProtocol && LoRaModule::hasInterrupt())
     {
         if (loraProtocol->processReceivedPacket())

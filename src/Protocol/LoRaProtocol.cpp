@@ -164,8 +164,8 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
+    SensorData sensor;
+    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
     {
         logger.error("Error accessing sensor data at index " + String(sensorIndex));
         return false;
@@ -177,8 +177,9 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
 
     if (result)
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, Press: " + String(sensor->pressure, 2) + " hPa, Batt: " +
+        sensorManager.getSensorSnapshot(sensorIndex, sensor);
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -196,8 +197,8 @@ bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIn
         return false;
     }
 
-    SensorData* sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor) {
+    SensorData sensor;
+    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor)) {
         logger.error("Error accessing sensor data at index " + String(sensorIndex));
         return false;
     }
@@ -207,7 +208,7 @@ bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIn
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
     if (result) {
-        logger.info(sensor->name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
+        logger.info(sensor.name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
                   String(header.batteryVoltage, 2) + "V");
     }
 
@@ -226,8 +227,8 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
+    SensorData sensor;
+    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
     {
         logger.error("Error accessing sensor data at index " + String(sensorIndex));
         return false;
@@ -239,8 +240,9 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
 
     if (result)
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, CO2: " + String(sensor->ppm, 0) + " ppm, Batt: " +
+        sensorManager.getSensorSnapshot(sensorIndex, sensor);
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, CO2: " + String(sensor.ppm, 0) + " ppm, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -259,8 +261,8 @@ bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorI
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
+    SensorData sensor;
+    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
     {
         logger.error("Error accessing sensor data at index " + String(sensorIndex));
         return false;
@@ -271,7 +273,7 @@ bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorI
 
     if (result)
     {
-        logger.info(sensor->name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
+        logger.info(sensor.name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -297,8 +299,8 @@ bool LoRaProtocol::processMeteoPacket(uint8_t *data, uint8_t len, int sensorInde
                  "m/s at " + String(payload.windDirection) + "°, rain=" + String(payload.rainAmount) +
                  "mm, rate=" + String(payload.rainRate) + "mm/h");
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
+    SensorData sensor;
+    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
     {
         logger.error("Error accessing sensor data at index " + String(sensorIndex));
         return false;
@@ -312,10 +314,11 @@ bool LoRaProtocol::processMeteoPacket(uint8_t *data, uint8_t len, int sensorInde
 
     if (result)
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, Press: " + String(sensor->pressure, 2) + " hPa, Wind: " +
-                    String(sensor->windSpeed, 1) + " m/s at " + String(sensor->windDirection) + "°, Rain: " +
-                    String(sensor->rainAmount, 1) + " mm (rate: " + String(sensor->rainRate, 1) + " mm/h), Batt: " +
+        sensorManager.getSensorSnapshot(sensorIndex, sensor);
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Wind: " +
+                    String(sensor.windSpeed, 1) + " m/s at " + String(sensor.windDirection) + "°, Rain: " +
+                    String(sensor.rainAmount, 1) + " mm (rate: " + String(sensor.rainRate, 1) + " mm/h), Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -432,7 +435,7 @@ bool LoRaProtocol::isValidPacket(uint8_t *buf, uint8_t len, String &reasonOut)
         return false;
     }
 
-    if (deviceType == 0 || deviceType > 256)
+    if (!isSupportedSensorType(deviceType))
     {
         reasonOut = "invalid device type: " + String(deviceType);
         return false;

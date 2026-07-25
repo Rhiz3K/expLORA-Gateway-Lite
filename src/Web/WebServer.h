@@ -39,16 +39,7 @@
 class WebPortal
 {
 private:
-    // Task handle for web server
-    // TaskHandle_t webServerTaskHandle = NULL;
-
     MQTTManager *mqttManager; // Reference to MQTT manager
-
-    // Static task function for the second core
-    static void webServerTask(void *parameter);
-
-    // Processing flag to avoid race conditions
-    volatile bool isProcessing = false;
 
     AsyncWebServer server;        // Asynchronous web server
     DNSServer dnsServer;          // DNS server for captive portal
@@ -106,15 +97,6 @@ private:
     // Guard handlers: if AP mode, redirect to /config and return true
     bool guardAPOnly(AsyncWebServerRequest *request);
 
-    // Create content for individual pages
-    String createHomePage();
-    String createConfigPage();
-    String createSensorsPage();
-    String createSensorAddPage();
-    String createSensorEditPage(int index);
-    String createLogsPage();
-    String createAPIPage();
-
     // Process HTTP requests
     void handleRoot(AsyncWebServerRequest *request);
     void handleConfig(AsyncWebServerRequest *request);
@@ -145,15 +127,6 @@ private:
     void handleFirmwarePage(AsyncWebServerRequest *request);
     void handleFirmwareUploadComplete(AsyncWebServerRequest *request);
     void handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
-
-
-    // Receive WebSocket messages
-    void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
-                          AwsEventType type, void *arg, uint8_t *data, size_t len);
-
-    // Send updates via WebSocket
-    void sendSensorUpdates();
-    void sendLogUpdates();
 
 public:
     // Constructor

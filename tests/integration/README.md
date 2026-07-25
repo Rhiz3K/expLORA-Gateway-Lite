@@ -52,6 +52,34 @@ rejected without changing stored configuration. Temporary sensors and the
 custom URL are restored in `finally`; existing device keys are never read or
 replaced.
 
+### Issue #24 correctness test
+
+After flashing the issue #24 build, run:
+
+```bash
+python3 tests/integration/test_issue24.py \
+  --url http://gateway-ip \
+  --admin-credential '<admin credential>'
+```
+
+It checks add/edit validation, persists and renders a temporary VEML7700
+sensor, verifies the public-CA TLS wording, and removes the fixture in
+`finally`.
+
+To verify immediate per-sensor Home Assistant discovery against an isolated
+MQTT broker running on the test host:
+
+```bash
+python3 tests/integration/test_issue24_mqtt.py \
+  --url http://gateway-ip \
+  --admin-credential '<admin credential>' \
+  --broker-host '<test-host LAN IP>'
+```
+
+The broker is local and isolated, so no discovery metadata leaves the test
+LAN. The script verifies a synthetic sensor and restores both the fixture and
+the previous MQTT settings in `finally`.
+
 ## Provisioning flow (first run, gateway with no STA config)
 
 When `[gateway].ip` is empty or unreachable, the script provisions the

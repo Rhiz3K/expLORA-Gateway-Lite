@@ -175,6 +175,10 @@ inline Status status(const Stats &s, unsigned long nowMillis)
     {
         return Status::Errors;
     }
+    if (!s.hasLastOk)
+    {
+        return Status::Unknown;
+    }
     if (s.hasLastOk &&
         static_cast<long>(nowMillis - s.lastOkAtMillis) > static_cast<long>(STALE_AFTER_MS))
     {

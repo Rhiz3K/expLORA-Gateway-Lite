@@ -459,50 +459,6 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     return html;
 }
 
-// Generating sensor table (optimized version for buffer)
-void HTMLGenerator::generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors)
-{
-    size_t contentLen = 0;
-
-    // Table start
-    if (!appendBounded(
-            buffer, maxLen, contentLen,
-            "<table><tr><th>Name</th><th>Type</th><th>Serial Number</th>"
-            "<th>Last Seen</th><th>Sensor Data</th></tr>"))
-    {
-        return;
-    }
-
-    // Process all sensors
-    for (const auto &sensor : sensors)
-    {
-        if (sensor.configured)
-        {
-            const String escapedName = escapeHtml(sensor.name);
-            const String escapedType = escapeHtml(String(sensor.getTypeInfo().name));
-            const String escapedLastSeen = escapeHtml(sensor.getLastSeenString());
-            const String escapedData = escapeHtml(sensor.getDataString());
-            const String row =
-                "<tr><td>" + escapedName +
-                "</td><td>" + escapedType +
-                "</td><td>" + formatSN(sensor.serialNumber) +
-                "</td><td>" + escapedLastSeen +
-                "</td><td>" + escapedData + "</td></tr>";
-            if (!appendBounded(buffer, maxLen, contentLen, row))
-            {
-                appendBounded(
-                    buffer, maxLen, contentLen,
-                    "<tr><td colspan='5'>Sensor output truncated due to buffer size "
-                    "limitations</td></tr>");
-                break;
-            }
-        }
-    }
-
-    // Table end
-    appendBounded(buffer, maxLen, contentLen, "</table>");
-}
-
 // Generating configuration page
 String HTMLGenerator::generateConfigPage(const String &ssid, bool hasPassword, bool configMode, const String &ip, const String &timezone)
 {
@@ -608,8 +564,9 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
 
     // TLS MQTTS checkbox
     html += "<div class='form-group'>";
-    html += "<label for='tls'>Enable TLS:</label>";
+    html += "<label for='tls'>Enable TLS (public CA verification):</label>";
     html += "<input type='checkbox' id='tls' name='tls' value='0'" + String(tls ? " checked" : "") + ">";
+    html += "<small>The broker certificate and hostname must validate against the built-in public CA store.</small>";
     html += "</div>";
 
     // MQTT Broker Host

@@ -69,8 +69,8 @@ const SensorTypeInfo SENSOR_TYPE_DEFINITIONS[] = {
     {SensorType::UNKNOWN, "Unknown",  0, 7, false, false, false, false, false, false, false, false, false},
     {SensorType::BME280,    "CLIMA",  6, 7, true,  true,  true,  false, false, false, false, false, false},
     {SensorType::SCD40,    "CARBON",  6, 7, true,  true,  false,  true, false, false, false, false, false},
+    {SensorType::VEML7700, "VEML7700", 4, 7, false, false, false, false, true, false, false, false, false},
     {SensorType::METEO,     "METEO", 14, 7, true,  true,  true,  false, false,  true,  true,  true,  true},
-    //{SensorType::VEML7700,  "VEML7700",     4,     7,    false, false, false, false, true,  false, false, false, false},
     {SensorType::DIY_TEMP, "DIY_TEMP",     2,     7,    true,  false, false, false, false, false, false, false, false},
 
     // Add more sensor types here in the future...
@@ -99,6 +99,13 @@ inline const SensorTypeInfo &getSensorTypeInfo(uint8_t typeValue)
 inline SensorType sensorTypeFromValue(uint8_t value)
 {
     return static_cast<SensorType>(value);
+}
+
+inline bool isSupportedSensorType(uint8_t value)
+{
+    const SensorTypeInfo &info = getSensorTypeInfo(value);
+    return info.type != SensorType::UNKNOWN &&
+           static_cast<uint8_t>(info.type) == value;
 }
 
 // Convert SensorType to string for debugging and logging

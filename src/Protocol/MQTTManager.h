@@ -62,6 +62,11 @@ private:
     // Create configuration JSON for Home Assistant discovery
     String buildDiscoveryJson(const SensorData &sensor, const String &valueType, const String &stateTopic);
 
+    // Publish retained Home Assistant discovery entities for one snapshot.
+    void publishDiscoverySnapshot(const SensorData &sensor);
+    void publishDiscoveryValue(const SensorData &sensor, const String &valueType,
+                               const String &stateTopic);
+
     // Helper function to capitalize first letter
     String capitalizeFirst(const String &input);
 

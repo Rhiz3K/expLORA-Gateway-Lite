@@ -87,9 +87,8 @@ public:
     // Get number of sensors
     size_t getSensorCount() const;
 
-    // Get sensor by index
-    const SensorData *getSensor(int index) const;
-    SensorData *getSensor(int index);
+    // Copy one configured sensor while holding the manager mutex.
+    bool getSensorSnapshot(int index, SensorData &snapshot) const;
 
     // Get list of all sensors
     std::vector<SensorData> getAllSensors() const;

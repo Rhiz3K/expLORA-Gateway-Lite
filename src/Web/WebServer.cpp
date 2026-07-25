@@ -28,32 +28,42 @@
 #include "../config.h"
 #include "../Security/SecurityPolicy.h"
 
+namespace
+{
+bool parseSupportedSensorType(const String &value, uint8_t &type)
+{
+    if (value.length() == 0 || value.length() > 3)
+    {
+        return false;
+    }
+    for (size_t index = 0; index < value.length(); ++index)
+    {
+        if (!isDigit(static_cast<unsigned char>(value.charAt(index))))
+        {
+            return false;
+        }
+    }
+
+    const unsigned long parsed = strtoul(value.c_str(), nullptr, 10);
+    if (parsed > UINT8_MAX || !isSupportedSensorType(static_cast<uint8_t>(parsed)))
+    {
+        return false;
+    }
+    type = static_cast<uint8_t>(parsed);
+    return true;
+}
+} // namespace
+
 // Constructor
 WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &password,
                      bool &config_mode, ConfigManager &config, String &tz)
-    : server(HTTP_PORT), sensorManager(sensors), logger(log), isAPMode(false),
+    : mqttManager(nullptr), server(HTTP_PORT), sensorManager(sensors), logger(log), isAPMode(false),
       apRadioActive(false), wifiSSID(ssid), wifiPassword(password), configMode(config_mode),
-      timezone(tz), configManager(config), mqttManager(nullptr)
+      timezone(tz), configManager(config)
 {
     otaStateMutex = xSemaphoreCreateMutex();
 }
 
-// Add this static task function to WebPortal in WebServer.cpp
-// void WebPortal::webServerTask(void *parameter) {
-//     WebPortal *server = (WebPortal*)parameter;
-
-//     for (;;) {
-//         if (server->isAPMode) {
-//             // Process DNS requests (captive portal)
-//             server->dnsServer.processNextRequest();
-//         }
-
-//         // Give other tasks time to run
-//         vTaskDelay(1);
-//     }
-// }
-
-// Modify the init function to create the task
 bool WebPortal::init()
 {
     logger.info("Initializing web portal");
@@ -78,20 +88,6 @@ bool WebPortal::init()
         logger.info("Web server started on port " + String(HTTP_PORT));
     }
 
-
-    // Create task on core 0 for DNS and other processing
-    // xTaskCreatePinnedToCore(
-    //     webServerTask,        // Task function
-    //     "WebServerTask",      // Task name
-    //     4096,                 // Stack size (bytes)
-    //     this,                 // Parameter to pass
-    //     1,                    // Task priority (1 is low)
-    //     &webServerTaskHandle, // Task handle
-    //     0                     // Run on core 0
-    // );
-
-    // logger.info("Web server task created on core 0");
-
     return true;
 }
 
@@ -106,8 +102,6 @@ bool WebPortal::startAccessPoint(bool allowStation)
     return ensureAPUp();
 }
 
-// Setup routes for web server
-// Modify WebPortal::setupRoutes() in WebServer.cpp
 void WebPortal::setupRoutes()
 {
     if (routesRegistered)
@@ -229,11 +223,6 @@ void WebPortal::handleClient()
 // Ensure proper cleanup in the destructor
 WebPortal::~WebPortal()
 {
-    // Stop the task if it's running
-    // if (webServerTaskHandle != NULL) {
-    //    vTaskDelete(webServerTaskHandle);
-    //}
-
     // Stop DNS server
     dnsServer.stop();
     if (otaStateMutex != nullptr)
@@ -564,7 +553,9 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
 
         // Get form data
         String name = request->getParam("name", true)->value();
-        uint8_t deviceTypeValue = request->getParam("deviceType", true)->value().toInt();
+        uint8_t deviceTypeValue = 0;
+        const String deviceTypeText =
+            request->getParam("deviceType", true)->value();
         String serialNumberHex = request->getParam("serialNumber", true)->value();
         String deviceKeyHex = request->getParam("deviceKey", true)->value();
         String customUrl = request->hasParam("customUrl", true) ? request->getParam("customUrl", true)->value() : "";
@@ -582,6 +573,16 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
         if (customUrl.length() > MAX_SENSOR_CUSTOM_URL_LENGTH)
         {
             request->send(400, "text/plain", "Custom URL too long");
+            return;
+        }
+        if (!SecurityPolicy::isHexString(serialNumberHex.c_str(), 6))
+        {
+            request->send(400, "text/plain", "Serial number must be exactly 6 hexadecimal characters");
+            return;
+        }
+        if (!parseSupportedSensorType(deviceTypeText, deviceTypeValue))
+        {
+            request->send(400, "text/plain", "Unsupported device type");
             return;
         }
 
@@ -696,13 +697,11 @@ void WebPortal::handleSensorEdit(AsyncWebServerRequest *request)
     {
         int index = request->getParam("index")->value().toInt();
 
-        // Get sensor
-        const SensorData *sensor = sensorManager.getSensor(index);
-
-        if (sensor && sensor->configured)
+        SensorData sensor;
+        if (sensorManager.getSensorSnapshot(index, sensor))
         {
             // Generate HTML
-            String html = HTMLGenerator::generateSensorEditPage(*sensor, index);
+            String html = HTMLGenerator::generateSensorEditPage(sensor, index);
 
             // Send response
             request->send(200, "text/html", html);
@@ -779,7 +778,9 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
         // Get form data
         int index = request->getParam("index", true)->value().toInt();
         String name = request->getParam("name", true)->value();
-        uint8_t deviceTypeValue = request->getParam("deviceType", true)->value().toInt();
+        uint8_t deviceTypeValue = 0;
+        const String deviceTypeText =
+            request->getParam("deviceType", true)->value();
         String serialNumberHex = request->getParam("serialNumber", true)->value();
         String deviceKeyHex = request->getParam("deviceKey", true)->value();
         String customUrl = request->hasParam("customUrl", true) ? request->getParam("customUrl", true)->value() : "";
@@ -799,15 +800,25 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
             request->send(400, "text/plain", "Custom URL too long");
             return;
         }
+        if (!SecurityPolicy::isHexString(serialNumberHex.c_str(), 6))
+        {
+            request->send(400, "text/plain", "Serial number must be exactly 6 hexadecimal characters");
+            return;
+        }
+        if (!parseSupportedSensorType(deviceTypeText, deviceTypeValue))
+        {
+            request->send(400, "text/plain", "Unsupported device type");
+            return;
+        }
 
-        const SensorData *existingSensor = sensorManager.getSensor(index);
-        if (!existingSensor || !existingSensor->configured)
+        SensorData existingSensor;
+        if (!sensorManager.getSensorSnapshot(index, existingSensor))
         {
             request->send(404, "text/plain", "Sensor not found");
             return;
         }
 
-        uint32_t deviceKey = existingSensor->deviceKey;
+        uint32_t deviceKey = existingSensor.deviceKey;
         if (deviceKeyHex.length() > 0)
         {
             if (!SecurityPolicy::isHexString(deviceKeyHex.c_str(), 8))
@@ -836,6 +847,10 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
             if (mqttManager && mqttManager->isConnected())
             {
                 logger.info("Updating MQTT discovery for edited sensor");
+                // Remove the old capability set first. This also cleans up
+                // topics when the serial number or device type changed.
+                mqttManager->removeDiscoveryForSensor(
+                    existingSensor.serialNumber);
                 mqttManager->publishDiscoveryForSensor(index);
             }
 
@@ -867,13 +882,11 @@ void WebPortal::handleSensorDelete(AsyncWebServerRequest *request)
     {
         int index = request->getParam("index", true)->value().toInt();
 
-        // Get sensor
-        const SensorData *sensor = sensorManager.getSensor(index);
-
-        if (sensor && sensor->configured)
+        SensorData sensor;
+        if (sensorManager.getSensorSnapshot(index, sensor))
         {
-            String name = sensor->name;
-            uint32_t serialNumber = sensor->serialNumber;
+            String name = sensor.name;
+            uint32_t serialNumber = sensor.serialNumber;
 
             // Delete sensor
             bool success = sensorManager.deleteSensor(index);
@@ -1074,10 +1087,10 @@ void WebPortal::handleAPI(AsyncWebServerRequest *request)
 
         if (sensorIndex >= 0)
         {
-            const SensorData *sensor = sensorManager.getSensor(sensorIndex);
-            if (sensor && sensor->configured)
+            SensorData sensor;
+            if (sensorManager.getSensorSnapshot(sensorIndex, sensor))
             {
-                sensorsList.push_back(*sensor);
+                sensorsList.push_back(sensor);
             }
         }
     }

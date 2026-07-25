@@ -275,7 +275,7 @@ bool LoRaModule::receivePacket(uint8_t *buffer, uint8_t *length)
     uint8_t packetLength = readRegister(REG_RX_NB_BYTES);
 
     // Basic check of data length
-    if (packetLength == 0 || packetLength > 255)
+    if (packetLength == 0)
     {
         logger.warning("Invalid packet length: " + String(packetLength));
         // Clear interrupt flags
@@ -287,15 +287,6 @@ bool LoRaModule::receivePacket(uint8_t *buffer, uint8_t *length)
 
     // Get current address in FIFO
     uint8_t currentAddr = readRegister(REG_FIFO_RX_CURRENT_ADDR);
-
-    // Check that address makes sense
-    if (currentAddr > 255)
-    {
-        logger.warning("Invalid FIFO address: " + String(currentAddr));
-        // Clear interrupt flags
-        writeRegister(REG_IRQ_FLAGS, 0xFF);
-        return false;
-    }
 
     // Set FIFO address
     writeRegister(REG_FIFO_ADDR_PTR, currentAddr);

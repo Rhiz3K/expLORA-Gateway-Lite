@@ -102,8 +102,7 @@ public:
     // Generate credential rotation page
     static String generateSecurityPage(const String &apName);
 
-    // Optimized versions using buffer
-    static void generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors);
+    // Optimized log rendering using a bounded buffer
     static void generateLogTable(char *buffer, size_t &maxLen, const std::vector<LogEntry> &logs);
 
     // Additional helper methods

@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
+#include "../Security/OtaTrust.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -401,7 +402,9 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
                 // Create timestamps for comparing dates
                 // Date of last reset
                 struct tm lastResetTime;
-                localtime_r((time_t *)&sensors[index].lastRainReset, &lastResetTime);
+                const time_t lastRainReset =
+                    static_cast<time_t>(sensors[index].lastRainReset);
+                localtime_r(&lastRainReset, &lastResetTime);
 
                 // If last reset was on a different day than today, reset the counter
                 if (sensors[index].lastRainReset == 0 ||
@@ -563,7 +566,7 @@ bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
     if (isHttps)
     {
         secureClientPtr = new WiFiClientSecure();
-        secureClientPtr->setInsecure(); // Skip certificate validation (no CA bundle)
+        configurePublicCaTls(*secureClientPtr);
         http.begin(*secureClientPtr, url);
     }
     else
@@ -699,24 +702,16 @@ size_t SensorManager::getSensorCount() const
     return sensorCount;
 }
 
-// Get sensor by index (const version)
-const SensorData *SensorManager::getSensor(int index) const
+bool SensorManager::getSensorSnapshot(int index, SensorData &snapshot) const
 {
-    if (index < 0 || index >= sensorCount || !sensors[index].configured)
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (index < 0 || static_cast<size_t>(index) >= sensorCount ||
+        !sensors[index].configured)
     {
-        return nullptr;
+        return false;
     }
-    return &sensors[index];
-}
-
-// Get sensor by index (non-const version)
-SensorData *SensorManager::getSensor(int index)
-{
-    if (index < 0 || index >= sensorCount || !sensors[index].configured)
-    {
-        return nullptr;
-    }
-    return &sensors[index];
+    snapshot = sensors[index];
+    return true;
 }
 
 // Get list of all sensors

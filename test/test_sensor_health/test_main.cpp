@@ -53,6 +53,9 @@ static void test_first_rejection_records_reason_and_streak(void)
     TEST_ASSERT_EQUAL_UINT16(1, s.consecutiveRejections);
     TEST_ASSERT_EQUAL_STRING("invalid pressure: 1012", s.lastRejectReason);
     TEST_ASSERT_EQUAL_UINT32(1, SensorHealth::rejectedLast24h(s));
+    TEST_ASSERT_EQUAL(
+        SensorHealth::Status::Unknown,
+        SensorHealth::status(s, 8000UL));
 }
 
 static void test_success_resets_consecutive_streak(void)

@@ -96,8 +96,6 @@ struct SensorData
                    pressure(0.0f),
                    ppm(0.0f),
                    lux(0.0f),
-                   batteryVoltage(0.0f),
-                   rssi(0),
                    windSpeed(0.0f),
                    windDirection(0),
                    rainAmount(0.0f),
@@ -112,7 +110,9 @@ struct SensorData
                    windSpeedCorrection(1.0f), // Multiplier of 1.0 = no change
                    windDirectionCorrection(0),
                    rainAmountCorrection(1.0f),
-                   rainRateCorrection(1.0f)
+                   rainRateCorrection(1.0f),
+                   batteryVoltage(0.0f),
+                   rssi(0)
     {
     }
 

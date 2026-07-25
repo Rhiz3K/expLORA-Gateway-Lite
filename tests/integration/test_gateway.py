@@ -1091,6 +1091,39 @@ def t_cross_origin_post_rejected(r: Runner) -> str:
     return "403 before form handling"
 
 
+def t_sensor_invalid_serial_rejected(r: Runner) -> str:
+    resp = r.post(
+        "/sensors/add",
+        data={
+            "name": "invalid-serial-fixture",
+            "deviceType": "1",
+            "serialNumber": "GGGGGG",
+            "deviceKey": "A0B0C0D0",
+        },
+    )
+    assert_status(resp, [400])
+    if "serial" not in resp.text.lower():
+        raise TestFailed(f"400 returned but message unclear: {resp.text!r}")
+    return "400 + exact-hex validation"
+
+
+def t_sensor_unsupported_type_rejected(r: Runner) -> str:
+    for invalid_type in ("99", "257", "1junk"):
+        resp = r.post(
+            "/sensors/add",
+            data={
+                "name": "invalid-type-fixture",
+                "deviceType": invalid_type,
+                "serialNumber": "EFFF24",
+                "deviceKey": "A0B0C0D0",
+            },
+        )
+        assert_status(resp, [400])
+        if "type" not in resp.text.lower():
+            raise TestFailed(f"400 returned but message unclear: {resp.text!r}")
+    return "400 + strict supported-type validation"
+
+
 # ---------------------------------------- live sensor (real LoRa packet)
 
 def _find_sensor(api_body: dict, sn_hex: str) -> Optional[dict]:
@@ -1583,6 +1616,8 @@ def main():
     r.run("missing password param → 400", lambda: t_config_missing_params_rejected(r))
     r.run("SSID > 32 chars → 400", lambda: t_config_too_long_ssid_rejected(r))
     r.run("cross-origin POST → 403", lambda: t_cross_origin_post_rejected(r))
+    r.run("invalid sensor serial → 400", lambda: t_sensor_invalid_serial_rejected(r))
+    r.run("unsupported sensor type → 400", lambda: t_sensor_unsupported_type_rejected(r))
 
     # ----------------------------------------------- Phase 4: live sensor wait
     if sensor_sn:
