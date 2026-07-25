@@ -1,4 +1,4 @@
-# Real config has WiFi password + sensor device key — never commit it.
+# Real config has the device access credential, WiFi password, and sensor key.
 config.ini
 
 # Anything explicitly marked local (e.g. config.local.ini)

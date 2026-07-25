@@ -516,7 +516,8 @@ bool SensorManager::forwardSensorData(int index)
     url.replace("*SN*", formatSN(sensors[index].serialNumber));
     url.replace("*TYPE*", String(static_cast<uint8_t>(sensors[index].deviceType)));
 
-    logger.debug("Forwarding data for sensor " + sensors[index].name + " to URL: " + url);
+    logger.debug("Forwarding data for sensor " + sensors[index].name +
+                 " to its configured endpoint");
 
     // For HTTPS, use a secure client, but ensure we delete it after the request
     if (isHttps)

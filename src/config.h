@@ -25,10 +25,15 @@
 #include <WiFi.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.13"
+#define FIRMWARE_VERSION "1.1.14-dev-secure"
 
 // OTA Configuration
+// NOTE: The manifest lives at the legacy flat path on the official server
+// (verified 2026-07-25). `SecurityPolicy::isAllowedFirmwareUrl` accepts the
+// manifest's `url` field only if it points under /webflash/explora-gw-lite/,
+// so the manifest's `url` is intentionally NOT hard-coded here.
 #define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+#define HTTP_ADMIN_USERNAME "admin"
 
 // LoRa registers
 #define REG_FIFO 0x00
@@ -126,10 +131,6 @@ inline String makeApName()
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"
 
-// CORS headers for API
-#define CORS_HEADER_NAME "Access-Control-Allow-Origin"
-#define CORS_HEADER_VALUE "*"
-
 // Webserver ports
 #define HTTP_PORT 80 // HTTP server port
 #define DNS_PORT 53  // DNS server port
@@ -145,7 +146,3 @@ inline String makeApName()
 
 // PSRAM configuration for web server
 #define WEB_BUFFER_SIZE 16384 // Reduced to 16KB
-
-// OTA update settings
-#define OTA_PASSWORD "admin" // OTA update password
-#define OTA_PORT 3232        // OTA update port

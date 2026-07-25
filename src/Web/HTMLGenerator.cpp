@@ -22,9 +22,36 @@
 #include "HTMLGenerator.h"
 #include <esp_heap_caps.h>
 #include <algorithm>
+#include <cstring>
 #include <Arduino.h>
 #include <WiFi.h>
 #include "../config.h"
+#include "../Security/SecurityPolicy.h"
+
+static String escapeHtml(const String &value)
+{
+    return String(SecurityPolicy::htmlEscape(value.c_str()).c_str());
+}
+
+static bool appendBounded(char *buffer, size_t capacity, size_t &contentLen,
+                          const String &text)
+{
+    if (buffer == nullptr || capacity == 0 || contentLen >= capacity)
+    {
+        return false;
+    }
+
+    const size_t available = capacity - contentLen - 1; // preserve trailing NUL
+    if (text.length() > available)
+    {
+        return false;
+    }
+
+    memcpy(buffer + contentLen, text.c_str(), text.length());
+    contentLen += text.length();
+    buffer[contentLen] = '\0';
+    return true;
+}
 
 // Initialization of static variables
 char *HTMLGenerator::htmlBuffer = nullptr;
@@ -99,14 +126,14 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
 {
     html += "<!DOCTYPE html><html><head>";
     html += "<meta charset='UTF-8'>";
-    html += "<title>" + title + " - expLORA Gateway Lite</title>";
+    html += "<title>" + escapeHtml(title) + " - expLORA Gateway Lite</title>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
 
     // Add CSS styles
     addStyles(html);
 
     html += "</head><body>";
-    html += "<header><h1>expLORA Gateway Lite</h1><h2>" + title + "</h2></header>";
+    html += "<header><h1>expLORA Gateway Lite</h1><h2>" + escapeHtml(title) + "</h2></header>";
 
     // Navigation: full in STA, minimal in AP (Config + Reboot)
     if (!isAPMode)
@@ -117,7 +144,7 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     {
         html += "<nav>";
         html += "<a href='/config' class='" + String(title == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
-        html += "<a href='/reboot' onclick=\"return confirm('Are you sure you want to reboot the device?');\">Reboot</a>";
+        html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
         html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
         html += "</nav>";
         html += "<div class='container'>";
@@ -127,6 +154,7 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
 // Adding HTML footer code
 void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 {
+    html += "</div>"; // container opened by addHtmlHeader/addNavigation
     html += "<footer>";
     html += "<p>expLORA Gateway Lite v" + String(FIRMWARE_VERSION) + " &copy; 2026</p>";
     if (!isAPMode)
@@ -164,7 +192,7 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "        var d=res.data; if(!d){ throw new Error('Bad JSON: '+res.raw); }";
     html += "        if(d.version && d.version !== '" + String(FIRMWARE_VERSION) + "'){";
     html += "          if(confirm('New version '+d.version+' available. Update now?')){";
-    html += "            window.updateFirmware(d.url);";
+    html += "            window.updateFirmware(d.url,d.sha256||'');";
     html += "          }";
     html += "        } else {";
     html += "          alert('You have the latest version: " + String(FIRMWARE_VERSION) + "');";
@@ -173,14 +201,14 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "      .catch(function(err){ alert('Update check failed: '+err.message); });";
     html += "  };";
 
-    html += "  window.updateFirmware = function(url){";
+    html += "  window.updateFirmware = function(url,sha256){";
     html += "    var btn=document.getElementById('btnUpdate'); if(btn) btn.disabled=true;";
     html += "    window.showNotice('Firmware update started. Please wait ~2 minutes. Do not power off.');";
     html += "    if (typeof startAutoRefresh==='function') { startAutoRefresh(120000); } else { setTimeout(function(){ location.reload(); },120000); }";
     html += "    fetch('/firmware/update',{";
     html += "      method:'POST',";
     html += "      headers:{'Content-Type':'application/x-www-form-urlencoded'},";
-    html += "      body:'url='+encodeURIComponent(url)";
+    html += "      body:'url='+encodeURIComponent(url)+(sha256?'&sha256='+encodeURIComponent(sha256):'')";
     html += "    })";
     html += "    .then(function(response){";
     html += "      return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
@@ -224,6 +252,9 @@ void HTMLGenerator::addStyles(String &html)
     html += "nav a:hover { background: #0066cc; }";
     html += "nav a.active { background: #0066cc; }";
     html += "nav .icon { display: none; }";
+    html += "nav .nav-action { float:left; display:block; margin:0; }";
+    html += "nav .nav-action button { background:#333; border-radius:0; margin:0; padding:14px 16px; line-height:1.6; }";
+    html += "nav .nav-action button:hover { background:#0066cc; }";
 
     // Cards
     html += ".container { padding: 20px; }";
@@ -305,7 +336,7 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
     html += "<a href='/firmware' class='" + String(activePage == "Firmware" ? "active" : "") + "'>Firmware</a>";
     html += "<a href='/logs' class='" + String(activePage == "Logs" ? "active" : "") + "'>Logs</a>";
     html += "<a href='/api' class='" + String(activePage == "API" ? "active" : "") + "'>API</a>";
-    html += "<a href='/reboot' onclick=\"return confirm('Are you sure you want to reboot the device?');\">Reboot</a>";
+    html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
     html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
     html += "</nav>";
 
@@ -329,15 +360,15 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
 
     if (WiFi.status() == WL_CONNECTED)
     {
-        html += "<p><strong>WiFi:</strong> Connected to " + WiFi.SSID() + "</p>";
-        html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
+        html += "<p><strong>WiFi:</strong> Connected to " + escapeHtml(WiFi.SSID()) + "</p>";
+        html += "<p><strong>IP:</strong> " + escapeHtml(WiFi.localIP().toString()) + "</p>";
     }
     else
     {
         html += "<p><strong>WiFi:</strong> Disconnected</p>";
         if (WiFi.getMode() == WIFI_AP)
         {
-            html += "<p><strong>AP IP:</strong> " + WiFi.softAPIP().toString() + "</p>";
+            html += "<p><strong>AP IP:</strong> " + escapeHtml(WiFi.softAPIP().toString()) + "</p>";
         }
     }
 
@@ -386,12 +417,12 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
             if (sensor.configured)
             {
                 html += "<tr>";
-                html += "<td>" + sensor.name + "</td>";
-                html += "<td>" + sensorTypeToString(sensor.deviceType) + "</td>";
-                html += "<td>" + sensor.getLastSeenString() + "</td>";
+                html += "<td>" + escapeHtml(sensor.name) + "</td>";
+                html += "<td>" + escapeHtml(sensorTypeToString(sensor.deviceType)) + "</td>";
+                html += "<td>" + escapeHtml(sensor.getLastSeenString()) + "</td>";
 
                 // Add sensor data - use the getDataString() method
-                html += "<td>" + sensor.getDataString() + "</td>";
+                html += "<td>" + escapeHtml(sensor.getDataString()) + "</td>";
 
                 html += "</tr>";
 
@@ -422,43 +453,46 @@ void HTMLGenerator::generateSensorTable(char *buffer, size_t &maxLen, const std:
     size_t contentLen = 0;
 
     // Table start
-    contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                           "<table>"
-                           "<tr><th>Name</th><th>Type</th><th>Serial Number</th><th>Last Seen</th><th>Sensor Data</th></tr>");
+    if (!appendBounded(
+            buffer, maxLen, contentLen,
+            "<table><tr><th>Name</th><th>Type</th><th>Serial Number</th>"
+            "<th>Last Seen</th><th>Sensor Data</th></tr>"))
+    {
+        return;
+    }
 
     // Process all sensors
     for (const auto &sensor : sensors)
     {
         if (sensor.configured)
         {
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<tr>"
-                                   "<td>%s</td>"
-                                   "<td>%s</td>"
-                                   "<td>%X</td>",
-                                   sensor.name.c_str(),
-                                   sensor.getTypeInfo().name,
-                                   sensor.serialNumber);
-
-            // Last Seen
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<td>%s</td>",
-                                   sensor.getLastSeenString().c_str());
-
-            // Sensor Data
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<td>%s</td>"
-                                   "</tr>",
-                                   sensor.getDataString().c_str());
+            const String escapedName = escapeHtml(sensor.name);
+            const String escapedType = escapeHtml(String(sensor.getTypeInfo().name));
+            const String escapedLastSeen = escapeHtml(sensor.getLastSeenString());
+            const String escapedData = escapeHtml(sensor.getDataString());
+            const String row =
+                "<tr><td>" + escapedName +
+                "</td><td>" + escapedType +
+                "</td><td>" + formatSN(sensor.serialNumber) +
+                "</td><td>" + escapedLastSeen +
+                "</td><td>" + escapedData + "</td></tr>";
+            if (!appendBounded(buffer, maxLen, contentLen, row))
+            {
+                appendBounded(
+                    buffer, maxLen, contentLen,
+                    "<tr><td colspan='5'>Sensor output truncated due to buffer size "
+                    "limitations</td></tr>");
+                break;
+            }
         }
     }
 
     // Table end
-    contentLen += snprintf(buffer + contentLen, maxLen - contentLen, "</table>");
+    appendBounded(buffer, maxLen, contentLen, "</table>");
 }
 
 // Generating configuration page
-String HTMLGenerator::generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip, const String &timezone)
+String HTMLGenerator::generateConfigPage(const String &ssid, bool hasPassword, bool configMode, const String &ip, const String &timezone)
 {
     String html;
     html.reserve(4096);
@@ -472,17 +506,17 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     if (configMode)
     {
         html += "<p><strong>Mode:</strong> Access Point</p>";
-        html += "<p><strong>AP Name:</strong> " + WiFi.softAPSSID() + "</p>";
-        html += "<p><strong>AP IP:</strong> " + WiFi.softAPIP().toString() + "</p>";
+        html += "<p><strong>AP Name:</strong> " + escapeHtml(WiFi.softAPSSID()) + "</p>";
+        html += "<p><strong>AP IP:</strong> " + escapeHtml(WiFi.softAPIP().toString()) + "</p>";
     }
     else
     {
         html += "<p><strong>Mode:</strong> Client</p>";
-        html += "<p><strong>SSID:</strong> " + ssid + "</p>";
+        html += "<p><strong>SSID:</strong> " + escapeHtml(ssid) + "</p>";
         html += "<p><strong>Status:</strong> " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "</p>";
         if (WiFi.status() == WL_CONNECTED)
         {
-            html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
+            html += "<p><strong>IP:</strong> " + escapeHtml(WiFi.localIP().toString()) + "</p>";
         }
     }
     html += "</div>";
@@ -492,9 +526,14 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     html += "<h2>WiFi Settings</h2>";
     html += "<form method='post' action='/config'>";
     html += "<label for='ssid'>SSID:</label>";
-    html += "<input type='text' id='ssid' name='ssid' value='" + ssid + "' required>";
+    html += "<input type='text' id='ssid' name='ssid' value='" + escapeHtml(ssid) + "' required>";
     html += "<label for='password'>Password:</label>";
-    html += "<input type='password' id='password' name='password' value='" + password + "'>";
+    html += "<input type='password' id='password' name='password' value='' autocomplete='new-password' placeholder='";
+    html += hasPassword ? "Leave blank to keep the stored password'>" : "Blank configures an open network'>";
+    if (hasPassword)
+    {
+        html += "<label><input type='checkbox' name='clearPassword' value='1'> Clear the stored password (open WiFi network)</label>";
+    }
     html += "<label for='timezone'>Timezone:</label>";
     html += "<select id='timezone' name='timezone'>";
 
@@ -522,18 +561,19 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     if (timezone == "MSK-3")
         html += " selected";
     html += ">Moscow Time (MSK)</option>";
+    html += "</select>";
 
     html += "<input type='submit' value='Save and Restart'>";
     html += "</form>";
     html += "</div>";
 
     // Add footer
-    addHtmlFooter(html);
+    addHtmlFooter(html, configMode);
 
     return html;
 }
 // Generate MQTT Configuration Page
-String HTMLGenerator::generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
+String HTMLGenerator::generateMqttPage(const String &host, int port, const String &user, bool hasPassword, bool enabled, bool tls,
                                        const String &prefix, bool haEnabled, String &haPrefix)
 {
     String html;
@@ -563,7 +603,7 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     // MQTT Broker Host
     html += "<div class='form-group'>";
     html += "<label for='host'>MQTT Broker Host:</label>";
-    html += "<input type='text' id='host' name='host' value='" + host + "' required>";
+    html += "<input type='text' id='host' name='host' value='" + escapeHtml(host) + "' required>";
     html += "</div>";
 
     // MQTT Port
@@ -575,31 +615,36 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     // Username
     html += "<div class='form-group'>";
     html += "<label for='user'>Username (optional):</label>";
-    html += "<input type='text' id='user' name='user' value='" + user + "'>";
+    html += "<input type='text' id='user' name='user' value='" + escapeHtml(user) + "'>";
     html += "</div>";
 
     // Password
     html += "<div class='form-group'>";
     html += "<label for='password'>Password (optional):</label>";
-    html += "<input type='password' id='password' name='password' value='" + password + "'>";
+    html += "<input type='password' id='password' name='password' value='' autocomplete='new-password' placeholder='";
+    html += hasPassword ? "Leave blank to keep the stored password'>" : "No password configured'>";
+    if (hasPassword)
+    {
+        html += "<label><input type='checkbox' name='clearPassword' value='1'> Clear the stored MQTT password</label>";
+    }
     html += "</div>";
 
     // Root prefix
     html += "<div class='form-group'>";
     html += "<label for='prefix'>Root topic:</label>";
-    html += "<input type='text' id='prefix' name='prefix' value='" + prefix + "'>";
+    html += "<input type='text' id='prefix' name='prefix' value='" + escapeHtml(prefix) + "'>";
     html += "</div>";
 
     // Home assistant discovery checkbox
     html += "<div class='form-group'>";
-    html += "<label for='tls'>Enable HA Discovery:</label>";
+    html += "<label for='haEnabled'>Enable HA Discovery:</label>";
     html += "<input type='checkbox' id='haEnabled' name='haEnabled' value='0'" + String(haEnabled ? " checked" : "") + ">";
     html += "</div>";
 
     // HA Prefix
     html += "<div class='form-group'>";
     html += "<label for='haPrefix'>HA discovery topic:</label>";
-    html += "<input type='text' id='haPrefix' name='haPrefix' value='" + haPrefix + "'>";
+    html += "<input type='text' id='haPrefix' name='haPrefix' value='" + escapeHtml(haPrefix) + "'>";
     html += "</div>";
 
     html += "<input type='submit' value='Save MQTT Settings'>";
@@ -681,8 +726,8 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             uint32_t rejected  = SensorHealth::rejectedLast24h(h);
 
             html += "<tr>";
-            html += "<td>" + s.name + "</td>";
-            html += "<td>" + sensorTypeToString(s.deviceType) + "</td>";
+            html += "<td>" + escapeHtml(s.name) + "</td>";
+            html += "<td>" + escapeHtml(sensorTypeToString(s.deviceType)) + "</td>";
             html += "<td>" + formatSN(s.serialNumber) + "</td>";
 
             // Status: badge + optional last reject reason on the line below
@@ -692,7 +737,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             {
                 html += "<br><small style='color:#c0392b;'>";
                 html += "last reject: ";
-                html += String(h.lastRejectReason);
+                html += escapeHtml(String(h.lastRejectReason));
                 html += " (";
                 html += formatRelativeMillis(nowMillis, h.lastRejectAtMillis, true);
                 html += ")</small>";
@@ -702,7 +747,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             // Last seen: prefer relative form derived from our millis snapshot;
             // the wall-clock form (getLastSeenString) is kept as a tooltip so
             // users can still see the exact timestamp if NTP is synced.
-            html += "<td title='" + s.getLastSeenString() + "'>";
+            html += "<td title='" + escapeHtml(s.getLastSeenString()) + "'>";
             html += formatRelativeMillis(nowMillis, h.lastOkAtMillis, h.hasLastOk);
             html += "</td>";
 
@@ -730,8 +775,9 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
 
             html += "<td>";
             html += "<a class='btn' href='/sensors/edit?index=" + String(idx) + "'>Edit</a> ";
-            html += "<a class='btn btn-delete' href='/sensors/delete?index=" + String(idx) +
-                    "' onclick='return confirm(\"Are you sure you want to delete this sensor?\")'>Delete</a>";
+            html += "<form method='post' action='/sensors/delete' style='display:inline;margin:0' onsubmit='return confirm(\"Are you sure you want to delete this sensor?\")'>";
+            html += "<input type='hidden' name='index' value='" + String(idx) + "'>";
+            html += "<button type='submit' class='btn btn-delete'>Delete</button></form>";
             html += "</td></tr>";
         }
         html += "</table>";
@@ -754,8 +800,9 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong></p>";
     html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn'>Check for update</button></p>";
     html += "<hr>";
-    html += "<label for='fwUrl'>Custom firmware URL:</label>";
-    html += "<input type='text' id='fwUrl' placeholder='https://example.com/firmware.bin'>";
+    html += "<label for='fwUrl'>Official firmware URL:</label>";
+    html += "<input type='text' id='fwUrl' placeholder='https://pajenicko.cz/webflash/explora-gw-lite/firmware.bin'>";
+    html += "<p><small>Only HTTPS URLs under the official pajenicko.cz firmware directory are accepted.</small></p>";
     html += "<button class='btn' onclick='(function(){var u=document.getElementById(\"fwUrl\").value.trim(); if(u){ updateFirmware(u); } else { alert(\"Enter firmware URL first\"); }})()'>Update from URL</button>";
     html += "</div>";
 
@@ -888,7 +935,7 @@ String HTMLGenerator::generateSensorAddPage()
 
     // Device key
     html += "<label for='deviceKey'>Device Key:</label>";
-    html += "<input type='text' id='deviceKey' name='deviceKey' placeholder='e.g. DEADBEEF' required>";
+    html += "<input type='password' id='deviceKey' name='deviceKey' autocomplete='new-password' placeholder='e.g. DEADBEEF' required>";
 
     // New code with a single field
     html += "<label for='customUrl'>Custom URL with Placeholders (Optional):</label>";
@@ -1094,7 +1141,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Sensor name
     html += "<label for='name'>Sensor Name:</label>";
-    html += "<input type='text' id='name' name='name' value='" + sensor.name + "' required>";
+    html += "<input type='text' id='name' name='name' value='" + escapeHtml(sensor.name) + "' required>";
 
     // Sensor type
     html += "<label for='deviceType'>Device Type:</label>";
@@ -1167,7 +1214,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Device key
     html += "<label for='deviceKey'>Device Key:</label>";
-    html += "<input type='text' id='deviceKey' name='deviceKey' value='" + formatKey(sensor.deviceKey) + "' required>";
+    html += "<input type='password' id='deviceKey' name='deviceKey' value='' autocomplete='new-password' placeholder='Leave blank to keep the stored key'>";
+    html += "<small>Enter exactly 8 hexadecimal characters only when replacing the key.</small>";
 
     // New code with a single field
     html += "<label for='customUrl'>Custom URL with Placeholders (Optional):</label>";
@@ -1199,7 +1247,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "<div class='placeholder-item'>Device Type <code>*TYPE*</code></div>";
     html += "</div>"; // end of grid
     html += "</div>"; // end of urlHelp
-    html += "<input type='text' id='customUrl' name='customUrl' placeholder='https://example.com/api?temp=*TEMP*&hum=*HUM*' value='" + sensor.customUrl + "'>";
+    html += "<input type='text' id='customUrl' name='customUrl' placeholder='https://example.com/api?temp=*TEMP*&hum=*HUM*' value='" + escapeHtml(sensor.customUrl) + "'>";
 
     html += "<h3 style='margin-top: 20px;'>Sensor Reading Corrections</h3>";
     html += "<p>Adjust sensor readings by adding offsets or applying multipliers. Leave at 0 for no correction.</p>";
@@ -1415,7 +1463,8 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
     // Buttons for working with logs
     html += "<div style='margin-top: 20px;'>";
     html += "<a href='/logs' class='btn'>Refresh</a> ";
-    html += "<a href='/logs/clear' class='btn btn-delete' onclick='return confirm(\"Are you sure you want to clear all logs?\")'>Clear Logs</a>";
+    html += "<form method='post' action='/logs/clear' style='display:inline;margin:0' onsubmit='return confirm(\"Are you sure you want to clear all logs?\")'>";
+    html += "<button type='submit' class='btn btn-delete'>Clear Logs</button></form>";
     html += "</div>";
     html += "</div>";
 
@@ -1464,7 +1513,8 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
                     break;
                 }
 
-                html += "<div class='log-entry " + logClass + "'>" + logs[index].getFormattedLog() + "</div>";
+                html += "<div class='log-entry " + logClass + "'>" +
+                        escapeHtml(logs[index].getFormattedLog()) + "</div>";
             }
         }
         else
@@ -1522,24 +1572,25 @@ void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const LogEntr
                 break;
             }
 
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<div class='log-entry %s'>%s</div>",
-                                   logClass,
-                                   logs[logIdx].getFormattedLog().c_str());
-
-            // Safety check to avoid buffer overflow
-            if (contentLen >= maxLen - 100)
+            const String escapedLog = escapeHtml(logs[logIdx].getFormattedLog());
+            const String entry =
+                "<div class='log-entry " + String(logClass) + "'>" +
+                escapedLog + "</div>";
+            if (!appendBounded(buffer, maxLen, contentLen, entry))
             {
-                contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                       "<div class='log-entry log-warning'>Log output truncated due to buffer size limitations</div>");
+                appendBounded(
+                    buffer, maxLen, contentLen,
+                    "<div class='log-entry log-warning'>Log output truncated due to "
+                    "buffer size limitations</div>");
                 break;
             }
         }
     }
     else
     {
-        contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                               "<div class='log-entry'>No logs to display</div>");
+        appendBounded(
+            buffer, maxLen, contentLen,
+            "<div class='log-entry'>No logs to display</div>");
     }
 }
 
@@ -1623,9 +1674,9 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     {
         const auto &sensor = sensors[0];
         html += "    {\n";
-        html += "      \"name\": \"" + sensor.name + "\",\n";
+        html += "      \"name\": \"" + escapeHtml(sensor.name) + "\",\n";
         html += "      \"type\": " + String(static_cast<uint8_t>(sensor.deviceType)) + ",\n";
-        html += "      \"typeName\": \"" + String(sensor.getTypeInfo().name) + "\",\n";
+        html += "      \"typeName\": \"" + escapeHtml(String(sensor.getTypeInfo().name)) + "\",\n";
         html += "      \"serialNumber\": \"" + formatSN(sensor.serialNumber) + "\",\n";
         html += "      \"lastSeen\": " + (sensor.lastSeen > 0 ? String((millis() - sensor.lastSeen) / 1000) : "-1") + ",\n";
 

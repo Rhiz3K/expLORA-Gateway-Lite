@@ -42,6 +42,7 @@ private:
     Logger &logger;              // Reference to logger
     Preferences preferences;     // For persistent configuration
     bool preferencesInitialized; // Preferences initialization flag
+    String accessCredential;     // Per-device AP and HTTP administrator secret
 
     // Configuration files
     const char *configFile; // Configuration file
@@ -53,6 +54,7 @@ private:
     // Loading and saving from/to Preferences
     bool loadFromPreferences();
     bool saveToPreferences();
+    bool ensureAccessCredential();
 
 public:
     // Device configuration
@@ -100,6 +102,10 @@ public:
 
     // Get device name for AP mode
     String getDeviceName() const;
+
+    // Per-device credential used for the WPA2 recovery AP and HTTP Basic auth.
+    // This value is intentionally available only to local firmware components.
+    const String &getAccessCredential() const;
 
     // Set WiFi configuration
     bool setWiFiConfig(const String &ssid, const String &password, bool saveConfig = true);

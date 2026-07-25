@@ -52,6 +52,7 @@
 // Web interface
 #include "Web/WebServer.h"
 #include "Web/HTMLGenerator.h"
+#include "Security/SecurityPolicy.h"
 
 // Global object instances
 Logger logger;                // Logging system
@@ -66,6 +67,9 @@ WebPortal *webPortal;         // Web interface
 // Timer for disabling AP mode
 unsigned long apStartTime = 0;
 bool temporaryAPMode = false;
+bool systemReady = false;
+wl_status_t lifecycleLastWifiStatus = WL_NO_SHIELD;
+bool lifecycleWifiStatusInitialized = false;
 
 // NTP synchronization helper - returns true if time was successfully synchronized
 bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000)
@@ -173,16 +177,36 @@ void setup()
         return;
     }
 
+    // Enable the ESP32 radio entropy source before a first-boot credential may
+    // be generated. No STA association is started until WiFi.begin() below.
+    if (!WiFi.mode(WIFI_STA))
+    {
+        logger.error("Failed to initialize WiFi entropy source");
+        return;
+    }
+
     // Configuration manager initialization
     configManager = new ConfigManager(logger);
     if (!configManager->init())
     {
+        WiFi.mode(WIFI_OFF);
+        Serial.println("ERROR: Secure NVS credential initialization failed. Repair or erase NVS over USB, then reboot.");
         logger.error("Failed to initialize configuration manager");
         return;
     }
 
     // Setting logging level according to configuration
     logger.setLogLevel(configManager->logLevel);
+
+    // Physical ownership/bootstrap channel. The credential is never emitted
+    // through the web interface or Logger, but is printed on USB serial at
+    // every boot so the device owner can recover access.
+    const String uniqueSSID = makeApName();
+    Serial.println("\nSecure device access");
+    Serial.println("AP SSID: " + uniqueSSID);
+    Serial.println("Admin username: " + String(HTTP_ADMIN_USERNAME));
+    Serial.println("Access credential: " + configManager->getAccessCredential());
+    Serial.println("Keep this credential private; it protects both WiFi AP and HTTP administration.\n");
 
     // SPI manager initialization
     spiManager = new SPIManager(logger);
@@ -204,44 +228,50 @@ void setup()
                     String(sensorManager->getSensorCount()) + " sensors");
     }
 
-    // WiFi Initialization - MODIFIED CODE SECTION
+    webPortal = new WebPortal(*sensorManager, logger,
+                              configManager->wifiSSID, configManager->wifiPassword,
+                              configManager->configMode, *configManager, configManager->timezone);
+
+    // WiFi initialization
     logger.info("Configuring WiFi. ConfigMode: " + String(configManager->configMode ? "true" : "false") +
                 ", SSID length: " + String(configManager->wifiSSID.length()));
 
     // Setting timer for temporary AP mode
     apStartTime = millis();
     temporaryAPMode = true;
-
-    String uniqueSSID = makeApName();
+    wl_status_t setupWifiOutcome = WL_DISCONNECTED;
 
     if (configManager->configMode || configManager->wifiSSID.length() == 0)
     {
         // We're in configuration mode or don't have credentials - AP mode only
         logger.info("Starting in AP mode only");
-        WiFi.mode(WIFI_AP);
-
-        // Configure AP with unique SSID (channel 6, max 4 clients)
-        WiFi.softAP(uniqueSSID.c_str(), nullptr, 6, 0, 4);
+        if (!webPortal->startAccessPoint(false))
+        {
+            WiFi.mode(WIFI_OFF);
+            Serial.println("ERROR: Protected AP startup failed; refusing open fallback");
+            logger.error("Protected AP startup failed; setup cannot continue");
+            return;
+        }
         logger.info("AP started with SSID: " + uniqueSSID + ", IP: " + WiFi.softAPIP().toString());
 
         configManager->enableConfigMode(true);
-        webPortal = new WebPortal(*sensorManager, logger,
-                                  configManager->wifiSSID, configManager->wifiPassword,
-                                  configManager->configMode, *configManager, configManager->timezone);
     }
     else
     {
         // We have credentials - start AP+STA mode
         logger.info("Starting in AP+STA mode (dual mode)");
-        WiFi.mode(WIFI_AP_STA);
-
-        // Configure AP part with unique SSID (channel 6, max 4 clients)
-        WiFi.softAP(uniqueSSID.c_str(), nullptr, 6, 0, 4);
+        if (!webPortal->startAccessPoint(true))
+        {
+            WiFi.mode(WIFI_OFF);
+            Serial.println("ERROR: Protected temporary AP startup failed; refusing open fallback");
+            logger.error("Protected temporary AP startup failed; setup cannot continue");
+            return;
+        }
         logger.info("Temporary AP started with SSID: " + uniqueSSID +
                     " (will be active for 5 minutes). IP: " + WiFi.softAPIP().toString());
 
         // Configure STA part (client)
-        logger.info("Attempting to connect to WiFi: " + configManager->wifiSSID);
+        logger.info("Attempting to connect to configured WiFi network");
         WiFi.begin(configManager->wifiSSID.c_str(), configManager->wifiPassword.c_str());
 
         int attempts = 0;
@@ -254,6 +284,7 @@ void setup()
 
         if (WiFi.status() == WL_CONNECTED)
         {
+            setupWifiOutcome = WL_CONNECTED;
             logger.info("WiFi connected! IP: " + WiFi.localIP().toString());
             configManager->enableConfigMode(false);
 
@@ -270,17 +301,18 @@ void setup()
         }
         else
         {
-            logger.warning("Failed to connect to WiFi after " + String(attempts) + " attempts. SSID: " +
-                           configManager->wifiSSID + ", Continuing in AP mode only");
-            // Switch to AP mode only
-            WiFi.mode(WIFI_AP);
+            logger.warning("Failed to connect to configured WiFi after " + String(attempts) +
+                           " attempts; keeping protected AP+STA active for automatic reconnect");
+            // Keep STA enabled. ESP32 auto-reconnect can still succeed later,
+            // at which point the normal connected transition shuts down AP.
         }
-
-        // Web interface initialization - will be accessible via AP and client (if connected)
-        webPortal = new WebPortal(*sensorManager, logger,
-                                  configManager->wifiSSID, configManager->wifiPassword,
-                                  configManager->configMode, *configManager, configManager->timezone);
     }
+
+    // Snapshot the result of the initial connection attempt. If STA connects
+    // later while the remaining setup work runs, the first loop iteration
+    // observes the transition and explicitly shuts down the recovery AP.
+    lifecycleLastWifiStatus = setupWifiOutcome;
+    lifecycleWifiStatusInitialized = true;
 
     // LoRa module initialization
     loraModule = new LoRaModule(logger, spiManager);
@@ -295,13 +327,6 @@ void setup()
 
     // LoRa protocol initialization
     loraProtocol = new LoRaProtocol(*loraModule, *sensorManager, logger);
-
-    // Web portal initialization if not already initialized
-    if (!webPortal)
-    {
-        webPortal = new WebPortal(*sensorManager, logger, configManager->wifiSSID, configManager->wifiPassword, configManager->configMode, *configManager,
-                                  configManager->timezone);
-    }
 
     // Initialize MQTT Manager if WiFi is connected
     mqttManager = new MQTTManager(*sensorManager, *configManager, logger);
@@ -327,38 +352,64 @@ void setup()
     logger.info("Task watchdog initialized with timeout of " + String(WDT_TIMEOUT) + " seconds");
 
     logger.info("System initialization complete");
+    systemReady = true;
 }
 
 // Loop - main loop
 void loop()
 {
+    // setup() can fail closed before global components exist (notably when
+    // NVS cannot persist the per-device credential). Arduino still calls
+    // loop() after setup() returns, so keep the radio/server inert and avoid
+    // dereferencing partially initialized globals.
+    if (!systemReady)
+    {
+        delay(1000);
+        return;
+    }
+
     esp_task_wdt_reset();
 
     // Detect WiFi status transitions and adapt web server routes
-    static wl_status_t lastWifiStatus = WiFi.status();
     wl_status_t currentWifiStatus = WiFi.status();
-    if (lastWifiStatus != currentWifiStatus)
+    if (!lifecycleWifiStatusInitialized)
+    {
+        lifecycleLastWifiStatus = currentWifiStatus;
+        lifecycleWifiStatusInitialized = true;
+    }
+    if (lifecycleLastWifiStatus != currentWifiStatus)
     {
         // On transition to connected, update portal mode (routes are always registered)
         if (currentWifiStatus == WL_CONNECTED)
         {
-            logger.info("WiFi connected (transition). Reinitializing web portal routes.");
-            if (webPortal)
+            logger.info("WiFi connected (transition). Closing recovery AP.");
+            // A connection observed after the initial setup snapshot is a
+            // reconnect, not the intentional five-minute bootstrap window.
+            // Clear the window flag so a failed radio-disable operation is
+            // retried below until the AP mode bit is actually gone.
+            temporaryAPMode = false;
+            if (webPortal &&
+                SecurityPolicy::decideApLifecycleAction(
+                    SecurityPolicy::ApLifecycleEvent::StaReconnected, true) ==
+                    SecurityPolicy::ApLifecycleAction::ShutDown)
             {
-                webPortal->setAPMode(false);
+                webPortal->shutdownAccessPoint();
             }
         }
         // On transition away from connected, switch portal to AP mode so handlers reflect captive state
-        else if (lastWifiStatus == WL_CONNECTED && currentWifiStatus != WL_CONNECTED)
+        else if (lifecycleLastWifiStatus == WL_CONNECTED && currentWifiStatus != WL_CONNECTED)
         {
             logger.warning("WiFi disconnected (transition). Switching web portal to AP mode.");
-            if (webPortal)
+            if (webPortal &&
+                SecurityPolicy::decideApLifecycleAction(
+                    SecurityPolicy::ApLifecycleEvent::StaDisconnected, false) ==
+                    SecurityPolicy::ApLifecycleAction::EnsureRunning)
             {
                 webPortal->setAPMode(true);
                 // No immediate restart to avoid flapping; routes will still serve config via handlers
             }
         }
-        lastWifiStatus = currentWifiStatus;
+        lifecycleLastWifiStatus = currentWifiStatus;
     }
 
     // Check timer for temporary AP mode
@@ -366,20 +417,40 @@ void loop()
     {
         if (millis() - apStartTime > AP_TIMEOUT)
         {
-            // Time expired, switch to client mode if successfully connected
-            if (WiFi.status() == WL_CONNECTED)
+            const bool staConnected = WiFi.status() == WL_CONNECTED;
+            const SecurityPolicy::ApLifecycleAction action =
+                SecurityPolicy::decideApLifecycleAction(
+                    SecurityPolicy::ApLifecycleEvent::TemporaryWindowExpired,
+                    staConnected);
+            if (action == SecurityPolicy::ApLifecycleAction::ShutDown)
             {
-                logger.info("Temporary AP timeout reached. Switching to client mode only.");
-                WiFi.mode(WIFI_STA);
-                temporaryAPMode = false;
+                logger.info("Temporary AP timeout reached. Shutting down AP radio.");
+                if (webPortal)
+                {
+                    webPortal->shutdownAccessPoint();
+                }
             }
             else
             {
-                // Not connected as a client, keep AP running
                 logger.info("Temporary AP timeout reached but WiFi client not connected. Keeping AP mode active.");
-                temporaryAPMode = false; // Stop timer, but AP remains active
             }
+            // If disconnected, the AP stays up, but a later STA transition
+            // still runs the same shutdown operation above.
+            temporaryAPMode = false;
         }
+    }
+
+    // A radio-mode change can fail transiently. Once the temporary bootstrap
+    // window is over (or a reconnect closed it early), retry AP-only shutdown
+    // without touching an established STA association.
+    static unsigned long lastApShutdownRetry = 0;
+    if (!temporaryAPMode && WiFi.status() == WL_CONNECTED && webPortal &&
+        webPortal->isAccessPointActive() &&
+        millis() - lastApShutdownRetry > 5000)
+    {
+        lastApShutdownRetry = millis();
+        logger.warning("AP radio still active while STA is connected; retrying shutdown");
+        webPortal->shutdownAccessPoint();
     }
 
     // Process LoRa packets

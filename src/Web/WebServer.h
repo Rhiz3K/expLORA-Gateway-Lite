@@ -55,7 +55,8 @@ private:
     SensorManager &sensorManager; // Reference to sensor manager
     Logger &logger;               // Reference to logger
 
-    bool isAPMode; // AP mode (true) or client mode (false)
+    bool isAPMode;      // Captive portal/UI state, independent of AP hardware
+    bool apRadioActive; // Physical AP radio state
     String apName; // AP name in AP mode
     bool routesRegistered = false; // Ensure routes are registered only once
     bool serverStarted = false;    // Track server begin/end state
@@ -72,12 +73,18 @@ private:
     String otaUploadErrorMsg = "";
     size_t otaUploadExpected = 0;
     size_t otaUploadWritten  = 0;
+    bool otaUploadRejected = false;
 
-    // Full AP (re)initialization with hard WiFi reset — only safe at boot.
-    void setupAP();
+    // Single-flight OTA: only one authenticated OTA (URL update or multipart
+    // upload) may be in flight at a time. Async handlers run on a worker task
+    // and the global `Update`/FS state is not re-entrant.
+    volatile bool otaInProgress = false;
 
     // Bring the AP up additively without disturbing an active STA. Idempotent.
-    void ensureAPUp();
+    bool ensureAPUp();
+
+    // Stop captive DNS and the physical AP while preserving STA association.
+    void shutdownAP();
 
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
@@ -88,6 +95,9 @@ private:
 
     // Setup routes for web server
     void setupRoutes();
+    // Central authentication and same-origin policy for management requests.
+    bool isRequestAuthorized(AsyncWebServerRequest *request, bool stateChanging) const;
+    bool authorizeRequest(AsyncWebServerRequest *request, bool stateChanging);
     // Guard handlers: if AP mode, redirect to /config and return true
     bool guardAPOnly(AsyncWebServerRequest *request);
 
@@ -153,11 +163,20 @@ public:
     // Process DNS requests (for captive portal)
     void processDNS();
 
+    // Start the WPA2 AP. If allowStation is true, preserve/use STA mode too.
+    bool startAccessPoint(bool allowStation);
+
     // Switch between AP and client modes
     void setAPMode(bool enable);
 
+    // Explicit physical AP shutdown used by timeout and reconnect paths.
+    void shutdownAccessPoint();
+
     // Get current mode
     bool isInAPMode() const;
+
+    // Get physical AP state (separate from captive portal/UI state).
+    bool isAccessPointActive() const;
 
     // Restart web server
     void restart();

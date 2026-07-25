@@ -68,7 +68,7 @@ bool MQTTManager::init()
     mqttClient.setSocketTimeout(5);
 
     // Log initialization
-    logger.info("MQTT initialized with broker: " + configManager.mqttHost + ":" + String(configManager.mqttPort));
+    logger.info("MQTT client initialized with configured broker");
 
     return true;
 }

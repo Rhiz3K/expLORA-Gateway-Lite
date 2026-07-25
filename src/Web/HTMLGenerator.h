@@ -72,10 +72,10 @@ public:
     static String generateHomePage(const std::vector<SensorData> &sensors);
 
     // Generate configuration page
-    static String generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip, const String &timezone);
+    static String generateConfigPage(const String &ssid, bool hasPassword, bool configMode, const String &ip, const String &timezone);
 
     // Generate MQTT settings page
-    static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
+    static String generateMqttPage(const String &host, int port, const String &user, bool hasPassword, bool enabled, bool tls,
                                     const String &prefix, bool haEnabled, String &haPrefix);
 
     // Generate sensor list page

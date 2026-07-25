@@ -24,6 +24,8 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_system.h>
+#include "../Security/SecurityPolicy.h"
 
 // External NTP sync function from main.cpp
 extern bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000);
@@ -55,15 +57,66 @@ bool ConfigManager::init()
 
     if (!preferencesInitialized)
     {
-        logger.error("Failed to initialize Preferences");
+        logger.error("Failed to initialize Preferences; secure AP cannot be started");
+        return false;
     }
-    else
+
+    logger.debug("Preferences initialized successfully");
+
+    if (!ensureAccessCredential())
     {
-        logger.debug("Preferences initialized successfully");
+        logger.error("Per-device access credential unavailable; refusing insecure startup");
+        return false;
     }
 
     // Load configuration
     return load();
+}
+
+bool ConfigManager::ensureAccessCredential()
+{
+    static const char *key = "accessCred";
+
+    if (preferences.isKey(key))
+    {
+        accessCredential = preferences.getString(key, "");
+        if (!SecurityPolicy::isAccessCredentialFormat(accessCredential.c_str()))
+        {
+            logger.error("Stored access credential is invalid; erase or repair NVS over USB");
+            accessCredential = "";
+            return false;
+        }
+        return true;
+    }
+
+    accessCredential.reserve(SecurityPolicy::ACCESS_CREDENTIAL_LENGTH);
+    const size_t alphabetSize = sizeof(SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET) - 1;
+    static_assert((alphabetSize & (alphabetSize - 1)) == 0,
+                  "Credential alphabet must be a power of two");
+    for (size_t i = 0; i < SecurityPolicy::ACCESS_CREDENTIAL_LENGTH; ++i)
+    {
+        accessCredential +=
+            SecurityPolicy::ACCESS_CREDENTIAL_ALPHABET[esp_random() & (alphabetSize - 1)];
+    }
+
+    if (!SecurityPolicy::isAccessCredentialFormat(accessCredential.c_str()) ||
+        preferences.putString(key, accessCredential) == 0)
+    {
+        logger.error("Failed to persist generated access credential to Preferences");
+        accessCredential = "";
+        return false;
+    }
+
+    const String persisted = preferences.getString(key, "");
+    if (persisted != accessCredential)
+    {
+        logger.error("Access credential failed Preferences read-back verification");
+        accessCredential = "";
+        return false;
+    }
+
+    logger.info("Generated and persisted a new per-device access credential");
+    return true;
 }
 
 // Load configuration from both sources
@@ -130,14 +183,6 @@ bool ConfigManager::loadFromFS()
         return false;
     }
 
-    // Log the raw content for debugging
-    String fileContent = file.readString();
-    logger.debug("Raw config file content: " + fileContent);
-    file.close();
-
-    // Re-open the file for parsing
-    file = LittleFS.open(configFile, "r");
-
     // Create JSON document
     DynamicJsonDocument doc(512);
     DeserializationError error = deserializeJson(doc, file);
@@ -166,8 +211,8 @@ bool ConfigManager::loadFromFS()
     mqttHAPrefix = doc["mqttHAPrefix"] | HA_DISCOVERY_DEFAULT_PREFIX;
     mqttHAEnabled = doc["mqttHAEnabled"] | HA_DISCOVERY_DEFAULT_ENABLED;
 
-    logger.debug("Loaded config - SSID: " + wifiSSID +
-                 ", Password length: " + String(wifiPassword.length()) +
+    logger.debug("Loaded config - SSID length: " + String(wifiSSID.length()) +
+                 ", password configured: " + String(wifiPassword.length() > 0 ? "true" : "false") +
                  ", configMode: " + String(configMode ? "true" : "false"));
 
     // Set log level if available
@@ -286,28 +331,40 @@ bool ConfigManager::saveToPreferences()
         return false;
     }
 
+    bool success = true;
+    const auto putStringChecked = [this, &success](const char *key, const String &value) {
+        const size_t written = preferences.putString(key, value);
+        // Preferences::putString() returns zero for both a successfully
+        // stored empty string and for failure. Read-back disambiguates the
+        // empty-secret case; non-empty strings must also report full length.
+        const bool writeReported = value.length() == 0 || written == value.length();
+        const bool readBackMatches =
+            preferences.isKey(key) && preferences.getString(key, "\x01") == value;
+        success = success && writeReported && readBackMatches;
+    };
+
     // Save logging level
     String logLevelStr = logger.levelToString(logLevel);
-    preferences.putString("logLevel", logLevelStr);
-    preferences.putString("timezone", timezone);
+    putStringChecked("logLevel", logLevelStr);
+    putStringChecked("timezone", timezone);
 
     // Save MQTT configuration
-    preferences.putString("mqttHost", mqttHost);
-    preferences.putInt("mqttPort", mqttPort);
-    preferences.putString("mqttUser", mqttUser);
-    preferences.putString("mqttPassword", mqttPassword);
-    preferences.putBool("mqttEnabled", mqttEnabled);
-    preferences.putBool("mqttTls", mqttTls);
-    preferences.putString("mqttPrefix", mqttPrefix);
-    preferences.putBool("mqttHAEnabled", mqttHAEnabled);
-    preferences.putString("mqttHAPrefix", mqttHAPrefix);
+    putStringChecked("mqttHost", mqttHost);
+    success = preferences.putInt("mqttPort", mqttPort) == sizeof(int32_t) && success;
+    putStringChecked("mqttUser", mqttUser);
+    putStringChecked("mqttPassword", mqttPassword);
+    success = preferences.putBool("mqttEnabled", mqttEnabled) == sizeof(uint8_t) && success;
+    success = preferences.putBool("mqttTls", mqttTls) == sizeof(uint8_t) && success;
+    putStringChecked("mqttPrefix", mqttPrefix);
+    success = preferences.putBool("mqttHAEnabled", mqttHAEnabled) == sizeof(uint8_t) && success;
+    putStringChecked("mqttHAPrefix", mqttHAPrefix);
 
     // Save WiFi configuration (as backup)
-    preferences.putString("ssid", wifiSSID);
-    preferences.putString("password", wifiPassword);
-    preferences.putBool("configMode", configMode);
+    putStringChecked("ssid", wifiSSID);
+    putStringChecked("password", wifiPassword);
+    success = preferences.putBool("configMode", configMode) == sizeof(uint8_t) && success;
 
-    return true;
+    return success;
 }
 
 // Add a new method to set MQTT configuration
@@ -320,10 +377,6 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
     if (!isValidMqttTopic(rootPrefix) || !isValidMqttTopic(haPrefix))
     {
         logger.error("Invalid MQTT topic format");
-        logger.verbose("Root topic: " + rootPrefix);
-        logger.verbose("root check: " + String(isValidMqttTopic(rootPrefix)));
-        logger.verbose("HA topic: " + haPrefix);
-        logger.verbose("HA check: " + String(isValidMqttTopic(haPrefix)));
         return false;
     }
 
@@ -391,6 +444,7 @@ void ConfigManager::resetToDefaults()
     mqttUser = MQTT_DEFAULT_USER;
     mqttPassword = MQTT_DEFAULT_PASS;
     mqttEnabled = MQTT_DEFAULT_ENABLED;
+    mqttTls = MQTT_DEFAULT_TLS;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
     mqttHAPrefix = HA_DISCOVERY_DEFAULT_PREFIX;
@@ -432,6 +486,11 @@ String ConfigManager::getDeviceName() const
     String result = deviceName;
     result.toUpperCase();
     return result;
+}
+
+const String &ConfigManager::getAccessCredential() const
+{
+    return accessCredential;
 }
 
 // Set WiFi configuration

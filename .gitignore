@@ -402,6 +402,9 @@ FodyWeavers.xsd
 # Ignore PlatformIO build output
 .pio/
 
+# Local hardware integration credentials
+/tests/integration/config.ini
+
 # Ignore VS Code settings
 .vscode/
 

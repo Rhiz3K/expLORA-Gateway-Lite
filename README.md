@@ -24,6 +24,7 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - Real-time sensor monitoring
   - Sensor management (add, edit, delete)
   - Configuration settings
+  - Per-device HTTP administrator authentication
 
 - **Network Connectivity**:
   - Dual-mode operation (AP and client)
@@ -84,17 +85,31 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
 ## Initial Setup
 
 1. **First Boot**:
-   - The gateway will start in AP mode
-   - Connect to the WiFi network named "expLORA-GW-XXXXXX"
+   - Connect the gateway to USB and open a 115200-baud serial monitor.
+   - The gateway creates a random per-device credential in ESP32 NVS on first
+     boot. It is reused across reboots and normal firmware updates.
+   - Record the printed `AP SSID`, `Admin username` (`admin`), and
+     `Access credential`. This is the ownership/bootstrap channel; the
+     credential is not available from an unauthenticated HTTP endpoint.
+   - Connect to the WPA2 network named `expLORA-GW-XXXXXX` using that access
+     credential. The firmware fails closed if NVS cannot store or reload it;
+     it never falls back to an open AP or shared password.
 
 2. **Configure WiFi**:
    - Open a browser and navigate to 192.168.4.1
+   - Enter the serial-console administrator username and access credential
+     when the browser presents the HTTP Basic authentication prompt.
    - Enter your home WiFi credentials
    - Save and reboot
 
 3. **Access the Web Interface**:
    - Once connected to your network, find the gateway's IP from your router
    - Access the web interface by entering the IP in a browser
+   - Use the same HTTP administrator credentials on the home network.
+
+Keep the access credential private. Erasing NVS creates a new credential and
+requires physical USB access to retrieve it. Erasing only LittleFS does not
+intentionally reset this NVS credential.
 
 ## Adding Sensors
 
@@ -141,11 +156,61 @@ The gateway will automatically generate discovery information for Home Assistant
 
 ## API Usage
 
-The gateway provides a REST API for programmatic access to sensor data:
+The gateway provides an authenticated REST API for programmatic access to
+sensor data. For example:
+
+```bash
+curl --user admin http://192.168.1.42/api?format=json
+```
+
+`curl` prompts for the per-device access credential when it is omitted from
+the command line.
 
 - **List all sensors**: `/api?format=json`
 - **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (where XXXXXX is the sensor's serial number in hex)
 - **CSV format**: Replace `json` with `csv` in the URL
+
+The API is same-origin by default and does not emit wildcard CORS headers.
+All web management and telemetry routes require HTTP Basic authentication,
+regardless of whether they are reached through the AP or STA interface.
+
+State-changing operations use POST. In particular:
+
+```text
+POST /reboot
+POST /sensors/delete   (form field: index)
+POST /logs/clear
+```
+
+Browser POSTs carrying an `Origin` header are accepted only when that origin
+exactly matches the request `Host`. Authenticated non-browser clients that omit
+`Origin` remain supported. This strict Origin/Host check supplements Basic
+authentication with a practical CSRF defense.
+
+Stored WiFi and MQTT passwords and sensor device keys are never rendered back
+into HTML. Blank password/key fields preserve an existing secret. WiFi and
+MQTT forms provide an explicit clear-password checkbox; a nonblank sensor key
+explicitly replaces the existing key.
+
+## Firmware update security
+
+Both manual firmware uploads and URL-based updates require administrator
+authentication and the browser same-origin check before any flash operation.
+URL updates accept only verified HTTPS URLs on exactly `pajenicko.cz`, below
+`/webflash/explora-gw-lite/`; redirects, userinfo, non-default ports, encoded
+paths, and alternate hosts are rejected. HTTPS is validated against the
+embedded public trust anchor. When the official manifest supplies a
+`sha256` field, the downloaded image is checked against it before finalizing
+the update.
+
+This repository does **not** contain maintainer firmware-signing infrastructure
+or a release public key, so application-level signed-image verification is not
+claimed. Manual uploads are protected by device authentication and ESP image
+validation, while URL updates additionally use the restricted authenticated
+TLS origin and optional manifest SHA-256. Before release, maintainers still
+need to establish an offline signing key/public-key verification flow (or
+ESP32 Secure Boot with protected eFuses) and validate certificate-chain,
+upload, rollback, and power-loss behavior on real hardware.
 
 Example API response:
 ```json
