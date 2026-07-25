@@ -574,6 +574,17 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
             altitude = request->getParam("altitude", true)->value().toInt();
         }
 
+        if (name.length() > MAX_SENSOR_NAME_LENGTH)
+        {
+            request->send(400, "text/plain", "Sensor name too long");
+            return;
+        }
+        if (customUrl.length() > MAX_SENSOR_CUSTOM_URL_LENGTH)
+        {
+            request->send(400, "text/plain", "Custom URL too long");
+            return;
+        }
+
         if (!SecurityPolicy::isHexString(deviceKeyHex.c_str(), 8))
         {
             request->send(400, "text/plain", "Device key must be exactly 8 hexadecimal characters");
@@ -638,26 +649,15 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
 
         if (sensorIndex >= 0)
         {
-            // Get added sensor and update additional data
-            SensorData *sensor = sensorManager.getSensor(sensorIndex);
-            if (sensor)
+            // Apply the remaining fields through the manager so the update,
+            // serialization and rollback are covered by the same mutex.
+            const bool configured = sensorManager.updateSensorConfig(
+                sensorIndex, name, deviceType, serialNumber, deviceKey,
+                customUrl, altitude, tempCorr, humCorr, pressCorr, ppmCorr,
+                luxCorr, windSpeedCorr, windDirCorr, rainAmountCorr,
+                rainRateCorr);
+            if (configured)
             {
-                sensor->customUrl = customUrl;
-                sensor->altitude = altitude;
-
-                // Set correction values
-                sensor->temperatureCorrection = tempCorr;
-                sensor->humidityCorrection = humCorr;
-                sensor->pressureCorrection = pressCorr;
-                sensor->ppmCorrection = ppmCorr;
-                sensor->luxCorrection = luxCorr;
-                sensor->windSpeedCorrection = windSpeedCorr;
-                sensor->windDirectionCorrection = windDirCorr;
-                sensor->rainAmountCorrection = rainAmountCorr;
-                sensor->rainRateCorrection = rainRateCorr;
-
-                sensorManager.saveSensors(true);
-
                 logger.info("Added new sensor: " + name + " (SN: " + serialNumberHex + ")");
 
                 // If MQTT is enabled, publish discovery message
@@ -670,6 +670,8 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
                 request->redirect("/sensors");
                 return;
             }
+
+            logger.error("Failed to persist complete configuration for newly added sensor");
         }
 
         // Error adding sensor
@@ -787,6 +789,17 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
             altitude = request->getParam("altitude", true)->value().toInt();
         }
 
+        if (name.length() > MAX_SENSOR_NAME_LENGTH)
+        {
+            request->send(400, "text/plain", "Sensor name too long");
+            return;
+        }
+        if (customUrl.length() > MAX_SENSOR_CUSTOM_URL_LENGTH)
+        {
+            request->send(400, "text/plain", "Custom URL too long");
+            return;
+        }
+
         const SensorData *existingSensor = sensorManager.getSensor(index);
         if (!existingSensor || !existingSensor->configured)
         {
@@ -898,12 +911,11 @@ void WebPortal::handleLogs(AsyncWebServerRequest *request)
     if (!authorizeRequest(request, false)) return;
     if (guardAPOnly(request)) return;
 
-    // Get logs
-    size_t logCount = 0;
-    const LogEntry *logs = logger.getLogs(logCount);
+    // Snapshot under Logger's mutex; render only caller-owned String objects.
+    const std::vector<LogEntry> logs = logger.getLogsSnapshot();
 
     // Generate HTML
-    String html = HTMLGenerator::generateLogsPage(logs, logCount, logger.getLogLevel());
+    String html = HTMLGenerator::generateLogsPage(logs, logger.getLogLevel());
 
     // Send response
     request->send(200, "text/html", html);

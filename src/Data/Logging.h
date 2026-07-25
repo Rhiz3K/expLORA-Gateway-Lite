@@ -23,6 +23,7 @@
 
 #include <Arduino.h>
 #include <mutex>
+#include <vector>
 #include "../config.h"
 
 // Preallocated capacities for in-memory log strings
@@ -146,8 +147,9 @@ public:
     static void debug(const String &message);
     static void verbose(const String &message);
 
-    // Get all logs (for web interface)
-    static const LogEntry *getLogs(size_t &count);
+    // Return newest-first caller-owned entries. The copy is made while
+    // logMutex is held, so asynchronous renderers never observe live Strings.
+    static std::vector<LogEntry> getLogsSnapshot();
 
     // Clear all logs
     static void clearLogs();
@@ -162,7 +164,4 @@ public:
     static void setTimeInitialized(bool initialized);
 
     static bool isTimeInitialized() { return timeInitialized; }
-
-    static size_t getLogIndex() { return logIndex; }
-    static size_t getLogBufferSize() { return logBufferSize; }
 };

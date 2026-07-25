@@ -33,6 +33,25 @@ home WiFi password, and sensor device key never get committed.
 
 25 tests total when fully configured (sensor SN set, reboot enabled).
 
+### Issue #23 storage/concurrency stress test
+
+After flashing a build from the issue #23 branch, run the focused destructive
+test separately:
+
+```bash
+python3 tests/integration/test_issue23.py \
+  --url http://gateway-ip \
+  --admin-credential '<admin credential>'
+```
+
+It temporarily fills all 20 sensor slots with large records, reboots and
+checks persistence, races log snapshots against log clearing, and verifies
+that the API remains responsive while a real sensor's custom HTTP request is
+held open. It also verifies that oversized names and forwarding URLs are
+rejected without changing stored configuration. Temporary sensors and the
+custom URL are restored in `finally`; existing device keys are never read or
+replaced.
+
 ## Provisioning flow (first run, gateway with no STA config)
 
 When `[gateway].ip` is empty or unreachable, the script provisions the

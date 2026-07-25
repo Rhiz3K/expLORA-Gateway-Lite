@@ -212,12 +212,25 @@ void Logger::verbose(const String &message)
     log(LogLevel::VERBOSE, message);
 }
 
-// Get all logs (for web interface)
-const LogEntry *Logger::getLogs(size_t &count)
+// Get a stable newest-first snapshot for asynchronous web rendering.
+std::vector<LogEntry> Logger::getLogsSnapshot()
 {
     std::lock_guard<std::mutex> lock(logMutex);
-    count = logCount;
-    return logBuffer;
+
+    std::vector<LogEntry> snapshot;
+    snapshot.reserve(logCount);
+    if (logBuffer == nullptr || logBufferSize == 0)
+    {
+        return snapshot;
+    }
+
+    for (size_t i = 0; i < logCount; ++i)
+    {
+        const size_t index =
+            (logIndex - 1 - i + logBufferSize) % logBufferSize;
+        snapshot.push_back(logBuffer[index]);
+    }
+    return snapshot;
 }
 
 // Clear all logs

@@ -88,7 +88,7 @@ public:
     static String generateSensorEditPage(const SensorData &sensor, int index);
 
     // Generate logs page
-    static String generateLogsPage(const LogEntry *logs, size_t logCount, LogLevel currentLevel);
+    static String generateLogsPage(const std::vector<LogEntry> &logs, LogLevel currentLevel);
 
     // Generate API page
     static String generateAPIPage(const std::vector<SensorData> &sensors);
@@ -104,7 +104,7 @@ public:
 
     // Optimized versions using buffer
     static void generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors);
-    static void generateLogTable(char *buffer, size_t &maxLen, const LogEntry *logs, size_t logCount);
+    static void generateLogTable(char *buffer, size_t &maxLen, const std::vector<LogEntry> &logs);
 
     // Additional helper methods
     static String getWifiNetworkOptions(const String &currentSSID);

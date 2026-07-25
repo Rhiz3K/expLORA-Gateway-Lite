@@ -1508,10 +1508,11 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 }
 
 // Generating logs page
-String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, LogLevel currentLevel)
+String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLevel currentLevel)
 {
     String html;
     html.reserve(8192);
+    const size_t logCount = logs.size();
 
     // Adding header
     addHtmlHeader(html, "Logs");
@@ -1551,7 +1552,7 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
     {
         memset(htmlBuffer, 0, htmlBufferSize);
         size_t maxLen = htmlBufferSize;
-        generateLogTable(htmlBuffer, maxLen, logs, logCount);
+        generateLogTable(htmlBuffer, maxLen, logs);
         html += htmlBuffer;
     }
     else
@@ -1561,10 +1562,9 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
         {
             for (size_t i = 0; i < logCount; i++)
             {
-                size_t index = (logCount - 1 - i); // Display from newest
                 String logClass = "log-";
 
-                switch (logs[index].level)
+                switch (logs[i].level)
                 {
                 case LogLevel::ERROR:
                     logClass += "error";
@@ -1587,7 +1587,7 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
                 }
 
                 html += "<div class='log-entry " + logClass + "'>" +
-                        escapeHtml(logs[index].getFormattedLog()) + "</div>";
+                        escapeHtml(logs[i].getFormattedLog()) + "</div>";
             }
         }
         else
@@ -1609,21 +1609,18 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
 }
 // Generating log table
 // In HTMLGenerator.cpp
-void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const LogEntry *logs, size_t logCount)
+void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const std::vector<LogEntry> &logs)
 {
     size_t contentLen = 0;
+    const size_t logCount = logs.size();
 
     if (logCount > 0)
     {
         // Loop through from newest to oldest
         for (size_t i = 0; i < logCount; i++)
         {
-            // Calculate correct index in the circular buffer
-            // This is critical to display logs correctly
-            size_t logIdx = (Logger::getLogIndex() - 1 - i + Logger::getLogBufferSize()) % Logger::getLogBufferSize();
-
             const char *logClass = "";
-            switch (logs[logIdx].level)
+            switch (logs[i].level)
             {
             case LogLevel::ERROR:
                 logClass = "log-error";
@@ -1645,7 +1642,7 @@ void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const LogEntr
                 break;
             }
 
-            const String escapedLog = escapeHtml(logs[logIdx].getFormattedLog());
+            const String escapedLog = escapeHtml(logs[i].getFormattedLog());
             const String entry =
                 "<div class='log-entry " + String(logClass) + "'>" +
                 escapedLog + "</div>";

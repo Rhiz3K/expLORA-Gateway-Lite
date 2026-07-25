@@ -21,13 +21,14 @@
 
 #include "SensorManager.h"
 #include "SensorCalibration.h"
+#include "SensorStoragePolicy.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
-    : sensorCount(0), logger(log), sensorsFile(file)
+    : sensorCount(0), logger(log), storageLoadedSuccessfully(true), sensorsFile(file)
 {
 }
 
@@ -67,10 +68,17 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
 
+    if (name.length() > MAX_SENSOR_NAME_LENGTH)
+    {
+        logger.error("Failed to add sensor: name exceeds maximum length");
+        return -1;
+    }
+
     // Check if sensor already exists
     int existingIndex = findSensorBySN(serialNumber);
     if (existingIndex >= 0)
     {
+        const SensorData previous = sensors[existingIndex];
         // Update existing sensor
         sensors[existingIndex].deviceType = deviceType;
         sensors[existingIndex].deviceKey = deviceKey;
@@ -78,15 +86,13 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
         sensors[existingIndex].configured = true;
 
         logger.info("Updated existing sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-        saveSensors(false);
+        if (!saveSensors(false))
+        {
+            sensors[existingIndex] = previous;
+            logger.error("Sensor update rolled back because persistence failed");
+            return -1;
+        }
         return existingIndex;
-    }
-
-    // Check if we still have space
-    if (sensorCount >= MAX_SENSORS)
-    {
-        logger.error("Failed to add sensor: maximum number of sensors reached");
-        return -1;
     }
 
     // Find first free slot
@@ -100,13 +106,15 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
         }
     }
 
-    // If no free slot, use the last index
     if (newIndex == -1)
     {
-        newIndex = sensorCount;
-        sensorCount++;
+        logger.error("Failed to add sensor: maximum number of sensors reached");
+        return -1;
     }
-    else if (newIndex >= sensorCount)
+
+    const size_t previousCount = sensorCount;
+    const SensorData previousSlot = sensors[newIndex];
+    if (newIndex >= static_cast<int>(sensorCount))
     {
         sensorCount = newIndex + 1;
     }
@@ -128,7 +136,13 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
     sensors[newIndex].configured = true;
 
     logger.info("Added new sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
+    if (!saveSensors(false))
+    {
+        sensors[newIndex] = previousSlot;
+        sensorCount = previousCount;
+        logger.error("Sensor add rolled back because persistence failed");
+        return -1;
+    }
     return newIndex;
 }
 
@@ -176,7 +190,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
                                      float windSpeed, uint16_t windDirection,
                                      float rainAmount, float rainRate)
 {
-    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::unique_lock<std::mutex> lock(sensorMutex);
 
     if (index < 0 || index >= sensorCount || !sensors[index].configured)
     {
@@ -423,9 +437,19 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
     sensors[index].rssi = rssi;
     sensors[index].lastSeen = millis();
 
-    if (WiFi.status() == WL_CONNECTED)
+    const bool shouldForward = WiFi.status() == WL_CONNECTED;
+    SensorData forwardSnapshot;
+    if (shouldForward)
     {
-        forwardSensorData(index);
+        // Copy the exact values produced by this packet, then release the
+        // sensor lock before DNS/connect/read can block.
+        forwardSnapshot = sensors[index];
+    }
+    lock.unlock();
+
+    if (shouldForward)
+    {
+        forwardSensorSnapshot(forwardSnapshot);
     }
     else
     {
@@ -437,14 +461,30 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
 
 bool SensorManager::forwardSensorData(int index)
 {
-    if (index < 0 || index >= sensorCount || !sensors[index].configured)
+    SensorData snapshot;
     {
-        logger.warning("Attempt to forward data for non-existent sensor at index " + String(index));
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        if (index < 0 || static_cast<size_t>(index) >= sensorCount ||
+            !sensors[index].configured)
+        {
+            logger.warning("Attempt to forward data for non-existent sensor at index " + String(index));
+            return false;
+        }
+        snapshot = sensors[index];
+    }
+
+    return forwardSensorSnapshot(snapshot);
+}
+
+bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
+{
+    if (!sensor.configured)
+    {
         return false;
     }
 
     // Check if the sensor has a custom endpoint configured
-    if (sensors[index].customUrl.length() == 0)
+    if (sensor.customUrl.length() == 0)
     {
         // No endpoint configured, nothing to do
         return true;
@@ -458,7 +498,7 @@ bool SensorManager::forwardSensorData(int index)
     http.setReuse(false);
 
     // Format the custom URL by replacing placeholders
-    String url = sensors[index].customUrl;
+    String url = sensor.customUrl;
 
     // Skip if no URL is configured
     if (url.length() == 0)
@@ -470,53 +510,53 @@ bool SensorManager::forwardSensorData(int index)
     bool isHttps = url.startsWith("https://");
 
     // Process the URL - replace placeholders with actual values
-    if (sensors[index].hasTemperature())
+    if (sensor.hasTemperature())
     {
-        url.replace("*TEMP*", String(sensors[index].temperature, 2));
+        url.replace("*TEMP*", String(sensor.temperature, 2));
     }
-    if (sensors[index].hasHumidity())
+    if (sensor.hasHumidity())
     {
-        url.replace("*HUM*", String(sensors[index].humidity, 2));
+        url.replace("*HUM*", String(sensor.humidity, 2));
     }
-    if (sensors[index].hasPressure())
+    if (sensor.hasPressure())
     {
-        url.replace("*PRESS*", String(sensors[index].pressure, 2));
+        url.replace("*PRESS*", String(sensor.pressure, 2));
     }
-    if (sensors[index].hasPPM())
+    if (sensor.hasPPM())
     {
-        url.replace("*PPM*", String(sensors[index].ppm, 0));
+        url.replace("*PPM*", String(sensor.ppm, 0));
     }
-    if (sensors[index].hasLux())
+    if (sensor.hasLux())
     {
-        url.replace("*LUX*", String(sensors[index].lux, 1));
+        url.replace("*LUX*", String(sensor.lux, 1));
     }
 
     // Added placeholders for METEO data
-    if (sensors[index].hasWindSpeed())
+    if (sensor.hasWindSpeed())
     {
-        url.replace("*WIND_SPEED*", String(sensors[index].windSpeed, 1));
+        url.replace("*WIND_SPEED*", String(sensor.windSpeed, 1));
     }
-    if (sensors[index].hasWindDirection())
+    if (sensor.hasWindDirection())
     {
-        url.replace("*WIND_DIR*", String(sensors[index].windDirection));
+        url.replace("*WIND_DIR*", String(sensor.windDirection));
     }
-    if (sensors[index].hasRainAmount())
+    if (sensor.hasRainAmount())
     {
-        url.replace("*RAIN*", String(sensors[index].rainAmount, 1));
-        url.replace("*DAILY_RAIN*", String(sensors[index].dailyRainTotal, 1)); // New placeholder
+        url.replace("*RAIN*", String(sensor.rainAmount, 1));
+        url.replace("*DAILY_RAIN*", String(sensor.dailyRainTotal, 1)); // New placeholder
     }
-    if (sensors[index].hasRainRate())
+    if (sensor.hasRainRate())
     {
-        url.replace("*RAIN_RATE*", String(sensors[index].rainRate, 1));
+        url.replace("*RAIN_RATE*", String(sensor.rainRate, 1));
     }
 
     // Replace other common placeholders
-    url.replace("*BAT*", String(sensors[index].batteryVoltage, 2));
-    url.replace("*RSSI*", String(sensors[index].rssi));
-    url.replace("*SN*", formatSN(sensors[index].serialNumber));
-    url.replace("*TYPE*", String(static_cast<uint8_t>(sensors[index].deviceType)));
+    url.replace("*BAT*", String(sensor.batteryVoltage, 2));
+    url.replace("*RSSI*", String(sensor.rssi));
+    url.replace("*SN*", formatSN(sensor.serialNumber));
+    url.replace("*TYPE*", String(static_cast<uint8_t>(sensor.deviceType)));
 
-    logger.debug("Forwarding data for sensor " + sensors[index].name +
+    logger.debug("Forwarding data for sensor " + sensor.name +
                  " to its configured endpoint");
 
     // For HTTPS, use a secure client, but ensure we delete it after the request
@@ -570,6 +610,13 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
 
+    if (name.length() > MAX_SENSOR_NAME_LENGTH ||
+        customUrl.length() > MAX_SENSOR_CUSTOM_URL_LENGTH)
+    {
+        logger.warning("Rejected sensor configuration with oversized text fields");
+        return false;
+    }
+
     if (index < 0 || index >= sensorCount || !sensors[index].configured)
     {
         logger.warning("Attempt to update non-existent sensor at index " + String(index));
@@ -585,6 +632,8 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
                        sensors[existingIndex].name);
         return false;
     }
+
+    const SensorData previous = sensors[index];
 
     // Update basic configuration
     sensors[index].name = name;
@@ -606,7 +655,12 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     sensors[index].rainRateCorrection = rainRateCorr;
 
     logger.info("Updated configuration for sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
+    if (!saveSensors(false))
+    {
+        sensors[index] = previous;
+        logger.error("Sensor configuration update rolled back because persistence failed");
+        return false;
+    }
     return true;
 }
 
@@ -623,18 +677,25 @@ bool SensorManager::deleteSensor(int index)
 
     String name = sensors[index].name;
     uint32_t serialNumber = sensors[index].serialNumber;
+    const bool wasConfigured = sensors[index].configured;
 
     // Mark as unconfigured instead of physically removing
     sensors[index].configured = false;
 
     logger.info("Deleted sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
+    if (!saveSensors(false))
+    {
+        sensors[index].configured = wasConfigured;
+        logger.error("Sensor delete rolled back because persistence failed");
+        return false;
+    }
     return true;
 }
 
 // Get number of sensors
 size_t SensorManager::getSensorCount() const
 {
+    std::lock_guard<std::mutex> lock(sensorMutex);
     return sensorCount;
 }
 
@@ -705,21 +766,35 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
 // Save sensor configuration to file
 bool SensorManager::saveSensors(bool lockMutex)
 {
+    std::unique_lock<std::mutex> lock(sensorMutex, std::defer_lock);
     if (lockMutex)
     {
-        std::lock_guard<std::mutex> lock(sensorMutex);
+        lock.lock();
     }
 
-    // Open file for writing
-    File file = LittleFS.open(sensorsFile, "w");
-    if (!file)
+    // A parse/open failure must not turn a recoverable sensors.json into an
+    // empty or partial file on the next web request.
+    if (!storageLoadedSuccessfully && LittleFS.exists(sensorsFile))
     {
-        logger.info("Failed to open sensors file for writing: " + String(sensorsFile));
+        logger.error("Refusing to overwrite sensor configuration after a failed load");
         return false;
     }
 
-    // Create JSON document
-    DynamicJsonDocument doc(4096); // Sufficiently large buffer
+    size_t configuredCount = 0;
+    size_t copiedStringBytes = 0;
+    for (size_t i = 0; i < sensorCount; ++i)
+    {
+        if (!sensors[i].configured)
+        {
+            continue;
+        }
+        ++configuredCount;
+        copiedStringBytes += sensors[i].name.length() + 1;
+        copiedStringBytes += sensors[i].customUrl.length() + 1;
+    }
+
+    DynamicJsonDocument doc(
+        SensorStoragePolicy::documentCapacity(configuredCount, copiedStringBytes));
     JsonArray sensorArray = doc.createNestedArray("sensors");
 
     // Add sensors to JSON
@@ -753,28 +828,50 @@ bool SensorManager::saveSensors(bool lockMutex)
             sensor["rainRateCorrection"] = sensors[i].rainRateCorrection;
         }
     }
-    logger.info("Serializing sensors to JSON");
-    
-    String jsonString;
-    size_t jsonSize = serializeJson(doc, jsonString);
-    if (jsonSize == 0)
+
+    if (doc.overflowed() || sensorArray.size() != configuredCount)
     {
-        logger.error("Failed to serialize sensors to JSON");
-        file.close();
+        logger.error("Sensor JSON capacity exhausted; existing configuration left unchanged");
         return false;
     }
 
-    // Write JSON string to file
-    size_t bytesWritten = file.print(jsonString);
-    file.flush(); // Ensure data is written to flash
+    const size_t expectedBytes = measureJson(doc);
+    if (expectedBytes == 0)
+    {
+        logger.error("Failed to measure sensor JSON");
+        return false;
+    }
+
+    // Write a complete temporary file first. LittleFS rename uses the
+    // filesystem's atomic replacement operation, so the previous file remains
+    // valid until the new file has been fully flushed and closed.
+    const String temporaryPath = String(sensorsFile) + ".tmp";
+    File file = LittleFS.open(temporaryPath.c_str(), "w");
+    if (!file)
+    {
+        logger.error("Failed to open temporary sensor file for writing");
+        return false;
+    }
+
+    const size_t bytesWritten = serializeJson(doc, file);
+    file.flush();
     file.close();
 
-    if (bytesWritten != jsonSize)
+    if (bytesWritten != expectedBytes)
     {
-        logger.error("Failed to write complete JSON to file");
+        logger.error("Failed to write complete sensor JSON; existing file preserved");
+        LittleFS.remove(temporaryPath.c_str());
         return false;
     }
 
+    if (!LittleFS.rename(temporaryPath.c_str(), sensorsFile))
+    {
+        logger.error("Failed to atomically replace sensor configuration");
+        LittleFS.remove(temporaryPath.c_str());
+        return false;
+    }
+
+    storageLoadedSuccessfully = true;
     logger.info("Saved " + String(sensorArray.size()) + " sensors to " + String(sensorsFile));
     return true;
 }
@@ -784,16 +881,15 @@ bool SensorManager::loadSensors()
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
 
-    // Reset sensor count
-    sensorCount = 0;
-    for (size_t i = 0; i < MAX_SENSORS; i++)
-    {
-        sensors[i].configured = false;
-    }
-
     // Check if file exists
     if (!LittleFS.exists(sensorsFile))
     {
+        sensorCount = 0;
+        for (size_t i = 0; i < MAX_SENSORS; ++i)
+        {
+            sensors[i] = SensorData();
+        }
+        storageLoadedSuccessfully = true;
         logger.info("Sensors file not found: " + String(sensorsFile) + ", starting with empty configuration");
         return true; // Not an error, we just start with an empty configuration
     }
@@ -803,147 +899,120 @@ bool SensorManager::loadSensors()
     if (!file)
     {
         logger.error("Failed to open sensors file for reading: " + String(sensorsFile));
+        storageLoadedSuccessfully = false;
         return false;
     }
 
-    // Check file size
-    size_t fileSize = file.size();
+    const size_t fileSize = file.size();
     if (fileSize == 0)
     {
-        logger.warning("Sensors file is empty, starting with empty configuration");
+        logger.error("Sensors file is empty; preserving it for recovery");
         file.close();
-        LittleFS.remove(sensorsFile); // Remove empty file
-        return true;
+        storageLoadedSuccessfully = false;
+        return false;
     }
 
-    // Read content and check for whitespace-only files
-    String fileContent = file.readString();
-    file.close();
-
-    fileContent.trim();
-    if (fileContent.length() == 0)
-    {
-        logger.warning("Sensors file contains only whitespace, removing it");
-        LittleFS.remove(sensorsFile);
-        return true;
-    }
-
-    // Create JSON document
-    DynamicJsonDocument doc(4096); // Sufficiently large buffer
-
-    // Deserialize JSON from file
-    DeserializationError error = deserializeJson(doc, fileContent);
+    DynamicJsonDocument doc(
+        SensorStoragePolicy::loadDocumentCapacity(fileSize, MAX_SENSORS));
+    const DeserializationError error = deserializeJson(doc, file);
     file.close();
 
     if (error)
     {
         logger.error("Failed to parse sensors file: " + String(error.c_str()));
+        storageLoadedSuccessfully = false;
         return false;
     }
 
-    // Load sensors from JSON
-    JsonArray sensorArray = doc["sensors"].as<JsonArray>();
-    for (JsonObject sensorObj : sensorArray)
+    const JsonArrayConst sensorArray = doc["sensors"].as<JsonArrayConst>();
+    if (sensorArray.isNull())
     {
-        if (sensorCount < MAX_SENSORS)
-        {
-            uint8_t typeValue = sensorObj["deviceType"];
-            SensorType deviceType = static_cast<SensorType>(typeValue);
-            uint32_t serialNumber = sensorObj["serialNumber"];
-            uint32_t deviceKey = sensorObj["deviceKey"];
-            String name = sensorObj["name"].as<String>();
-            String customUrl = sensorObj["customUrl"].as<String>();
-
-            // Create sensor
-            sensors[sensorCount].deviceType = deviceType;
-            sensors[sensorCount].serialNumber = serialNumber;
-            sensors[sensorCount].deviceKey = deviceKey;
-            sensors[sensorCount].name = name;
-            sensors[sensorCount].customUrl = customUrl;
-            sensors[sensorCount].lastSeen = 0;
-            sensors[sensorCount].temperature = 0.0f;
-            sensors[sensorCount].humidity = 0.0f;
-            sensors[sensorCount].pressure = 0.0f;
-            sensors[sensorCount].ppm = 0.0f;
-            sensors[sensorCount].lux = 0.0f;
-            sensors[sensorCount].batteryVoltage = 0.0f;
-            sensors[sensorCount].rssi = 0;
-            sensors[sensorCount].configured = true;
-
-            // Load daily rain total if it exists
-            if (sensorObj.containsKey("dailyRainTotal"))
-            {
-                sensors[sensorCount].dailyRainTotal = sensorObj["dailyRainTotal"].as<float>();
-            }
-            else
-            {
-                sensors[sensorCount].dailyRainTotal = 0.0f;
-            }
-
-            // Load time of last reset if it exists
-            if (sensorObj.containsKey("lastRainReset"))
-            {
-                sensors[sensorCount].lastRainReset = sensorObj["lastRainReset"].as<unsigned long>();
-            }
-            else
-            {
-                sensors[sensorCount].lastRainReset = 0;
-            }
-
-            if (sensorObj.containsKey("altitude"))
-            {
-                sensors[sensorCount].altitude = sensorObj["altitude"].as<int>();
-            }
-            else
-            {
-                sensors[sensorCount].altitude = 0;
-            }
-
-            if (sensorObj.containsKey("temperatureCorrection"))
-            {
-                sensors[sensorCount].temperatureCorrection = sensorObj["temperatureCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("humidityCorrection"))
-            {
-                sensors[sensorCount].humidityCorrection = sensorObj["humidityCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("pressureCorrection"))
-            {
-                sensors[sensorCount].pressureCorrection = sensorObj["pressureCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("ppmCorrection"))
-            {
-                sensors[sensorCount].ppmCorrection = sensorObj["ppmCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("luxCorrection"))
-            {
-                sensors[sensorCount].luxCorrection = sensorObj["luxCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("windSpeedCorrection"))
-            {
-                sensors[sensorCount].windSpeedCorrection = sensorObj["windSpeedCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("windDirectionCorrection"))
-            {
-                sensors[sensorCount].windDirectionCorrection = sensorObj["windDirectionCorrection"].as<int>();
-            }
-            if (sensorObj.containsKey("rainAmountCorrection"))
-            {
-                sensors[sensorCount].rainAmountCorrection = sensorObj["rainAmountCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("rainRateCorrection"))
-            {
-                sensors[sensorCount].rainRateCorrection = sensorObj["rainRateCorrection"].as<float>();
-            }
-            sensorCount++;
-        }
-        else
-        {
-            logger.warning("Too many sensors in configuration file, ignoring some");
-            break;
-        }
+        logger.error("Sensors file does not contain a sensors array");
+        storageLoadedSuccessfully = false;
+        return false;
+    }
+    if (sensorArray.size() > MAX_SENSORS)
+    {
+        logger.error("Sensors file exceeds MAX_SENSORS; existing configuration preserved");
+        storageLoadedSuccessfully = false;
+        return false;
     }
 
+    std::vector<SensorData> loadedSensors;
+    loadedSensors.reserve(sensorArray.size());
+    for (JsonObjectConst sensorObj : sensorArray)
+    {
+        SensorData sensor;
+        sensor.deviceType =
+            static_cast<SensorType>(sensorObj["deviceType"].as<uint8_t>());
+        sensor.serialNumber = sensorObj["serialNumber"].as<uint32_t>();
+        sensor.deviceKey = sensorObj["deviceKey"].as<uint32_t>();
+        sensor.name = sensorObj["name"].as<String>();
+        sensor.customUrl = sensorObj["customUrl"].as<String>();
+        sensor.configured = true;
+
+        if (sensorObj.containsKey("dailyRainTotal"))
+        {
+            sensor.dailyRainTotal = sensorObj["dailyRainTotal"].as<float>();
+        }
+        if (sensorObj.containsKey("lastRainReset"))
+        {
+            sensor.lastRainReset = sensorObj["lastRainReset"].as<unsigned long>();
+        }
+        if (sensorObj.containsKey("altitude"))
+        {
+            sensor.altitude = sensorObj["altitude"].as<int>();
+        }
+        if (sensorObj.containsKey("temperatureCorrection"))
+        {
+            sensor.temperatureCorrection = sensorObj["temperatureCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("humidityCorrection"))
+        {
+            sensor.humidityCorrection = sensorObj["humidityCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("pressureCorrection"))
+        {
+            sensor.pressureCorrection = sensorObj["pressureCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("ppmCorrection"))
+        {
+            sensor.ppmCorrection = sensorObj["ppmCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("luxCorrection"))
+        {
+            sensor.luxCorrection = sensorObj["luxCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("windSpeedCorrection"))
+        {
+            sensor.windSpeedCorrection = sensorObj["windSpeedCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("windDirectionCorrection"))
+        {
+            sensor.windDirectionCorrection = sensorObj["windDirectionCorrection"].as<int>();
+        }
+        if (sensorObj.containsKey("rainAmountCorrection"))
+        {
+            sensor.rainAmountCorrection = sensorObj["rainAmountCorrection"].as<float>();
+        }
+        if (sensorObj.containsKey("rainRateCorrection"))
+        {
+            sensor.rainRateCorrection = sensorObj["rainRateCorrection"].as<float>();
+        }
+        loadedSensors.push_back(sensor);
+    }
+
+    for (size_t i = 0; i < MAX_SENSORS; ++i)
+    {
+        sensors[i] = SensorData();
+    }
+    sensorCount = loadedSensors.size();
+    for (size_t i = 0; i < sensorCount; ++i)
+    {
+        sensors[i] = loadedSensors[i];
+    }
+
+    storageLoadedSuccessfully = true;
     logger.info("Loaded " + String(sensorCount) + " sensors from configuration");
     return true;
 }

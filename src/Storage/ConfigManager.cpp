@@ -28,7 +28,8 @@
 #include "../Security/SecurityPolicy.h"
 
 // External NTP sync function from main.cpp
-extern bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000);
+extern bool syncNTPTime(const String &timezone,
+                        unsigned long timeoutMs = NTP_SYNC_TIMEOUT_MS);
 
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)

@@ -73,7 +73,7 @@ wl_status_t lifecycleLastWifiStatus = WL_NO_SHIELD;
 bool lifecycleWifiStatusInitialized = false;
 
 // NTP synchronization helper - returns true if time was successfully synchronized
-bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000)
+bool syncNTPTime(const String &timezone, unsigned long timeoutMs = NTP_SYNC_TIMEOUT_MS)
 {
     configTime(0, 0, NTP_SERVER);
     setenv("TZ", timezone.c_str(), 1);
@@ -82,8 +82,13 @@ bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000)
     // Wait for actual NTP sync with timeout
     struct tm timeinfo;
     unsigned long startWait = millis();
+    const bool watchdogRegistered = esp_task_wdt_status(nullptr) == ESP_OK;
     while (!getLocalTime(&timeinfo, 100))
     {
+        if (watchdogRegistered)
+        {
+            esp_task_wdt_reset();
+        }
         if (millis() - startWait > timeoutMs)
         {
             return false;

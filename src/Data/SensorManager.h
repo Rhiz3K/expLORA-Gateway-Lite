@@ -41,9 +41,13 @@ private:
     size_t sensorCount;              // Current number of sensors
     mutable std::mutex sensorMutex;  // Mutex for safe multi-threaded access
     Logger &logger;                  // Reference to logger
+    bool storageLoadedSuccessfully;  // Prevents corrupt input from being overwritten
 
     // Filename for storing sensor configuration
     const char *sensorsFile;
+
+    // Forward an immutable snapshot without holding sensorMutex.
+    bool forwardSensorSnapshot(const SensorData &sensor);
 
 public:
     // Constructor

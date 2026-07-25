@@ -25,7 +25,7 @@
 #include <WiFi.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.14-dev-secure.4"
+#define FIRMWARE_VERSION "1.1.14-dev-storage.1"
 
 // OTA Configuration
 // NOTE: The manifest lives at the legacy flat path on the official server
@@ -83,10 +83,13 @@
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
+#define MAX_SENSOR_NAME_LENGTH 96     // Persisted sensor display name
+#define MAX_SENSOR_CUSTOM_URL_LENGTH 512 // Persisted forwarding URL
 #define LOG_BUFFER_SIZE 150           // Size of log buffer
 #define AP_TIMEOUT 300000             // AP mode timeout (5 minutes in milliseconds)
 #define WIFI_RECONNECT_INTERVAL 60000 // WiFi reconnect attempt interval (1 minute in milliseconds)
 #define WDT_TIMEOUT 10                // Watchdog timeout in seconds
+#define NTP_SYNC_TIMEOUT_MS 5000      // Leave margin below the task watchdog
 
 // File system configuration
 #define CONFIG_FILE "/config.json"   // Configuration file
