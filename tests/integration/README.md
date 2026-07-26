@@ -26,12 +26,12 @@ home WiFi password, and sensor device key never get committed.
 
 | Section | Cases | What it covers |
 |---|---|---|
-| Authentication/read-only smoke | 15 | unauthenticated 401 challenge on `/config` and `POST /firmware`, authenticated firmware version/manifest/status, rejected bad-signature cleanup, API, UI, diagnostics, logs, and 404 handling |
-| POST validation/security | 5  | Empty SSID, short password, missing param, SSID > 32 chars, and authenticated cross-origin POST rejection |
+| Authentication/read-only smoke | 15 | unauthenticated 401 challenge on `/config` and `POST /firmware`, authenticated firmware version/manifest/status, rejected bad-digest cleanup, API, UI, diagnostics, logs, and 404 handling |
+| POST validation/security | 7 | Empty SSID, short password, missing param, SSID > 32 chars, firmware digest rejection and cleanup, authenticated cross-origin POST rejection, and Origin/Host port validation |
 | Live sensor round-trip | 4 | Adds the sensor → waits up to 20 min for a real LoRa packet → checks decoded values are in physical ranges → confirms sensor appears in `/sensors` HTML |
 | Reboot recovery | 1 | authenticated `POST /reboot` → waits for device to drop off → waits up to 60 s for it to come back with the same version |
 
-25 tests total when fully configured (sensor SN set, reboot enabled).
+27 tests total when fully configured (sensor SN set, reboot enabled).
 
 ### Issue #23 storage/concurrency stress test
 
@@ -203,12 +203,12 @@ python3 tests/integration/test_gateway.py \
   it gone.
 - **Flashes only when explicitly requested.** `--flash`, `--rebuild`, or
   `[flash].before_test` are opt-in. The normal suite never installs an image;
-  it does verify that a fake signature is rejected and the OTA lock is freed.
+  it does verify that a bad digest is rejected and the OTA lock is freed.
 
 All management requests made by the suite use HTTP Basic authentication.
 Browser-style mutations are protected by the firmware's strict Origin/Host
 check; the Python client omits `Origin`, which is the documented policy for
 direct authenticated clients. Reboot, sensor deletion, and log clear are
 POST-only. Release validation should additionally exercise WPA2/AP shutdown,
-the public CA chain, successful signed manual and URL OTA, and rollback on the
-target hardware.
+the public CA chain, successful manual and URL OTA with SHA-256 verification,
+and rollback on the target hardware.

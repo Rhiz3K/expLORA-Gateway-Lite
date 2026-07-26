@@ -73,18 +73,30 @@ static void test_manifest_url_has_separate_exact_policy(void)
         "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json?channel=dev"));
 }
 
-static void test_signature_shape_and_version_ordering(void)
+static void test_semantic_version_ordering(void)
 {
-    TEST_ASSERT_TRUE(SecurityPolicy::isBase64SignatureShape(
-        "MEUCIQDRrCbHUPE4lALWkZ16f0X1M4r0wKszGmrYcPiXxQIgQpM+utN4U1X1hMK2sYd5s7VY0P6V0D0s0vF6Xw=="));
-    TEST_ASSERT_FALSE(SecurityPolicy::isBase64SignatureShape("unsigned"));
-    TEST_ASSERT_FALSE(SecurityPolicy::isBase64SignatureShape(
-        "MEUCIQDRrCbHUPE4lALWkZ16f0X1M4r0wKszGmrYcPiXxQIgQpM+utN4U1X1hMK2sYd5s7VY0P6V0D0s0vF6Xw=!"));
-
     TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer("1.1.14", "1.1.14-dev-secure"));
     TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer("1.1.15", "1.1.14"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer(
+        "1.1.14-dev-correctness.10", "1.1.14-dev-correctness.5"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer(
+        "1.1.14-alpha.1", "1.1.14-alpha"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer(
+        "1.1.14-beta", "1.1.14-10"));
     TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("1.1.13", "1.1.14-dev-secure"));
     TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("1.1.14", "1.1.14"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.1.14-alpha.5", "1.1.14-alpha.10"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.1.14-alpha", "1.1.14-alpha.1"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.1.14+build.2", "1.1.14+build.1"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.1.14-alpha..1", "1.1.14-alpha"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.1.14-alpha.01", "1.1.14-alpha"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer(
+        "1.01.14", "1.1.14"));
     TEST_ASSERT_FALSE(SecurityPolicy::isVersionNewer("not-a-version", "1.1.14"));
 }
 
@@ -121,8 +133,10 @@ static void test_browser_origin_policy_requires_exact_origin(void)
         "http://192.168.4.1", "192.168.4.1"));
     TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
         "http://gateway.local:8080", "GATEWAY.local:8080"));
-    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
         "https://gateway.local", "GATEWAY.local"));
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
+        "https://gateway.local", "GATEWAY.local:443"));
     TEST_ASSERT_TRUE(SecurityPolicy::isAllowedBrowserOrigin(
         "https://gateway.local:8443", "GATEWAY.local:8443"));
     TEST_ASSERT_FALSE(SecurityPolicy::isAllowedBrowserOrigin(
@@ -166,7 +180,7 @@ int main(int, char **)
     RUN_TEST(test_secret_update_preserves_replaces_and_clears);
     RUN_TEST(test_official_firmware_urls_are_allowed);
     RUN_TEST(test_manifest_url_has_separate_exact_policy);
-    RUN_TEST(test_signature_shape_and_version_ordering);
+    RUN_TEST(test_semantic_version_ordering);
     RUN_TEST(test_firmware_url_rejects_scheme_host_userinfo_and_port_bypasses);
     RUN_TEST(test_firmware_url_rejects_deceptive_or_encoded_paths);
     RUN_TEST(test_browser_origin_policy_requires_exact_origin);

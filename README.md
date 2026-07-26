@@ -199,36 +199,35 @@ explicitly replaces the existing key.
 ## Firmware update security
 
 Both manual firmware uploads and URL-based updates require administrator
-authentication, the browser same-origin check, a newer semantic version,
-SHA-256 integrity, and a trusted ECDSA P-256 metadata signature before the
-candidate image is activated. The signed canonical metadata binds the version
-to the exact image digest, preventing a signed older image from being
-relabeled as a new release.
+authentication, the browser same-origin check, a newer semantic version, and
+SHA-256 integrity before the candidate image is activated. Manual uploads are
+therefore available to developers building the GPL source without a separate
+release signing key.
 
 URL updates accept only verified HTTPS URLs on exactly `pajenicko.cz`, below
 `/webflash/explora-gw-lite/`; redirects, userinfo, non-default ports, encoded
 paths, and alternate hosts are rejected. TLS uses ESP-IDF's Mozilla CA bundle
 instead of one pinned root. Downloads run in a dedicated FreeRTOS task so the
 management server remains responsive, with progress exposed at
-`GET /firmware/status`. Signed OTA remains available through the protected
+`GET /firmware/status`. OTA remains available through the protected
 recovery AP.
 
 Manual upload state is isolated per HTTP request. Oversize data, failed writes,
-bad digests/signatures, and client disconnects abort and release the OTA slot,
+bad digests, and client disconnects abort and release the OTA slot,
 so a failed attempt cannot wedge later updates. A newly installed image is
 confirmed only after critical initialization; ESP32 bootloader rollback remains
 available until then.
 
-The repository contains only the release public key. Keep the private key
-offline and outside the checkout. To generate a detached `.sig`, `.sha256`,
-and optionally a manifest:
+Generate the detached digest required by the manual upload page with:
 
 ```bash
-EXPLORA_SIGNING_KEY=/secure/path/firmware-signing-p256.pem \
-python3 tools/sign_firmware.py .pio/build/esp32-s3-devkitc-1/firmware.bin \
-  --version 1.2.0 \
-  --url https://pajenicko.cz/webflash/explora-gw-lite/firmware-1.2.0.bin
+shasum -a 256 .pio/build/esp32-s3-devkitc-1/firmware.bin \
+  > .pio/build/esp32-s3-devkitc-1/firmware.sha256
 ```
+
+The gateway itself serves HTTP on port 80. An HTTPS reverse proxy must forward
+an explicit external port in `Host` (for example `gateway.local:443`) so the
+Origin/Host CSRF check can compare the complete external origin.
 
 Example API response:
 ```json

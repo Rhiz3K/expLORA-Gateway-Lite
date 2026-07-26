@@ -225,38 +225,6 @@ inline bool isAllowedManifestUrl(const std::string &url)
            asciiLower(url) == allowed;
 }
 
-inline bool isBase64SignatureShape(const std::string &value)
-{
-    // DER-encoded ECDSA P-256 signatures are normally 70-72 bytes, or roughly
-    // 96 base64 characters. Keep a bounded envelope and leave canonical DER
-    // validation to mbedTLS.
-    if (value.size() < 80 || value.size() > 128 || value.size() % 4 != 0)
-    {
-        return false;
-    }
-
-    std::size_t padding = 0;
-    for (std::size_t i = 0; i < value.size(); ++i)
-    {
-        const unsigned char ch = static_cast<unsigned char>(value[i]);
-        if (ch == '=')
-        {
-            ++padding;
-            if (i < value.size() - 2)
-            {
-                return false;
-            }
-            continue;
-        }
-        if (padding > 0 ||
-            !(std::isalnum(ch) != 0 || ch == '+' || ch == '/'))
-        {
-            return false;
-        }
-    }
-    return padding <= 2;
-}
-
 struct SemanticVersion
 {
     unsigned long major = 0;
@@ -276,6 +244,7 @@ inline bool parseVersionNumber(const std::string &text, std::size_t &position,
         return false;
     }
 
+    const std::size_t start = position;
     result = 0;
     while (position < text.size() &&
            std::isdigit(static_cast<unsigned char>(text[position])) != 0)
@@ -288,6 +257,55 @@ inline bool parseVersionNumber(const std::string &text, std::size_t &position,
         }
         result = result * 10UL + digit;
         ++position;
+    }
+    if (position - start > 1 && text[start] == '0')
+    {
+        return false;
+    }
+    return true;
+}
+
+inline bool isValidIdentifierList(const std::string &text,
+                                  std::size_t start,
+                                  std::size_t end,
+                                  bool rejectNumericLeadingZeros)
+{
+    if (start >= end)
+    {
+        return false;
+    }
+
+    std::size_t identifierStart = start;
+    for (std::size_t position = start; position <= end; ++position)
+    {
+        if (position < end)
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[position]);
+            if (ch != '.' &&
+                !(std::isalnum(ch) != 0 || ch == '-'))
+            {
+                return false;
+            }
+        }
+
+        if (position == end || text[position] == '.')
+        {
+            if (position == identifierStart)
+            {
+                return false;
+            }
+            if (rejectNumericLeadingZeros &&
+                position - identifierStart > 1 &&
+                text[identifierStart] == '0' &&
+                std::all_of(
+                    text.begin() + identifierStart,
+                    text.begin() + position,
+                    [](unsigned char ch) { return std::isdigit(ch) != 0; }))
+            {
+                return false;
+            }
+            identifierStart = position + 1;
+        }
     }
     return true;
 }
@@ -311,14 +329,9 @@ inline SemanticVersion parseSemanticVersion(const std::string &text)
         const std::size_t start = position;
         while (position < text.size() && text[position] != '+')
         {
-            const unsigned char ch = static_cast<unsigned char>(text[position]);
-            if (!(std::isalnum(ch) != 0 || ch == '.' || ch == '-'))
-            {
-                return version;
-            }
             ++position;
         }
-        if (position == start)
+        if (!isValidIdentifierList(text, start, position, true))
         {
             return version;
         }
@@ -330,16 +343,8 @@ inline SemanticVersion parseSemanticVersion(const std::string &text)
     {
         ++position;
         const std::size_t start = position;
-        while (position < text.size())
-        {
-            const unsigned char ch = static_cast<unsigned char>(text[position]);
-            if (!(std::isalnum(ch) != 0 || ch == '.' || ch == '-'))
-            {
-                return version;
-            }
-            ++position;
-        }
-        if (position == start)
+        position = text.size();
+        if (!isValidIdentifierList(text, start, position, false))
         {
             return version;
         }
@@ -347,6 +352,71 @@ inline SemanticVersion parseSemanticVersion(const std::string &text)
 
     version.valid = position == text.size();
     return version;
+}
+
+inline bool isNumericIdentifier(const std::string &identifier)
+{
+    return !identifier.empty() &&
+           std::all_of(identifier.begin(), identifier.end(),
+                       [](unsigned char ch) {
+                           return std::isdigit(ch) != 0;
+                       });
+}
+
+inline int comparePrerelease(const std::string &left,
+                             const std::string &right)
+{
+    std::size_t leftStart = 0;
+    std::size_t rightStart = 0;
+    while (true)
+    {
+        const std::size_t leftEnd = left.find('.', leftStart);
+        const std::size_t rightEnd = right.find('.', rightStart);
+        const std::string leftIdentifier = left.substr(
+            leftStart, leftEnd == std::string::npos
+                           ? std::string::npos
+                           : leftEnd - leftStart);
+        const std::string rightIdentifier = right.substr(
+            rightStart, rightEnd == std::string::npos
+                            ? std::string::npos
+                            : rightEnd - rightStart);
+
+        const bool leftNumeric = isNumericIdentifier(leftIdentifier);
+        const bool rightNumeric = isNumericIdentifier(rightIdentifier);
+        if (leftNumeric && rightNumeric)
+        {
+            if (leftIdentifier.size() != rightIdentifier.size())
+            {
+                return leftIdentifier.size() > rightIdentifier.size() ? 1 : -1;
+            }
+        }
+        else if (leftNumeric != rightNumeric)
+        {
+            // SemVer gives numeric identifiers lower precedence than
+            // non-numeric identifiers.
+            return leftNumeric ? -1 : 1;
+        }
+
+        if (leftIdentifier != rightIdentifier)
+        {
+            return leftIdentifier > rightIdentifier ? 1 : -1;
+        }
+
+        const bool leftFinished = leftEnd == std::string::npos;
+        const bool rightFinished = rightEnd == std::string::npos;
+        if (leftFinished || rightFinished)
+        {
+            if (leftFinished && rightFinished)
+            {
+                return 0;
+            }
+            // A larger set of otherwise equal identifiers has higher
+            // precedence: alpha.1 > alpha.
+            return leftFinished ? -1 : 1;
+        }
+        leftStart = leftEnd + 1;
+        rightStart = rightEnd + 1;
+    }
 }
 
 inline bool isVersionNewer(const std::string &candidateText,
@@ -369,7 +439,8 @@ inline bool isVersionNewer(const std::string &candidateText,
         return current.prerelease && !candidate.prerelease;
     if (!candidate.prerelease)
         return false;
-    return candidate.prereleaseText > current.prereleaseText;
+    return comparePrerelease(candidate.prereleaseText,
+                             current.prereleaseText) > 0;
 }
 
 struct Authority
@@ -470,6 +541,11 @@ inline Authority parseHttpAuthority(const std::string &rawAuthority, unsigned in
 /**
  * Browser POSTs must come from the exact HTTP origin serving the request.
  * An absent Origin is accepted for authenticated command-line/device clients.
+ *
+ * The gateway itself serves plain HTTP, so a Host header without an explicit
+ * port means port 80. An HTTPS reverse proxy must preserve its external port
+ * in Host (for example gateway.local:443); otherwise the gateway cannot
+ * distinguish that proxy from a forged scheme/port combination.
  */
 inline bool isAllowedBrowserOrigin(const std::string &origin, const std::string &hostHeader)
 {
@@ -512,11 +588,8 @@ inline bool isAllowedBrowserOrigin(const std::string &origin, const std::string 
 
     const Authority originAuthority =
         parseHttpAuthority(originAuthorityText, defaultPort);
-    // A reverse proxy normally forwards a Host header without the default
-    // external port. Use the Origin scheme's default for that case, while an
-    // explicit Host port still has to match exactly.
     const Authority requestAuthority =
-        parseHttpAuthority(hostHeader, defaultPort);
+        parseHttpAuthority(hostHeader, 80);
     return originAuthority.valid && requestAuthority.valid &&
            originAuthority.host == requestAuthority.host &&
            originAuthority.port == requestAuthority.port;

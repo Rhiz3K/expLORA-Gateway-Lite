@@ -43,9 +43,7 @@ Exit codes:
 """
 
 import argparse
-import base64
 import configparser
-import hashlib
 import os
 import platform
 import queue
@@ -956,13 +954,13 @@ def t_firmware_manifest_check(r: Runner) -> str:
     resp = r.get("/firmware/check", timeout=10)
     assert_status(resp, [200])
     body = resp.json()
-    for key in ("version", "currentVersion", "installable", "keyId"):
+    for key in ("version", "currentVersion", "installable"):
         if key not in body:
             raise TestFailed(f"missing {key!r} in normalized manifest response")
     if not isinstance(body["installable"], bool):
         raise TestFailed("manifest 'installable' is not boolean")
     if body["installable"]:
-        for key in ("url", "sha256", "signature"):
+        for key in ("url", "sha256"):
             if not body.get(key):
                 raise TestFailed(f"installable manifest lacks {key!r}")
     return f"normalized, installable={body['installable']}"
@@ -978,7 +976,7 @@ def t_firmware_status(r: Runner) -> str:
     return f"{body['status']}, inProgress={body['inProgress']}"
 
 
-def t_invalid_signed_upload_cleans_up(r: Runner) -> str:
+def t_invalid_digest_upload_cleans_up(r: Runner) -> str:
     current = r.get("/firmware/version").json()["version"]
     version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(current))
     if not version_match:
@@ -988,8 +986,7 @@ def t_invalid_signed_upload_cleans_up(r: Runner) -> str:
         f"{int(version_match.group(3)) + 1}-integration"
     )
     image = b"not-an-esp32-firmware-image"
-    digest = hashlib.sha256(image).hexdigest()
-    fake_signature = base64.b64encode(bytes(64)).decode("ascii")
+    digest = "0" * 64
     files = {"bin": ("firmware.bin", image, "application/octet-stream")}
     resp = r.session.post(
         f"{r.base}/firmware",
@@ -997,7 +994,6 @@ def t_invalid_signed_upload_cleans_up(r: Runner) -> str:
         headers={
             "X-Firmware-Version": candidate,
             "X-Firmware-SHA256": digest,
-            "X-Firmware-Signature": fake_signature,
         },
         timeout=8,
     )
@@ -1006,7 +1002,7 @@ def t_invalid_signed_upload_cleans_up(r: Runner) -> str:
     if status.get("inProgress"):
         raise TestFailed(f"rejected upload left OTA busy: {status}")
     assert_status(r.get("/firmware/version"), [200])
-    return "bad signature rejected; OTA lock released"
+    return "bad digest rejected; OTA lock released"
 
 
 def t_root(r: Runner) -> str:
@@ -1595,7 +1591,7 @@ def main():
     r.run("firmware version JSON", lambda: t_firmware_version(r))
     r.run("firmware manifest policy", lambda: t_firmware_manifest_check(r))
     r.run("firmware status JSON", lambda: t_firmware_status(r))
-    r.run("invalid signed upload cleanup", lambda: t_invalid_signed_upload_cleans_up(r))
+    r.run("invalid digest upload cleanup", lambda: t_invalid_digest_upload_cleans_up(r))
     r.run("/api?format=json shape", lambda: t_api_json(r))
     r.run("/api?format=csv basics", lambda: t_api_csv(r))
     if has_configured_sensor:

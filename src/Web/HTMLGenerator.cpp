@@ -136,7 +136,7 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     html += "</head><body>";
     html += "<header><h1>expLORA Gateway Lite</h1><h2>" + escapeHtml(title) + "</h2></header>";
 
-    // Recovery AP keeps the authenticated security and signed-OTA controls
+    // Recovery AP keeps the authenticated security and OTA controls
     // available, so a broken STA configuration can still be repaired safely.
     if (!isAPMode)
     {
@@ -196,7 +196,7 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "        var d=res.data; if(!d){ throw new Error('Bad JSON: '+res.raw); }";
     html += "        if(d.installable){";
     html += "          if(confirm('New version '+d.version+' available. Update now?')){";
-    html += "            window.updateFirmware(d.url,d.version,d.sha256,d.signature);";
+    html += "            window.updateFirmware(d.url,d.version,d.sha256);";
     html += "          }";
     html += "        } else {";
     html += "          alert(d.reason||'No trusted update is available.');";
@@ -213,13 +213,13 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "    }).catch(function(){setTimeout(window.pollFirmwareStatus,2500);});";
     html += "  };";
 
-    html += "  window.updateFirmware = function(url,version,sha256,signature){";
+    html += "  window.updateFirmware = function(url,version,sha256){";
     html += "    var btn=document.getElementById('btnUpdate'); if(btn) btn.disabled=true;";
-    html += "    window.showNotice('Starting signed firmware update. Do not power off.');";
+    html += "    window.showNotice('Starting firmware update. Do not power off.');";
     html += "    fetch('/firmware/update',{";
     html += "      method:'POST',";
     html += "      headers:{'Content-Type':'application/x-www-form-urlencoded'},";
-    html += "      body:'url='+encodeURIComponent(url)+'&version='+encodeURIComponent(version)+'&sha256='+encodeURIComponent(sha256)+'&signature='+encodeURIComponent(signature)";
+    html += "      body:'url='+encodeURIComponent(url)+'&version='+encodeURIComponent(version)+'&sha256='+encodeURIComponent(sha256)";
     html += "    })";
     html += "    .then(function(response){";
     html += "      return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
@@ -770,22 +770,20 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "<h2>Online Update</h2>";
     html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong></p>";
     html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn'>Check for update</button></p>";
-    html += "<p><small>The gateway accepts only a newer release from the official HTTPS origin with a valid expLORA firmware signature.</small></p>";
+    html += "<p><small>The gateway accepts only a newer release from the official HTTPS origin and verifies its SHA-256 digest before installation.</small></p>";
     html += "</div>";
 
-    // Card: Manual upload (.bin plus detached metadata signature)
+    // Card: Manual upload with a detached SHA-256 digest
     html += "<div class='card'>";
-    html += "<h2>Manual Signed Upload</h2>";
+    html += "<h2>Manual Upload</h2>";
     html += "<form id='uploadForm' enctype='multipart/form-data'>";
     html += "  <label for='fwVersion'>Firmware version:</label>";
     html += "  <input type='text' id='fwVersion' placeholder='1.2.0' pattern='[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.-]+)?' required>";
     html += "  <label for='fwFile'>Firmware image (.bin):</label>";
     html += "  <input type='file' name='bin' id='fwFile' accept='.bin,application/octet-stream' required>";
-    html += "  <label for='fwSignature'>Detached metadata signature (.sig):</label>";
-    html += "  <input type='file' id='fwSignature' accept='.sig,text/plain' required>";
     html += "  <label for='fwDigest'>Image digest (.sha256):</label>";
     html += "  <input type='file' id='fwDigest' accept='.sha256,text/plain' required>";
-    html += "  <p><small>Use the .sig and .sha256 files produced together by the release signer.</small></p>";
+    html += "  <p><small>Provide the image SHA-256 digest and a version newer than the running firmware.</small></p>";
     html += "  <button type='submit' id='btnUpload' class='btn'>Upload & Install</button>";
     html += "</form>";
     html += "</div>";
@@ -799,23 +797,22 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "    f.addEventListener('submit', function(ev){";
     html += "      ev.preventDefault();";
     html += "      var image=document.getElementById('fwFile').files[0];";
-    html += "      var sigFile=document.getElementById('fwSignature').files[0];";
     html += "      var digestFile=document.getElementById('fwDigest').files[0];";
     html += "      var version=document.getElementById('fwVersion').value.trim();";
-    html += "      if(!image||!sigFile||!digestFile||!version){ alert('Select the .bin, .sig, and .sha256 files, then enter the signed version'); return; }";
+    html += "      if(!image||!digestFile||!version){ alert('Select the .bin and .sha256 files, then enter the firmware version'); return; }";
     html += "      if(b) b.disabled=true;";
-    html += "      if(window.showNotice){ window.showNotice('Reading signed metadata…'); }";
-    html += "      Promise.all([sigFile.text(),digestFile.text()]).then(function(parts){";
-    html += "        var signature=parts[0].trim();var sha=parts[1].trim().toLowerCase();";
+    html += "      if(window.showNotice){ window.showNotice('Reading firmware metadata…'); }";
+    html += "      digestFile.text().then(function(digest){";
+    html += "        var sha=digest.trim().split(/\\s+/)[0].toLowerCase();";
     html += "        if(!/^[0-9a-f]{64}$/.test(sha)){throw new Error('Invalid .sha256 file');}";
     html += "        var fd=new FormData();fd.append('bin',image,image.name);";
-    html += "        if(window.showNotice){window.showNotice('Uploading signed firmware… Do not power off.');}";
-    html += "        return fetch('/firmware',{method:'POST',headers:{'X-Firmware-Version':version,'X-Firmware-SHA256':sha,'X-Firmware-Signature':signature},body:fd});";
+    html += "        if(window.showNotice){window.showNotice('Uploading firmware… Do not power off.');}";
+    html += "        return fetch('/firmware',{method:'POST',headers:{'X-Firmware-Version':version,'X-Firmware-SHA256':sha},body:fd});";
     html += "      })";
     html += "        .then(function(resp){ return resp.text().then(function(t){ return {ok:resp.ok,status:resp.status,data:parseJsonSafe(t),raw:t}; }); })";
     html += "        .then(function(res){";
     html += "          if(!res.ok){ throw new Error((res.data&&(res.data.error||res.data.message))||('HTTP '+res.status)); }";
-    html += "          var msg=(res.data&&res.data.message)?res.data.message:'Signed firmware installed; device will reboot.';";
+    html += "          var msg=(res.data&&res.data.message)?res.data.message:'Firmware installed; device will reboot.';";
     html += "          if(window.showNotice){ window.showNotice(msg); } else { alert(msg); }";
     html += "        })";
     html += "        .catch(function(err){";

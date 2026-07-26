@@ -25,7 +25,7 @@
 #include <WiFi.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.14-dev-correctness.5"
+#define FIRMWARE_VERSION "1.1.14-dev-correctness.6"
 
 // OTA Configuration
 // NOTE: The manifest lives at the legacy flat path on the official server

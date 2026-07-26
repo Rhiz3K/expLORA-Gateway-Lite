@@ -1,7 +1,6 @@
 #include "WebServer.h"
 
 #include "HTMLGenerator.h"
-#include "../Security/FirmwareVerifier.h"
 #include "../Security/OtaTrust.h"
 #include "../Security/SecurityPolicy.h"
 #include "../config.h"
@@ -13,6 +12,8 @@
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace
 {
@@ -21,17 +22,15 @@ constexpr uint32_t OTA_STALL_TIMEOUT_MS = 15000;
 
 struct FirmwareUploadState
 {
-    bool error = false;
-    int httpStatus = 500;
-    String errorMessage;
-    String version;
-    String expectedSha256;
-    String signature;
-    size_t written = 0;
-    bool ownsOta = false;
-    bool updateBegun = false;
-    bool shaInitialized = false;
-    bool installed = false;
+    bool error;
+    int httpStatus;
+    const char *errorMessage;
+    char expectedSha256[65];
+    size_t written;
+    bool ownsOta;
+    bool updateBegun;
+    bool shaInitialized;
+    bool installed;
     mbedtls_sha256_context shaContext;
 };
 
@@ -41,8 +40,67 @@ struct OtaTaskContext
     String url;
     String version;
     String expectedSha256;
-    String signature;
 };
+
+// HTTPClient::getString() grows an Arduino String until a chunked response
+// ends. Write through this bounded sink instead so a malformed official
+// response cannot consume the gateway heap before the size check runs.
+class BoundedStringStream : public Stream
+{
+public:
+    explicit BoundedStringStream(size_t limit) : limit(limit) {}
+
+    size_t write(const uint8_t *buffer, size_t size) override
+    {
+        if (buffer == nullptr || size == 0)
+        {
+            return 0;
+        }
+        if (size > limit - value.length())
+        {
+            exceeded = true;
+            setWriteError();
+            return 0;
+        }
+        if (!value.concat(reinterpret_cast<const char *>(buffer), size))
+        {
+            setWriteError();
+            return 0;
+        }
+        return size;
+    }
+
+    size_t write(uint8_t byte) override
+    {
+        return write(&byte, 1);
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+    const String &payload() const { return value; }
+    bool limitExceeded() const { return exceeded; }
+
+private:
+    const size_t limit;
+    String value;
+    bool exceeded = false;
+};
+
+String digestToHex(const uint8_t digest[32])
+{
+    static const char hex[] = "0123456789abcdef";
+    char output[65];
+    for (size_t index = 0; index < 32; ++index)
+    {
+        output[index * 2] = hex[(digest[index] >> 4) & 0x0f];
+        output[index * 2 + 1] = hex[digest[index] & 0x0f];
+    }
+    output[64] = '\0';
+    return String(output);
+}
 
 String requestHeader(AsyncWebServerRequest *request, const char *name)
 {
@@ -99,9 +157,11 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
         return;
     }
 
-    const String payload = http.getString();
+    BoundedStringStream manifestStream(MAX_MANIFEST_BYTES);
+    const int manifestBytes = http.writeToStream(&manifestStream);
     http.end();
-    if (payload.length() == 0 || payload.length() > MAX_MANIFEST_BYTES)
+    if (manifestBytes <= 0 || manifestStream.limitExceeded() ||
+        manifestStream.payload().length() > MAX_MANIFEST_BYTES)
     {
         request->send(502, "application/json",
                       "{\"error\":\"Official firmware manifest size is invalid\"}");
@@ -109,7 +169,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     }
 
     DynamicJsonDocument incoming(MAX_MANIFEST_BYTES);
-    const DeserializationError parseError = deserializeJson(incoming, payload);
+    const DeserializationError parseError =
+        deserializeJson(incoming, manifestStream.payload());
     if (parseError)
     {
         request->send(502, "application/json",
@@ -120,16 +181,13 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     String version = incoming["version"] | "";
     String url = incoming["url"] | "";
     String sha256 = incoming["sha256"] | "";
-    String signature = incoming["signature"] | "";
     version.trim();
     url.trim();
     sha256.trim();
     sha256.toLowerCase();
-    signature.trim();
 
     bool installable = true;
     String reason;
-    String signatureError;
     if (!SecurityPolicy::isVersionNewer(version.c_str(), FIRMWARE_VERSION))
     {
         installable = false;
@@ -140,19 +198,16 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
         installable = false;
         reason = "Manifest firmware URL is outside the official HTTPS origin";
     }
-    else if (!FirmwareVerifier::verifyMetadataSignature(
-                 version, sha256, signature, signatureError))
+    else if (!SecurityPolicy::isHexString(sha256.c_str(), 64))
     {
         installable = false;
-        reason = signatureError;
+        reason = "Manifest firmware SHA-256 digest is invalid";
     }
 
     DynamicJsonDocument responseDocument(1024);
     responseDocument["version"] = version;
     responseDocument["url"] = url;
     responseDocument["sha256"] = sha256;
-    responseDocument["signature"] = signature;
-    responseDocument["keyId"] = FirmwareVerifier::KEY_ID;
     responseDocument["currentVersion"] = FIRMWARE_VERSION;
     responseDocument["installable"] = installable;
     if (!installable)
@@ -171,13 +226,13 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     logger.debug("HTTP request: POST /firmware/update");
     if (!authorizeRequest(request, true)) return;
 
-    static const char *required[] = {"url", "version", "sha256", "signature"};
+    static const char *required[] = {"url", "version", "sha256"};
     for (const char *name : required)
     {
         if (!request->hasParam(name, true))
         {
             request->send(400, "application/json",
-                          "{\"error\":\"Signed firmware metadata is incomplete\"}");
+                          "{\"error\":\"Firmware metadata is incomplete\"}");
             return;
         }
     }
@@ -186,8 +241,7 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
         this,
         request->getParam("url", true)->value(),
         request->getParam("version", true)->value(),
-        request->getParam("sha256", true)->value(),
-        request->getParam("signature", true)->value()};
+        request->getParam("sha256", true)->value()};
     if (context == nullptr)
     {
         request->send(503, "application/json",
@@ -198,7 +252,6 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     context->version.trim();
     context->expectedSha256.trim();
     context->expectedSha256.toLowerCase();
-    context->signature.trim();
 
     String verificationError;
     if (!SecurityPolicy::isAllowedFirmwareUrl(context->url.c_str()))
@@ -210,11 +263,10 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     {
         verificationError = "Firmware version must be newer than the running version";
     }
-    else if (!FirmwareVerifier::verifyMetadataSignature(
-                 context->version, context->expectedSha256,
-                 context->signature, verificationError))
+    else if (!SecurityPolicy::isHexString(
+                 context->expectedSha256.c_str(), 64))
     {
-        // The verifier supplies a non-sensitive reason.
+        verificationError = "Invalid firmware SHA-256 digest";
     }
 
     if (!verificationError.isEmpty())
@@ -237,7 +289,7 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     }
 
     BaseType_t created = xTaskCreate(
-        firmwareUpdateTask, "SignedFirmwareOTA", 12288, context, 2, nullptr);
+        firmwareUpdateTask, "FirmwareOTA", 12288, context, 2, nullptr);
     if (created != pdPASS)
     {
         finishOta(context, "failed", "Could not create firmware update task", 0);
@@ -248,7 +300,7 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     }
 
     request->send(202, "application/json",
-                  "{\"status\":\"accepted\",\"message\":\"Signed firmware download started\"}");
+                  "{\"status\":\"accepted\",\"message\":\"Firmware download started\"}");
 }
 
 void WebPortal::firmwareUpdateTask(void *parameter)
@@ -259,7 +311,7 @@ void WebPortal::firmwareUpdateTask(void *parameter)
     bool updateBegun = false;
     String failure;
 
-    portal->setOtaStatus("downloading", "Downloading signed firmware", 0);
+    portal->setOtaStatus("downloading", "Downloading firmware", 0);
     WiFiClientSecure tlsClient;
     configureOtaTls(tlsClient);
     HTTPClient http;
@@ -362,7 +414,7 @@ void WebPortal::firmwareUpdateTask(void *parameter)
                         {
                             lastProgress = progress;
                             portal->setOtaStatus(
-                                "downloading", "Downloading signed firmware",
+                                "downloading", "Downloading firmware",
                                 progress);
                         }
                     }
@@ -408,24 +460,15 @@ void WebPortal::firmwareUpdateTask(void *parameter)
             break;
         }
 
-        const String actualSha256 =
-            FirmwareVerifier::digestToHex(actualDigest);
+        const String actualSha256 = digestToHex(actualDigest);
         if (actualSha256 != context->expectedSha256)
         {
-            failure = "Firmware SHA-256 digest does not match signed metadata";
-            break;
-        }
-        String signatureError;
-        if (!FirmwareVerifier::verifyMetadataSignature(
-                context->version, actualSha256, context->signature,
-                signatureError))
-        {
-            failure = signatureError;
+            failure = "Firmware SHA-256 digest does not match metadata";
             break;
         }
 
         portal->setOtaStatus("installing",
-                            "Firmware signature verified; installing image", 100);
+                            "Firmware digest verified; installing image", 100);
         if (!Update.end(true))
         {
             failure = "Firmware image validation failed";
@@ -441,7 +484,10 @@ void WebPortal::firmwareUpdateTask(void *parameter)
         {
             Update.abort();
         }
-        portal->logger.error("Signed URL OTA failed: " + failure);
+        portal->logger.error("URL OTA failed: " + failure);
+        portal->logger.info(
+            "URL OTA task minimum free stack: " +
+            String(uxTaskGetStackHighWaterMark(nullptr)) + " bytes");
         portal->finishOta(context, "failed", failure, 0);
         if (wdtRegistered)
         {
@@ -452,9 +498,12 @@ void WebPortal::firmwareUpdateTask(void *parameter)
         return;
     }
 
-    portal->logger.info("Signed URL OTA installed; rebooting");
+    portal->logger.info(
+        "URL OTA task minimum free stack: " +
+        String(uxTaskGetStackHighWaterMark(nullptr)) + " bytes");
+    portal->logger.info("URL OTA installed; rebooting");
     portal->setOtaStatus("rebooting",
-                         "Signed firmware installed; gateway is rebooting", 100);
+                         "Firmware installed; gateway is rebooting", 100);
     if (wdtRegistered)
     {
         esp_task_wdt_delete(nullptr);
@@ -510,13 +559,17 @@ void WebPortal::cleanupFirmwareUpload(AsyncWebServerRequest *request,
         restartAt = millis() + 500;
         restartRequested = true;
     }
-    delete state;
+    free(state);
 }
 
 void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /firmware (complete)");
-    if (!authorizeRequest(request, true)) return;
+    if (!authorizeRequest(request, true))
+    {
+        cleanupFirmwareUpload(request, false);
+        return;
+    }
 
     FirmwareUploadState *state =
         static_cast<FirmwareUploadState *>(request->_tempObject);
@@ -546,13 +599,14 @@ void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
     }
 
     const size_t bytes = state->written;
-    // Keep the OTA single-flight lock until reboot. Null the framework-owned
-    // pointer before delete so AsyncWebServer's destructor cannot free it.
+    // Keep the OTA single-flight lock until reboot. The request framework
+    // owns _tempObject with malloc/free semantics, so this state is allocated
+    // and released the same way.
     request->_tempObject = nullptr;
-    delete state;
+    free(state);
     request->send(
         200, "application/json",
-        "{\"status\":\"installed\",\"message\":\"Signed firmware installed; device will reboot\",\"bytes\":" +
+        "{\"status\":\"installed\",\"message\":\"Firmware installed; device will reboot\",\"bytes\":" +
             String(bytes) + "}");
     restartAt = millis() + 1500;
     restartRequested = true;
@@ -576,41 +630,46 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
         {
             cleanupFirmwareUpload(request, false);
         }
-        state = new (std::nothrow) FirmwareUploadState();
+        state = static_cast<FirmwareUploadState *>(
+            calloc(1, sizeof(FirmwareUploadState)));
         if (state == nullptr)
         {
             return;
         }
+        state->httpStatus = 500;
+        state->errorMessage = "Firmware upload failed";
         request->_tempObject = state;
         mbedtls_sha256_init(&state->shaContext);
         request->onDisconnect(
             [this, request]() { cleanupFirmwareUpload(request, true); });
 
-        state->version = requestHeader(request, "X-Firmware-Version");
-        state->expectedSha256 =
+        const String version =
+            requestHeader(request, "X-Firmware-Version");
+        String expectedSha256 =
             requestHeader(request, "X-Firmware-SHA256");
-        state->expectedSha256.toLowerCase();
-        state->signature =
-            requestHeader(request, "X-Firmware-Signature");
+        expectedSha256.toLowerCase();
 
-        String verificationError;
-        if (!SecurityPolicy::isVersionNewer(state->version.c_str(),
+        if (!SecurityPolicy::isVersionNewer(version.c_str(),
                                              FIRMWARE_VERSION))
-        {
-            verificationError =
-                "Firmware version must be newer than the running version";
-        }
-        else if (!FirmwareVerifier::verifyMetadataSignature(
-                     state->version, state->expectedSha256,
-                     state->signature, verificationError))
-        {
-            // Verifier supplies the error.
-        }
-        if (!verificationError.isEmpty())
         {
             state->error = true;
             state->httpStatus = 400;
-            state->errorMessage = verificationError;
+            state->errorMessage =
+                "Firmware version must be newer than the running version";
+        }
+        else if (!SecurityPolicy::isHexString(expectedSha256.c_str(), 64))
+        {
+            state->error = true;
+            state->httpStatus = 400;
+            state->errorMessage = "Invalid firmware SHA-256 digest";
+        }
+        else
+        {
+            memcpy(state->expectedSha256, expectedSha256.c_str(),
+                   sizeof(state->expectedSha256));
+        }
+        if (state->error)
+        {
             return;
         }
 
@@ -657,7 +716,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
             state->ownsOta = false;
             return;
         }
-        setOtaStatus("uploading", "Receiving signed firmware upload", 0);
+        setOtaStatus("uploading", "Receiving firmware upload", 0);
     }
 
     if (state == nullptr || state->error)
@@ -666,7 +725,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
     }
 
     auto failUpload = [this, request, state](int status,
-                                             const String &message) {
+                                             const char *message) {
         state->error = true;
         state->httpStatus = status;
         state->errorMessage = message;
@@ -705,7 +764,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
         state->written += len;
         const int progress = static_cast<int>(
             (state->written * 100ULL) / ota->size);
-        setOtaStatus("uploading", "Receiving signed firmware upload",
+        setOtaStatus("uploading", "Receiving firmware upload",
                      min(progress, 99));
     }
 
@@ -724,23 +783,15 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
         return;
     }
 
-    const String actualSha256 = FirmwareVerifier::digestToHex(digest);
+    const String actualSha256 = digestToHex(digest);
     if (actualSha256 != state->expectedSha256)
     {
-        failUpload(400,
-                   "Firmware SHA-256 digest does not match signed metadata");
-        return;
-    }
-    String signatureError;
-    if (!FirmwareVerifier::verifyMetadataSignature(
-            state->version, actualSha256, state->signature, signatureError))
-    {
-        failUpload(400, signatureError);
+        failUpload(400, "Firmware SHA-256 digest does not match metadata");
         return;
     }
 
     setOtaStatus("installing",
-                 "Firmware signature verified; installing image", 100);
+                 "Firmware digest verified; installing image", 100);
     if (!Update.end(true))
     {
         failUpload(500, "Firmware image validation failed");
@@ -749,5 +800,5 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
     state->updateBegun = false;
     state->installed = true;
     setOtaStatus("rebooting",
-                 "Signed firmware installed; gateway is rebooting", 100);
+                 "Firmware installed; gateway is rebooting", 100);
 }
