@@ -359,8 +359,10 @@ def main() -> int:
     version_response = session.get(base + "/firmware/version", timeout=5)
     require_status(version_response, (200,), "firmware version")
     version = str(version_response.json().get("version", ""))
-    if "storage" not in version:
-        raise TestFailure(f"expected storage test firmware, got {version!r}")
+    if not any(marker in version for marker in ("storage", "correctness")):
+        raise TestFailure(
+            f"expected storage/correctness test firmware, got {version!r}"
+        )
 
     originals = configured_forms(session, base)
     original_serials = {
