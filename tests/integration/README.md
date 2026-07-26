@@ -52,6 +52,11 @@ rejected without changing stored configuration. Temporary sensors and the
 custom URL are restored in `finally`; existing device keys are never read or
 replaced.
 
+If the gateway cannot route back to the test host (for example, across
+isolated LAN subnets), add `--detect-forward-via-api`. The same real packet
+is detected by polling its `lastSeen` reset while the temporary forwarding
+request is in flight; the URL contains no sensor-value placeholders.
+
 ### Issue #24 correctness test
 
 After flashing the issue #24 build, run:

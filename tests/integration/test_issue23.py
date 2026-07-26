@@ -241,16 +241,28 @@ def log_snapshot_race(
                 base + "/logs/clear",
                 auth=(username, credential),
                 headers={"Origin": base},
+                allow_redirects=False,
                 timeout=8,
             )
         else:
             response = requests.get(
                 base + "/logs", auth=(username, credential), timeout=8
             )
-        require_status(response, (200, 302, 303), f"log race request {sequence}")
-        if response.status_code == 200 and sequence % 4:
-            if "System Logs" not in response.text:
-                raise TestFailure(f"log race request {sequence}: malformed page")
+        allowed = (200, 302, 303) if sequence % 4 == 0 else (200, 503)
+        require_status(response, allowed, f"log race request {sequence}")
+        if sequence % 4:
+            if response.status_code == 200 and "System Logs" not in response.text:
+                raise TestFailure(
+                    f"log race request {sequence}: malformed page "
+                    f"({len(response.content)} bytes)"
+                )
+            if response.status_code == 503 and (
+                response.text != "Logs page busy; retry"
+                or response.headers.get("Retry-After") != "1"
+            ):
+                raise TestFailure(
+                    f"log race request {sequence}: invalid overload response"
+                )
         return time.monotonic() - started
 
     try:
@@ -293,6 +305,7 @@ def forwarding_does_not_hold_sensor_lock(
     base: str,
     original_forms: Dict[int, Dict[str, str]],
     timeout: int,
+    detect_via_api: bool,
 ) -> float:
     if not original_forms:
         raise TestFailure("no existing real sensor is available for forwarding test")
@@ -312,7 +325,11 @@ def forwarding_does_not_hold_sensor_lock(
     changed = dict(original)
     changed["customUrl"] = (
         f"http://{local_ip}:{server.server_address[1]}/issue23"
-        "?serial=*SN*&temperature=*TEMP*"
+        + (
+            ""
+            if detect_via_api
+            else "?serial=*SN*&temperature=*TEMP*"
+        )
     )
     try:
         require_status(
@@ -320,20 +337,60 @@ def forwarding_does_not_hold_sensor_lock(
             (200, 302, 303),
             "configure temporary slow forwarding URL",
         )
-        if not SlowHandler.hit.wait(timeout):
-            raise TestFailure(
-                f"no real sensor packet reached the slow endpoint within {timeout}s"
-            )
+        if detect_via_api:
+            serial = normal_serial(original["serialNumber"])
 
-        started = time.monotonic()
-        response = session.get(base + "/api?format=json", timeout=2)
-        latency = time.monotonic() - started
-        require_status(response, (200,), "API during slow forwarding")
-        if latency > 1.0:
+            def read_age() -> Tuple[float, int]:
+                started = time.monotonic()
+                response = session.get(base + "/api?format=json", timeout=5)
+                latency = time.monotonic() - started
+                require_status(response, (200,), "poll API during slow forwarding")
+                for sensor in response.json().get("sensors", []):
+                    if normal_serial(str(sensor.get("serialNumber", ""))) == serial:
+                        return latency, int(sensor.get("lastSeen", -1))
+                raise TestFailure("real sensor disappeared while polling forwarding")
+
+            _, previous_age = read_age()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                latency, age = read_age()
+                fresh_packet = (
+                    (previous_age < 0 <= age)
+                    or (
+                        previous_age >= 0
+                        and age >= 0
+                        and age + 2 < previous_age
+                    )
+                )
+                if fresh_packet:
+                    if latency > 1.0:
+                        raise TestFailure(
+                            f"/api blocked for {latency:.2f}s while custom HTTP "
+                            "was in progress"
+                        )
+                    return latency
+                previous_age = age
+                time.sleep(0.05)
             raise TestFailure(
-                f"/api blocked for {latency:.2f}s while custom HTTP was in progress"
+                f"no fresh real sensor packet appeared within {timeout}s"
             )
-        return latency
+        else:
+            if not SlowHandler.hit.wait(timeout):
+                raise TestFailure(
+                    f"no real sensor packet reached the slow endpoint within "
+                    f"{timeout}s"
+                )
+
+            started = time.monotonic()
+            response = session.get(base + "/api?format=json", timeout=2)
+            latency = time.monotonic() - started
+            require_status(response, (200,), "API during slow forwarding")
+            if latency > 1.0:
+                raise TestFailure(
+                    f"/api blocked for {latency:.2f}s while custom HTTP was in "
+                    "progress"
+                )
+            return latency
     finally:
         try:
             post_form(session, base, "/sensors/update", original)
@@ -349,6 +406,14 @@ def main() -> int:
     parser.add_argument("--admin-username", default="admin")
     parser.add_argument("--admin-credential", required=True)
     parser.add_argument("--packet-timeout", type=int, default=300)
+    parser.add_argument(
+        "--detect-forward-via-api",
+        action="store_true",
+        help=(
+            "detect the real packet through lastSeen polling when the gateway "
+            "cannot route back to the test host"
+        ),
+    )
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
@@ -403,7 +468,11 @@ def main() -> int:
 
         print("[4/5] Verifying API responsiveness during slow custom HTTP forwarding")
         latency = forwarding_does_not_hold_sensor_lock(
-            session, base, originals, args.packet_timeout
+            session,
+            base,
+            originals,
+            args.packet_timeout,
+            args.detect_forward_via_api,
         )
         print(f"      /api latency while forwarding: {latency:.3f}s")
 

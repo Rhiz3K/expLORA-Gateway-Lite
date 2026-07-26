@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <mutex>
 #include <vector>
 #include "../Data/SensorData.h"
 #include "../Data/Logging.h"
@@ -39,6 +40,7 @@ private:
     static char *htmlBuffer;
     static size_t htmlBufferSize;
     static bool usePSRAM;
+    static std::mutex htmlBufferMutex;
 
     // Buffer initialization
     static bool initBuffer();

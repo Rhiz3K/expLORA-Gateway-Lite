@@ -25,11 +25,14 @@
 #include <esp_ota_ops.h>
 #include <esp_heap_caps.h>
 #include <ArduinoJson.h>
+#include <atomic>
 #include "../config.h"
 #include "../Security/SecurityPolicy.h"
 
 namespace
 {
+std::atomic<bool> logsPageInFlight{false};
+
 bool parseSupportedSensorType(const String &value, uint8_t &type)
 {
     if (value.length() == 0 || value.length() > 3)
@@ -923,6 +926,22 @@ void WebPortal::handleLogs(AsyncWebServerRequest *request)
     logger.debug("HTTP request: GET /logs");
     if (!authorizeRequest(request, false)) return;
     if (guardAPOnly(request)) return;
+
+    // A full logs response is large enough that several responses queued at
+    // once can exhaust the ESP32 heap. Keep one response in flight and apply
+    // explicit backpressure instead of returning an allocation-truncated 200.
+    bool expected = false;
+    if (!logsPageInFlight.compare_exchange_strong(expected, true))
+    {
+        AsyncWebServerResponse *busy = request->beginResponse(
+            503, "text/plain", "Logs page busy; retry");
+        busy->addHeader("Retry-After", "1");
+        request->send(busy);
+        return;
+    }
+    request->onDisconnect([]() {
+        logsPageInFlight.store(false);
+    });
 
     // Snapshot under Logger's mutex; render only caller-owned String objects.
     const std::vector<LogEntry> logs = logger.getLogsSnapshot();

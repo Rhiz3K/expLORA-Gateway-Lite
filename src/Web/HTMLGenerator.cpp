@@ -57,6 +57,7 @@ static bool appendBounded(char *buffer, size_t capacity, size_t &contentLen,
 char *HTMLGenerator::htmlBuffer = nullptr;
 size_t HTMLGenerator::htmlBufferSize = WEB_BUFFER_SIZE;
 bool HTMLGenerator::usePSRAM = false;
+std::mutex HTMLGenerator::htmlBufferMutex;
 
 // Generator initialization
 bool HTMLGenerator::init(bool usePsram, size_t bufferSize)
@@ -1468,7 +1469,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLevel currentLevel)
 {
     String html;
-    html.reserve(8192);
+    html.reserve(WEB_BUFFER_SIZE + 8192);
     const size_t logCount = logs.size();
 
     // Adding header
@@ -1504,7 +1505,10 @@ String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLev
     html += "<h2>System Logs</h2>";
     html += "<div class='log-container'>";
 
-    // Using optimized method for log generation
+    // The async web server can render several /logs responses at once. Keep
+    // the shared bounded buffer private to one renderer while it is filled
+    // and copied into the request-local String.
+    std::lock_guard<std::mutex> bufferLock(htmlBufferMutex);
     if (htmlBuffer != nullptr)
     {
         memset(htmlBuffer, 0, htmlBufferSize);
