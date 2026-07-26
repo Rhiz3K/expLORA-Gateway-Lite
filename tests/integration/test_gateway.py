@@ -1428,8 +1428,8 @@ def main():
         "--test-sensor-type",
         type=int,
         default=1,
-        help="Sensor type code: 1=BME280, 2=SCD40, 3=METEO, 4=VEML7700, "
-        "0x51=DIY_TEMP (default: 1)",
+        help="Sensor type code: 1=BME280, 2=SCD40, 3=METEO, "
+        "4=VEML7700 (reserved, not in UI), 0x51=DIY_TEMP (default: 1)",
     )
     parser.add_argument(
         "--packet-timeout",

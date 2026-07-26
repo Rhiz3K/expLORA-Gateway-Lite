@@ -2,8 +2,8 @@
 """Hardware-test per-sensor MQTT discovery without an external broker.
 
 The script starts a minimal MQTT 3.1.1 broker on the test host, temporarily
-points the gateway at it, adds a synthetic VEML7700 sensor, and verifies that
-the add handler immediately publishes retained Home Assistant discovery
+points the gateway at it, adds a synthetic supported CLIMA sensor, and verifies
+that the add handler immediately publishes retained Home Assistant discovery
 configuration. No discovery metadata leaves the test LAN. The fixture and the
 gateway's previous MQTT settings are restored in ``finally``; a blank password
 submission preserves any stored password.
@@ -264,14 +264,14 @@ def main() -> int:
         time.sleep(1)
         marker = len(broker.snapshot())
 
-        print("[2/4] Adding a VEML7700 sensor while MQTT is connected")
+        print("[2/4] Adding a CLIMA sensor while MQTT is connected")
         added = post_form(
             session,
             base,
             "/sensors/add",
             {
                 "name": FIXTURE_NAME,
-                "deviceType": "4",
+                "deviceType": "1",
                 "serialNumber": FIXTURE_SERIAL,
                 "deviceKey": "A0B0C0D0",
             },
@@ -285,7 +285,13 @@ def main() -> int:
             raise TestFailure("temporary MQTT sensor was not persisted")
 
         print("[3/4] Verifying immediate retained discovery configuration")
-        expected_types = {"illuminance", "battery", "rssi"}
+        expected_types = {
+            "temperature",
+            "humidity",
+            "pressure",
+            "battery",
+            "rssi",
+        }
         expected_topics = {
             value_type: (
                 f"{ha_prefix}/sensor/{prefix}_{FIXTURE_SERIAL}_"
@@ -318,7 +324,7 @@ def main() -> int:
             device = payload.get("device", {})
             if (
                 device.get("name") != FIXTURE_NAME
-                or device.get("model") != "VEML7700"
+                or device.get("model") != "CLIMA"
             ):
                 raise TestFailure(f"{value_type} device metadata is incorrect")
 

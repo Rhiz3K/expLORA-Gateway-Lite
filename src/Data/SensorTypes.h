@@ -69,8 +69,11 @@ const SensorTypeInfo SENSOR_TYPE_DEFINITIONS[] = {
     {SensorType::UNKNOWN, "Unknown",  0, 7, false, false, false, false, false, false, false, false, false},
     {SensorType::BME280,    "CLIMA",  6, 7, true,  true,  true,  false, false, false, false, false, false},
     {SensorType::SCD40,    "CARBON",  6, 7, true,  true,  false,  true, false, false, false, false, false},
-    {SensorType::VEML7700, "VEML7700", 4, 7, false, false, false, false, true, false, false, false, false},
     {SensorType::METEO,     "METEO", 14, 7, true,  true,  true,  false, false,  true,  true,  true,  true},
+    // VEML7700 remains reserved as protocol type 0x04, but it is not
+    // currently enabled as a supported gateway sensor. Keep it out of the UI
+    // until product support is enabled intentionally.
+    // {SensorType::VEML7700, "VEML7700", 4, 7, false, false, false, false, true, false, false, false, false},
     {SensorType::DIY_TEMP, "DIY_TEMP",     2,     7,    true,  false, false, false, false, false, false, false, false},
 
     // Add more sensor types here in the future...

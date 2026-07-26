@@ -67,8 +67,9 @@ python3 tests/integration/test_issue24.py \
   --admin-credential '<admin credential>'
 ```
 
-It checks add/edit validation, persists and renders a temporary VEML7700
-sensor, verifies the public-CA TLS wording, and removes the fixture in
+It checks add/edit validation, confirms that the reserved VEML7700 protocol
+type is not offered as a supported sensor, persists and renders a temporary
+CLIMA sensor, verifies the public-CA TLS wording, and removes the fixture in
 `finally`.
 
 To verify immediate per-sensor Home Assistant discovery against an isolated

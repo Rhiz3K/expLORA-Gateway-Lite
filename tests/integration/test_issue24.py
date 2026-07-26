@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Focused hardware checks for GitHub issue #24.
 
-The test validates add/edit input rejection, exercises a temporary VEML7700
-configuration through persistence and rendering, and checks the truthful TLS
-UI copy. The fixture is deleted in ``finally``.
+The test validates add/edit input rejection, confirms that the reserved
+VEML7700 protocol type stays out of the supported UI, exercises a temporary
+CLIMA configuration through persistence and rendering, and checks the
+truthful TLS UI copy. The fixture is deleted in ``finally``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import requests
 
 
 FIXTURE_SERIAL = "EFFF24"
-FIXTURE_NAME = "issue24-veml-fixture"
+FIXTURE_NAME = "issue24-clima-fixture"
 
 
 class TestFailure(RuntimeError):
@@ -100,7 +101,7 @@ def main() -> int:
             },
         )
         require_status(invalid_serial, 400, "invalid add serial")
-        for invalid_type_value in ("99", "257", "1junk"):
+        for invalid_type_value in ("4", "99", "257", "1junk"):
             invalid_type = post_form(
                 session,
                 base,
@@ -120,47 +121,47 @@ def main() -> int:
         if serials(session, base) != baseline:
             raise TestFailure("invalid add changed configured sensors")
 
-        print("[2/5] Adding and persisting a VEML7700 fixture")
+        print("[2/5] Adding and persisting a supported CLIMA fixture")
         added = post_form(
             session,
             base,
             "/sensors/add",
             {
                 "name": FIXTURE_NAME,
-                "deviceType": "4",
+                "deviceType": "1",
                 "serialNumber": FIXTURE_SERIAL,
                 "deviceKey": "A0B0C0D0",
             },
         )
         if added.status_code not in (200, 302, 303):
             raise TestFailure(
-                f"VEML7700 add: HTTP {added.status_code}, body={added.text[:160]!r}"
+                f"CLIMA add: HTTP {added.status_code}, body={added.text[:160]!r}"
             )
         fixture_index = find_fixture_index(session, base)
         if fixture_index is None:
-            raise TestFailure("VEML7700 fixture has no editable persisted record")
+            raise TestFailure("CLIMA fixture has no editable persisted record")
 
         edit_page = session.get(
             f"{base}/sensors/edit?index={fixture_index}", timeout=5
         )
-        require_status(edit_page, 200, "read VEML7700 edit page")
+        require_status(edit_page, 200, "read CLIMA edit page")
         if not re.search(
-            r"<option value='4' selected>VEML7700\s+-\s+Light",
+            r"<option value='1' selected>CLIMA\s+-\s+Temperature, Humidity, Pressure",
             edit_page.text,
         ):
-            raise TestFailure("VEML7700 is not selected in the edit form")
+            raise TestFailure("CLIMA is not selected in the edit form")
 
         api_response = session.get(
             f"{base}/api?sensor={FIXTURE_SERIAL}&format=json", timeout=5
         )
-        require_status(api_response, 200, "read VEML7700 API")
+        require_status(api_response, 200, "read CLIMA API")
         matching = [
             sensor
             for sensor in api_response.json().get("sensors", [])
             if str(sensor.get("serialNumber", "")).upper() == FIXTURE_SERIAL
         ]
-        if len(matching) != 1 or matching[0].get("typeName") != "VEML7700":
-            raise TestFailure("VEML7700 capability is absent from the API")
+        if len(matching) != 1 or matching[0].get("typeName") != "CLIMA":
+            raise TestFailure("CLIMA capability is absent from the API")
 
         print("[3/5] Rejecting invalid edit inputs without mutation")
         invalid_edit_serial = post_form(
@@ -170,13 +171,13 @@ def main() -> int:
             {
                 "index": str(fixture_index),
                 "name": FIXTURE_NAME,
-                "deviceType": "4",
+                "deviceType": "1",
                 "serialNumber": "12X456",
                 "deviceKey": "",
             },
         )
         require_status(invalid_edit_serial, 400, "invalid edit serial")
-        for invalid_type_value in ("99", "257", "1junk"):
+        for invalid_type_value in ("4", "99", "257", "1junk"):
             invalid_edit_type = post_form(
                 session,
                 base,
@@ -195,13 +196,17 @@ def main() -> int:
                 f"invalid edit type {invalid_type_value!r}",
             )
         if find_fixture_index(session, base) != fixture_index:
-            raise TestFailure("invalid edit changed the VEML7700 fixture")
+            raise TestFailure("invalid edit changed the CLIMA fixture")
 
-        print("[4/5] Checking VEML7700 and verified-TLS UI")
+        print("[4/5] Checking supported sensor options and verified-TLS UI")
         sensors_page = session.get(base + "/sensors", timeout=5)
         require_status(sensors_page, 200, "read sensors page")
-        if FIXTURE_NAME not in sensors_page.text or "VEML7700" not in sensors_page.text:
-            raise TestFailure("VEML7700 is not rendered on the sensors page")
+        if FIXTURE_NAME not in sensors_page.text or "CLIMA" not in sensors_page.text:
+            raise TestFailure("CLIMA fixture is not rendered on the sensors page")
+        add_page = session.get(base + "/sensors/add", timeout=5)
+        require_status(add_page, 200, "read add-sensor page")
+        if re.search(r"<option value='4'(?:\s|>)", add_page.text):
+            raise TestFailure("reserved VEML7700 type is exposed as supported")
         mqtt_page = session.get(base + "/mqtt", timeout=5)
         require_status(mqtt_page, 200, "read MQTT page")
         if "Enable TLS (public CA verification)" not in mqtt_page.text:

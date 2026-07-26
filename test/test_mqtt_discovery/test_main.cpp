@@ -39,7 +39,7 @@ void test_clima_discovery_plan()
         {"temperature", "humidity", "pressure", "battery", "rssi"});
 }
 
-void test_veml7700_discovery_plan()
+void test_illuminance_discovery_plan()
 {
     MQTTDiscoveryPlan::Capabilities capabilities;
     capabilities.illuminance = true;
@@ -74,7 +74,7 @@ int main(int, char **)
 {
     UNITY_BEGIN();
     RUN_TEST(test_clima_discovery_plan);
-    RUN_TEST(test_veml7700_discovery_plan);
+    RUN_TEST(test_illuminance_discovery_plan);
     RUN_TEST(test_meteo_discovery_plan);
     return UNITY_END();
 }
