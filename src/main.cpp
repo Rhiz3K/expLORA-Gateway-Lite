@@ -37,7 +37,7 @@
 #include "Data/SensorManager.h"
 
 // Hardware
-#include "Hardware/LoRa_Module.h"
+#include "Hardware/LoRaRadio.h"
 #include "Hardware/PSRAM_Manager.h"
 #include "Hardware/SPI_Manager.h"
 
@@ -57,7 +57,7 @@
 Logger logger;                // Logging system
 ConfigManager *configManager; // Configuration manager
 SPIManager *spiManager;       // SPI communication manager
-LoRaModule *loraModule;       // LoRa module
+LoRaRadio *loraModule;        // LoRa radio (chip selected in board_config.h)
 SensorManager *sensorManager; // Sensor manager
 LoRaProtocol *loraProtocol;   // LoRa protocol
 MQTTManager *mqttManager;     // MQTT Manager
@@ -283,14 +283,14 @@ void setup()
     }
 
     // LoRa module initialization
-    loraModule = new LoRaModule(logger, spiManager);
+    loraModule = createLoRaRadio(logger, spiManager);
     if (!loraModule->init())
     {
         logger.error("Failed to initialize LoRa module");
     }
     else
     {
-        logger.info("LoRa module initialized successfully");
+        logger.info(String("LoRa module initialized successfully (") + loraModule->getChipName() + ")");
     }
 
     // LoRa protocol initialization
@@ -393,7 +393,7 @@ void loop()
 
     // Process LoRa packets
     // if (loraModule && loraProtocol) {
-    //    if (LoRaModule::hasInterrupt()) {
+    //    if (LoRaRadio::hasInterrupt()) {
     //        logger.debug("LoRa interrupt detected");
     //        loraProtocol->processReceivedPacket();
     //    }
@@ -419,7 +419,7 @@ void loop()
 
     // Add a check for LoRa packet processing to publish to MQTT
     static unsigned int lastProcessedIndex = -1;
-    if (loraModule && loraProtocol && LoRaModule::hasInterrupt())
+    if (loraModule && loraProtocol && LoRaRadio::hasInterrupt())
     {
         if (loraProtocol->processReceivedPacket())
         {

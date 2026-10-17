@@ -24,7 +24,7 @@
 #include "SensorParsers.h"
 
 // Constructor
-LoRaProtocol::LoRaProtocol(LoRaModule &module, SensorManager &manager, Logger &log)
+LoRaProtocol::LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log)
     : loraModule(module), sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
 {
 }

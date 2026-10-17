@@ -22,7 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include "../Hardware/LoRa_Module.h"
+#include "../Hardware/LoRaRadio.h"
 #include "../Data/SensorManager.h"
 #include "../Data/Logging.h"
 
@@ -35,7 +35,7 @@
 class LoRaProtocol
 {
 private:
-    LoRaModule &loraModule;       // Reference to LoRa module
+    LoRaRadio &loraModule;       // Reference to LoRa module
     SensorManager &sensorManager; // Reference to sensor manager
     Logger &logger;               // Reference to logger
 
@@ -71,7 +71,7 @@ private:
 
 public:
     // Constructor
-    LoRaProtocol(LoRaModule &module, SensorManager &manager, Logger &log);
+    LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log);
 
     // Destructor
     ~LoRaProtocol();

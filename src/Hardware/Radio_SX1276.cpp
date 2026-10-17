@@ -1,7 +1,7 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
- * LoRa module manager implementation file
+ * SX1276 (RFM95W) LoRa radio driver implementation file
  *
  * Copyright Pajenicko s.r.o., Igor Sverma (C) 2025
  *
@@ -19,20 +19,59 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "LoRa_Module.h"
+#include "Radio_SX1276.h"
 #include <Arduino.h>
 
-// Initialization of static variables
-volatile bool LoRaModule::interruptOccurred = false;
+#if defined(RADIO_SX1276)
 
-// Interrupt handler
-void IRAM_ATTR LoRaModule::handleInterrupt()
-{
-    interruptOccurred = true;
-}
+// SX1276 registers
+#define REG_FIFO 0x00
+#define REG_OP_MODE 0x01
+#define REG_FRF_MSB 0x06
+#define REG_FRF_MID 0x07
+#define REG_FRF_LSB 0x08
+#define REG_PA_CONFIG 0x09
+#define REG_OCP 0x0B
+#define REG_LNA 0x0C
+#define REG_FIFO_ADDR_PTR 0x0D
+#define REG_FIFO_TX_BASE_ADDR 0x0E
+#define REG_FIFO_RX_BASE_ADDR 0x0F
+#define REG_FIFO_RX_CURRENT_ADDR 0x10
+#define REG_IRQ_FLAGS 0x12
+#define REG_RX_NB_BYTES 0x13
+#define REG_PKT_SNR_VALUE 0x19
+#define REG_PKT_RSSI_VALUE 0x1A
+#define REG_MODEM_CONFIG_1 0x1D
+#define REG_MODEM_CONFIG_2 0x1E
+#define REG_SYMB_TIMEOUT_LSB 0x1F
+#define REG_PREAMBLE_MSB 0x20
+#define REG_PREAMBLE_LSB 0x21
+#define REG_PAYLOAD_LENGTH 0x22
+#define REG_MODEM_CONFIG_3 0x26
+#define REG_FREQ_ERROR_MSB 0x28
+#define REG_FREQ_ERROR_MID 0x29
+#define REG_FREQ_ERROR_LSB 0x2A
+#define REG_RSSI_WIDEBAND 0x2C
+#define REG_DETECTION_OPTIMIZE 0x31
+#define REG_INVERTIQ 0x33
+#define REG_DETECTION_THRESHOLD 0x37
+#define REG_SYNC_WORD 0x39
+#define REG_INVERTIQ2 0x3B
+#define REG_DIO_MAPPING_1 0x40
+#define REG_VERSION 0x42
+#define REG_PA_DAC 0x4D
+
+// SX1276 modes
+#define MODE_LONG_RANGE_MODE 0x80
+#define MODE_SLEEP 0x00
+#define MODE_STDBY 0x01
+#define MODE_TX 0x03
+#define MODE_RX_CONTINUOUS 0x05
+#define MODE_RX_SINGLE 0x06
+#define MODE_CAD 0x07
 
 // Constructor
-LoRaModule::LoRaModule(Logger &log, SPIManager *spiMgr, int cs, int rst, int dio0)
+RadioSX1276::RadioSX1276(Logger &log, SPIManager *spiMgr, int cs, int rst, int dio0)
     : csPin(cs), rstPin(rst), dio0Pin(dio0), spiManager(spiMgr), logger(log)
 {
 
@@ -44,13 +83,13 @@ LoRaModule::LoRaModule(Logger &log, SPIManager *spiMgr, int cs, int rst, int dio
 }
 
 // Destructor
-LoRaModule::~LoRaModule()
+RadioSX1276::~RadioSX1276()
 {
     // We don't free the SPIManager instance if it was created externally
 }
 
 // Setup pins and SPI
-bool LoRaModule::setupPins()
+bool RadioSX1276::setupPins()
 {
     // Set CS pin
     pinMode(csPin, OUTPUT);
@@ -85,7 +124,7 @@ bool LoRaModule::setupPins()
 }
 
 // Reset module
-void LoRaModule::resetModule()
+void RadioSX1276::resetModule()
 {
     if (rstPin < 0) {
         logger.debug("Reset pin is not available, skipping...");
@@ -101,7 +140,7 @@ void LoRaModule::resetModule()
 }
 
 // Initialize LoRa module
-bool LoRaModule::init()
+bool RadioSX1276::init()
 {
     logger.info("Initializing LoRa module...");
 
@@ -208,7 +247,7 @@ bool LoRaModule::init()
 }
 
 // Reset module
-bool LoRaModule::reset()
+bool RadioSX1276::reset()
 {
     resetModule();
 
@@ -233,7 +272,7 @@ bool LoRaModule::reset()
 }
 
 // Write to register
-void LoRaModule::writeRegister(uint8_t reg, uint8_t value)
+void RadioSX1276::writeRegister(uint8_t reg, uint8_t value)
 {
     digitalWrite(csPin, LOW);
 
@@ -246,7 +285,7 @@ void LoRaModule::writeRegister(uint8_t reg, uint8_t value)
 }
 
 // Read from register
-uint8_t LoRaModule::readRegister(uint8_t reg)
+uint8_t RadioSX1276::readRegister(uint8_t reg)
 {
     digitalWrite(csPin, LOW);
 
@@ -260,7 +299,7 @@ uint8_t LoRaModule::readRegister(uint8_t reg)
 }
 
 // Receive packet
-bool LoRaModule::receivePacket(uint8_t *buffer, uint8_t *length)
+bool RadioSX1276::receivePacket(uint8_t *buffer, uint8_t *length)
 {
     // Check if reception is complete
     uint8_t irqFlags = readRegister(REG_IRQ_FLAGS);
@@ -322,48 +361,37 @@ bool LoRaModule::receivePacket(uint8_t *buffer, uint8_t *length)
 }
 
 // Get RSSI
-int LoRaModule::getRSSI()
+int RadioSX1276::getRSSI()
 {
-    int16_t rssi = readRegister(REG_PKT_RSSI_VALUE) - 137;
+    // SX1276 datasheet 5.5.5: HF port (868 MHz) = -157 + PacketRssi;
+    // below the noise floor (SNR < 0) the SNR is added
+    int rssi = -157 + readRegister(REG_PKT_RSSI_VALUE);
+    float snr = getSNR();
+    if (snr < 0)
+    {
+        rssi += (int)snr;
+    }
     return rssi;
 }
 
 // Get SNR of last packet
-float LoRaModule::getSNR()
+float RadioSX1276::getSNR()
 {
-    int8_t snr = readRegister(REG_PKT_SNR_VALUE);
-    if (snr & 0x80)
-    {
-        snr = ((~snr + 1) & 0xFF) >> 2;
-        snr = -snr;
-    }
-    else
-    {
-        snr = snr >> 2;
-    }
-    return snr * 0.25;
-}
-
-// Check if interrupt occurred
-bool LoRaModule::hasInterrupt()
-{
-    return interruptOccurred;
-}
-
-// Clear interrupt flag
-void LoRaModule::clearInterrupt()
-{
-    interruptOccurred = false;
+    // Two's complement value in 0.25 dB steps
+    int8_t snr = (int8_t)readRegister(REG_PKT_SNR_VALUE);
+    return snr * 0.25f;
 }
 
 // Check if module is connected
-bool LoRaModule::isConnected()
+bool RadioSX1276::isConnected()
 {
     return (getVersion() == 0x12);
 }
 
 // Get chip version
-uint8_t LoRaModule::getVersion()
+uint8_t RadioSX1276::getVersion()
 {
     return readRegister(REG_VERSION);
 }
+
+#endif // RADIO_SX1276

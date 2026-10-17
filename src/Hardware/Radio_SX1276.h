@@ -1,7 +1,7 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
- * LoRa module manager header file
+ * SX1276 (RFM95W) LoRa radio driver header file
  *
  * Copyright Pajenicko s.r.o., Igor Sverma (C) 2025
  *
@@ -26,15 +26,18 @@
 #include "../config.h"
 #include "../Data/Logging.h"
 #include "SPI_Manager.h"
+#include "LoRaRadio.h"
 #include "board_config.h"
 
+#if defined(RADIO_SX1276)
+
 /**
- * Class for managing RFM95W LoRa module
+ * SX1276 (RFM95W) LoRa radio driver
  *
  * Handles initialization, configuration, and communication with RFM95W LoRa module.
- * Abstracts SPI communication and interrupt handling.
+ * Abstracts SPI communication; DIO0 signals RxDone.
  */
-class LoRaModule
+class RadioSX1276 : public LoRaRadio
 {
 private:
     int csPin;              // Chip select pin
@@ -44,9 +47,6 @@ private:
 
     Logger &logger; // Reference to logger
 
-    static volatile bool interruptOccurred;  // Interrupt flag (static for use in ISR)
-    static void IRAM_ATTR handleInterrupt(); // Interrupt handler
-
     // Setup pins and SPI
     bool setupPins();
     // Reset module
@@ -54,16 +54,16 @@ private:
 
 public:
     // Constructor
-    LoRaModule(Logger &log, SPIManager *spiMgr = nullptr, int cs = LORA_CS, int rst = LORA_RST, int dio0 = LORA_DIO0);
+    RadioSX1276(Logger &log, SPIManager *spiMgr = nullptr, int cs = LORA_CS, int rst = LORA_RST, int dio0 = LORA_DIO0);
 
     // Destructor
-    ~LoRaModule();
+    ~RadioSX1276() override;
 
     // Initialize LoRa module
-    bool init();
+    bool init() override;
 
     // Reset module
-    bool reset();
+    bool reset() override;
 
     // Write to register
     void writeRegister(uint8_t reg, uint8_t value);
@@ -72,23 +72,21 @@ public:
     uint8_t readRegister(uint8_t reg);
 
     // Receive packet
-    bool receivePacket(uint8_t *buffer, uint8_t *length);
+    bool receivePacket(uint8_t *buffer, uint8_t *length) override;
 
     // Get RSSI
-    int getRSSI();
+    int getRSSI() override;
 
     // Return SNR of last packet
-    float getSNR();
-
-    // Check if interrupt occurred
-    static bool hasInterrupt();
-
-    // Clear interrupt flag
-    static void clearInterrupt();
+    float getSNR() override;
 
     // Check if module is connected
-    bool isConnected();
+    bool isConnected() override;
 
     // Get chip version
     uint8_t getVersion();
+
+    const char *getChipName() const override { return "SX1276"; }
 };
+
+#endif // RADIO_SX1276

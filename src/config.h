@@ -30,51 +30,13 @@
 // OTA Configuration
 #define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
 
-// LoRa registers
-#define REG_FIFO 0x00
-#define REG_OP_MODE 0x01
-#define REG_FRF_MSB 0x06
-#define REG_FRF_MID 0x07
-#define REG_FRF_LSB 0x08
-#define REG_PA_CONFIG 0x09
-#define REG_OCP 0x0B
-#define REG_LNA 0x0C
-#define REG_FIFO_ADDR_PTR 0x0D
-#define REG_FIFO_TX_BASE_ADDR 0x0E
-#define REG_FIFO_RX_BASE_ADDR 0x0F
-#define REG_FIFO_RX_CURRENT_ADDR 0x10
-#define REG_IRQ_FLAGS 0x12
-#define REG_RX_NB_BYTES 0x13
-#define REG_PKT_SNR_VALUE 0x19
-#define REG_PKT_RSSI_VALUE 0x1A
-#define REG_MODEM_CONFIG_1 0x1D
-#define REG_MODEM_CONFIG_2 0x1E
-#define REG_SYMB_TIMEOUT_LSB 0x1F
-#define REG_PREAMBLE_MSB 0x20
-#define REG_PREAMBLE_LSB 0x21
-#define REG_PAYLOAD_LENGTH 0x22
-#define REG_MODEM_CONFIG_3 0x26
-#define REG_FREQ_ERROR_MSB 0x28
-#define REG_FREQ_ERROR_MID 0x29
-#define REG_FREQ_ERROR_LSB 0x2A
-#define REG_RSSI_WIDEBAND 0x2C
-#define REG_DETECTION_OPTIMIZE 0x31
-#define REG_INVERTIQ 0x33
-#define REG_DETECTION_THRESHOLD 0x37
-#define REG_SYNC_WORD 0x39
-#define REG_INVERTIQ2 0x3B
-#define REG_DIO_MAPPING_1 0x40
-#define REG_VERSION 0x42
-#define REG_PA_DAC 0x4D
-
-// LoRa modes
-#define MODE_LONG_RANGE_MODE 0x80
-#define MODE_SLEEP 0x00
-#define MODE_STDBY 0x01
-#define MODE_TX 0x03
-#define MODE_RX_CONTINUOUS 0x05
-#define MODE_RX_SINGLE 0x06
-#define MODE_CAD 0x07
+// LoRa radio parameters - must match the sensors (receive only)
+#define LORA_FREQUENCY_MHZ 868.0
+#define LORA_BANDWIDTH_KHZ 125.0
+#define LORA_SPREADING_FACTOR 9
+#define LORA_CODING_RATE 5      // 4/5
+#define LORA_SYNC_WORD 0x12     // private network (SX126x: 0x1424)
+#define LORA_PREAMBLE_LENGTH 16
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
