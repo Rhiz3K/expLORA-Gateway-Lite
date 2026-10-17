@@ -56,6 +56,9 @@ struct Stats
     uint8_t       headIdx                        = 0;
     unsigned long currentBucketStartedAtMillis   = 0;
     bool          windowInitialised              = false;
+    // Set by the periodic tick once the sensor went stale; a 32-bit millis()
+    // difference wraps after 49.7 days and would show it Healthy again
+    bool          staleLatched                   = false;
 };
 
 // Advance the head bucket forward if at least one BUCKET_MS has elapsed
@@ -73,26 +76,25 @@ inline void advanceBucketsIfNeeded(Stats &s, unsigned long nowMillis)
         return;
     }
 
-    // Use signed delta to be safe across millis() wrap.
-    long elapsed = static_cast<long>(nowMillis - s.currentBucketStartedAtMillis);
-    if (elapsed < static_cast<long>(BUCKET_MS))
+    // Unsigned difference is correct across the millis() wrap (a signed one
+    // went negative after ~24.8 days of silence and froze the window)
+    unsigned long elapsed = nowMillis - s.currentBucketStartedAtMillis;
+    if (elapsed < BUCKET_MS)
     {
         return;
     }
 
     // How many full hours have passed since the current bucket was opened?
-    unsigned long hours = static_cast<unsigned long>(elapsed) / BUCKET_MS;
-    if (hours > WINDOW_BUCKETS)
-    {
-        hours = WINDOW_BUCKETS; // a full silence longer than 24 h wipes everything
-    }
-
-    for (unsigned long i = 0; i < hours; i++)
+    unsigned long hours = elapsed / BUCKET_MS;
+    unsigned long clear = hours > WINDOW_BUCKETS ? WINDOW_BUCKETS : hours; // >24 h wipes everything
+    for (unsigned long i = 0; i < clear; i++)
     {
         s.headIdx = static_cast<uint8_t>((s.headIdx + 1) % WINDOW_BUCKETS);
         s.okBuckets[s.headIdx]     = 0;
         s.rejectBuckets[s.headIdx] = 0;
     }
+    // Move the bucket start by the full elapsed hours (not the clamped count),
+    // or the next call would clear the buckets again
     s.currentBucketStartedAtMillis += hours * BUCKET_MS;
 }
 
@@ -102,6 +104,7 @@ inline void recordSuccess(Stats &s, unsigned long nowMillis)
     advanceBucketsIfNeeded(s, nowMillis);
 
     s.lastOkAtMillis        = nowMillis;
+    s.staleLatched          = false;
     s.hasLastOk             = true;
     s.consecutiveRejections = 0;
 
@@ -175,12 +178,24 @@ inline Status status(const Stats &s, unsigned long nowMillis)
     {
         return Status::Errors;
     }
-    if (s.hasLastOk &&
-        static_cast<long>(nowMillis - s.lastOkAtMillis) > static_cast<long>(STALE_AFTER_MS))
+    if (!s.hasLastOk)
+    {
+        return Status::Unknown; // only rejections so far: never "Healthy"
+    }
+    if (s.staleLatched || (s.hasLastOk && nowMillis - s.lastOkAtMillis > STALE_AFTER_MS))
     {
         return Status::Stale;
     }
     return Status::Healthy;
+}
+
+// Periodic (e.g. once a minute): remember that the sensor went stale
+inline void latchStale(Stats &s, unsigned long nowMillis)
+{
+    if (s.hasLastOk && nowMillis - s.lastOkAtMillis > STALE_AFTER_MS)
+    {
+        s.staleLatched = true;
+    }
 }
 
 } // namespace SensorHealth

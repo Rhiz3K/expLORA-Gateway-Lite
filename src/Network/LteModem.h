@@ -89,6 +89,7 @@ private:
     uint8_t failures = 0;
     bool pppStarted = false;
     bool pinSent = false;
+    bool pinAccepted = false; // the modem answered OK to AT+CPIN=<pin>
     bool atUartOpen = false; // raw AT access before the PPP driver owns the UART
     String rxBuffer;
 
@@ -98,6 +99,8 @@ private:
     String imei;
     String lastError;
     String detectedApn;
+    String apn; // configured APN (copy taken at begin())
+    String pin; // configured SIM PIN (copy taken at begin())
     SemaphoreHandle_t textLock;
 
     String readText(const String &field) const;

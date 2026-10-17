@@ -20,6 +20,7 @@
  */
 
 #include "MQTTManager.h"
+#include "../Hardware/WatchdogPause.h"
 #include <ArduinoJson.h>
 #include "config.h"
 #include "../Network/Uplink.h"
@@ -51,31 +52,60 @@ MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &
 // Initialization
 bool MQTTManager::init()
 {
+    // Own copy: the web task may change the configuration at any time
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        cfg.host = configManager.mqttHost;
+        cfg.port = configManager.mqttPort;
+        cfg.user = configManager.mqttUser;
+        cfg.password = configManager.mqttPassword;
+        cfg.enabled = configManager.mqttEnabled;
+        cfg.tls = configManager.mqttTls;
+        cfg.prefix = configManager.mqttPrefix;
+        cfg.haPrefix = configManager.mqttHAPrefix;
+        cfg.haEnabled = configManager.mqttHAEnabled;
+    }
+
     // Only initialize if MQTT is enabled in configuration
-    if (!configManager.mqttEnabled)
+    if (!cfg.enabled)
     {
         logger.info("MQTT integration disabled in configuration");
         return false;
     }
 
-    if (configManager.mqttTls) {
-        //TODO: Do checkbox and allow set CA/Certs for validation
+    if (cfg.tls) {
+        // Brokers on the LAN usually have self-signed certificates: encrypted,
+        // but the server is not verified (README)
         wifiClientSecure.setInsecure();
+        wifiClientSecure.setHandshakeTimeout(8);
+        wifiClientSecure.setConnectionTimeout(5000);
         mqttClient.setClient(wifiClientSecure);
     }
     else {
+        wifiClient.setConnectionTimeout(5000);
         mqttClient.setClient(wifiClient);
     }
     mqttClientReady = true;
 
-    mqttClient.setBufferSize(1024); // Increase to accommodate larger messages
+    if (!mqttClient.setBufferSize(1024)) // discovery payloads need it
+    {
+        logger.error("MQTT: not enough memory for the 1 kB buffer - discovery will fail");
+    }
+    mqttClient.setCallback([this](char *topic, uint8_t *payload, unsigned int length)
+                           {
+        // Only subscription: <haPrefix>/status
+        if (length == 6 && memcmp(payload, "online", 6) == 0)
+        {
+            haRestarted = true;
+        } });
 
     // Configure MQTT client
-    mqttClient.setServer(configManager.mqttHost.c_str(), configManager.mqttPort);
+    statusTopic = cfg.prefix + "/status";
+    mqttClient.setServer(cfg.host.c_str(), cfg.port);
     mqttClient.setSocketTimeout(5);
 
     // Log initialization
-    logger.info("MQTT initialized with broker: " + configManager.mqttHost + ":" + String(configManager.mqttPort));
+    logger.info("MQTT initialized with broker: " + cfg.host + ":" + String(cfg.port));
 
     return true;
 }
@@ -90,24 +120,27 @@ bool MQTTManager::connect()
     
     logger.debug("Attempting to connect to MQTT broker...");
 
-    bool connected = false;
+    // DNS (e.g. homeassistant.local), TCP connect and TLS handshake can
+    // together exceed the watchdog timeout
+    WatchdogPause pause;
 
-    // Connect with credentials if provided
-    if (configManager.mqttUser.length() > 0)
-    {
-        connected = mqttClient.connect(
-            clientId.c_str(),
-            configManager.mqttUser.c_str(),
-            configManager.mqttPassword.c_str());
-    }
-    else
-    {
-        connected = mqttClient.connect(clientId.c_str());
-    }
+    // Last will: the broker publishes "offline" if the gateway disappears,
+    // so Home Assistant marks its entities unavailable
+    bool hasUser = cfg.user.length() > 0;
+    bool connected = mqttClient.connect(clientId.c_str(),
+                                        hasUser ? cfg.user.c_str() : nullptr,
+                                        hasUser ? cfg.password.c_str() : nullptr,
+                                        statusTopic.c_str(), 0, true, "offline");
 
     if (connected)
     {
         logger.info("Connected to MQTT broker");
+
+        // Home Assistant announces a restart here; discovery is resent then
+        if (cfg.haEnabled)
+        {
+            mqttClient.subscribe((cfg.haPrefix + "/status").c_str());
+        }
 
         // Publish discovery information after successful connection
         publishDiscovery();
@@ -115,7 +148,7 @@ bool MQTTManager::connect()
         // TODO: Some better idea than magic number delay?
         // Give HA time to subscribe this topic
         delay(500);
-        mqttClient.publish(String(configManager.mqttPrefix + "/status").c_str(), "online", true);
+        mqttClient.publish(statusTopic.c_str(), "online", true);
         publishGatewayState(true);
     }
     else
@@ -132,7 +165,7 @@ void MQTTManager::process()
     processPending();
 
     // Skip if MQTT is disabled in configuration
-    if (!configManager.mqttEnabled || !mqttClientReady)
+    if (!cfg.enabled || !mqttClientReady)
     {
         return;
     }
@@ -155,14 +188,18 @@ void MQTTManager::process()
         }
         else
         {
+            // A write to a half-dead socket can block ~10 s (lwIP retries)
+            WatchdogPause pause;
             // Process MQTT loop
             mqttClient.loop();
             publishGatewayState(false);
 
-            // Republish discovery information periodically (every hour)
+            // Discovery again when Home Assistant restarted, otherwise daily
+            // (retained configs survive; hourly resends cost data on LTE)
             unsigned long now = millis();
-            if (now - lastDiscoveryUpdate > 3600000)
-            { // 1 hour
+            if (haRestarted || now - lastDiscoveryUpdate > 24UL * 3600 * 1000)
+            {
+                haRestarted = false;
                 lastDiscoveryUpdate = now;
                 publishDiscovery();
             }
@@ -173,7 +210,7 @@ void MQTTManager::process()
 // Publish discovery configuration for sensors
 void MQTTManager::publishDiscovery()
 {
-    if (!configManager.mqttHAEnabled) {
+    if (!cfg.haEnabled) {
         return; // Skip discovery if HA is disabled
     }
 
@@ -199,18 +236,30 @@ void MQTTManager::publishDiscovery()
     lastDiscoveryUpdate = millis();
 }
 
+// Retained discovery message; a failure (payload over the buffer, socket
+// error) is logged instead of silently missing entities in HA
+bool MQTTManager::publishRetained(const String &topic, const String &payload)
+{
+    if (mqttClient.publish(topic.c_str(), payload.c_str(), true))
+    {
+        return true;
+    }
+    logger.warning("MQTT publish failed: " + topic + " (" + String(topic.length() + payload.length()) + " B)");
+    return false;
+}
+
 // Discovery config of every value a sensor provides
 void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
 {
     // Base state topic for this sensor
-    String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor.serialNumber);
+    String baseTopic = String(cfg.prefix) + "/" + formatSN(sensor.serialNumber);
 
     // Publish discovery for each supported value type based on sensor type
     if (sensor.hasTemperature())
     {
         String topic = buildDiscoveryTopic(sensor, "temperature");
         String payload = buildDiscoveryJson(sensor, "temperature", baseTopic + "/temperature");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true); // Retained message
+        publishRetained(topic, payload); // Retained message
         logger.debug("Published temperature discovery for " + sensor.name);
     }
 
@@ -218,7 +267,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "humidity");
         String payload = buildDiscoveryJson(sensor, "humidity", baseTopic + "/humidity");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published humidity discovery for " + sensor.name);
     }
 
@@ -226,7 +275,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "pressure");
         String payload = buildDiscoveryJson(sensor, "pressure", baseTopic + "/pressure");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published pressure discovery for " + sensor.name);
     }
 
@@ -234,7 +283,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "co2");
         String payload = buildDiscoveryJson(sensor, "co2", baseTopic + "/co2");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published CO2 discovery for " + sensor.name);
     }
 
@@ -242,7 +291,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "illuminance");
         String payload = buildDiscoveryJson(sensor, "illuminance", baseTopic + "/illuminance");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published illuminance discovery for " + sensor.name);
     }
 
@@ -250,7 +299,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "wind_speed");
         String payload = buildDiscoveryJson(sensor, "wind_speed", baseTopic + "/wind_speed");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published wind speed discovery for " + sensor.name);
     }
 
@@ -258,7 +307,7 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "wind_direction");
         String payload = buildDiscoveryJson(sensor, "wind_direction", baseTopic + "/wind_direction");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published wind direction discovery for " + sensor.name);
     }
 
@@ -266,13 +315,13 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "rain_amount");
         String payload = buildDiscoveryJson(sensor, "rain_amount", baseTopic + "/rain_amount");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published rain amount discovery for " + sensor.name);
 
         // Also for daily rain total
         topic = buildDiscoveryTopic(sensor, "daily_rain");
         payload = buildDiscoveryJson(sensor, "daily_rain", baseTopic + "/daily_rain");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published daily rain discovery for " + sensor.name);
     }
 
@@ -280,26 +329,26 @@ void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
     {
         String topic = buildDiscoveryTopic(sensor, "rain_rate");
         String payload = buildDiscoveryJson(sensor, "rain_rate", baseTopic + "/rain_rate");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        publishRetained(topic, payload);
         logger.debug("Published rain rate discovery for " + sensor.name);
     }
 
     // Battery voltage - available for all sensors
     String topic = buildDiscoveryTopic(sensor, "battery");
     String payload = buildDiscoveryJson(sensor, "battery", baseTopic + "/battery");
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    publishRetained(topic, payload);
     logger.debug("Published battery discovery for " + sensor.name);
 
     // RSSI (signal strength) - available for all sensors
     topic = buildDiscoveryTopic(sensor, "rssi");
     payload = buildDiscoveryJson(sensor, "rssi", baseTopic + "/rssi");
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    publishRetained(topic, payload);
     logger.debug("Published RSSI discovery for " + sensor.name);
 }
 
 String MQTTManager::gatewayTopic(const char *key) const
 {
-    return String(configManager.mqttPrefix) + "/gateway/" + key;
+    return String(cfg.prefix) + "/gateway/" + key;
 }
 
 // One diagnostic sensor of the gateway device
@@ -309,9 +358,9 @@ void MQTTManager::publishGatewayEntity(const char *key, const char *name, const 
     DynamicJsonDocument doc(768);
     doc["name"] = name;
     doc["state_topic"] = gatewayTopic(key);
-    doc["unique_id"] = String(configManager.mqttPrefix) + "_" + gatewayId + "_" + key;
+    doc["unique_id"] = String(cfg.prefix) + "_" + gatewayId + "_" + key;
     doc["entity_category"] = "diagnostic";
-    doc["availability_topic"] = String(configManager.mqttPrefix) + "/status";
+    doc["availability_topic"] = String(cfg.prefix) + "/status";
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
     if (deviceClass)
@@ -336,9 +385,9 @@ void MQTTManager::publishGatewayEntity(const char *key, const char *name, const 
 
     String payload;
     serializeJson(doc, payload);
-    String topic = String(configManager.mqttHAPrefix) + "/sensor/" + String(configManager.mqttPrefix) + "_" +
+    String topic = String(cfg.haPrefix) + "/sensor/" + String(cfg.prefix) + "_" +
                    gatewayId + "_" + key + "/config";
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    publishRetained(topic, payload);
 }
 
 void MQTTManager::publishGatewayDiscovery()
@@ -434,8 +483,8 @@ String MQTTManager::buildDiscoveryTopic(const SensorData &sensor, const String &
         deviceClass = "wind_direction";
 
     // Create discovery topic
-    return String(configManager.mqttHAPrefix) + "/sensor/" +
-           String(configManager.mqttPrefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType + "/config";
+    return String(cfg.haPrefix) + "/sensor/" +
+           String(cfg.prefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType + "/config";
 }
 
 // Helper function to capitalize first letter
@@ -474,10 +523,10 @@ String MQTTManager::buildDiscoveryJson(const SensorData &sensor, const String &v
     doc["value_template"] = "{{ value }}";
 
     // Unique ID
-    doc["unique_id"] = String(configManager.mqttPrefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType;
+    doc["unique_id"] = String(cfg.prefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType;
 
     // Availability topic - use LWT (Last Will and Testament)
-    doc["availability_topic"] = String(configManager.mqttPrefix) + "/status";
+    doc["availability_topic"] = String(cfg.prefix) + "/status";
     doc["payload_available"] = "online";
     doc["payload_not_available"] = "offline";
 
@@ -580,7 +629,7 @@ String capitalizeFirst(const String &input)
 void MQTTManager::publishSensorData(int sensorIndex)
 {
     // Skip if not connected
-    if (!mqttClient.connected() || !configManager.mqttEnabled)
+    if (!mqttClient.connected() || !cfg.enabled)
     {
         return;
     }
@@ -593,7 +642,7 @@ void MQTTManager::publishSensorData(int sensorIndex)
     const SensorData *sensor = &copy;
 
     // Base topic for this sensor
-    String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor->serialNumber);
+    String baseTopic = String(cfg.prefix) + "/" + formatSN(sensor->serialNumber);
 
     // Publish each value based on sensor type
     if (sensor->hasTemperature())
@@ -665,16 +714,32 @@ void MQTTManager::publishSensorData(int sensorIndex)
 
 // Web handlers run in the async server task; PubSubClient is used only from
 // the loop task, so they queue the work here and process() does it
+static constexpr size_t MAX_PENDING_OPS = 32;
+
 void MQTTManager::requestSensorDiscovery(uint32_t serialNumber)
 {
     std::lock_guard<std::mutex> lock(pendingMutex);
-    pending.push_back({PendingOp::Discovery, serialNumber});
+    if (pending.size() < MAX_PENDING_OPS)
+    {
+        pending.push_back({PendingOp::Discovery, serialNumber});
+    }
+    else
+    {
+        logger.warning("MQTT queue full - discovery for " + formatSN(serialNumber) + " dropped");
+    }
 }
 
 void MQTTManager::requestSensorRemoval(uint32_t serialNumber)
 {
     std::lock_guard<std::mutex> lock(pendingMutex);
-    pending.push_back({PendingOp::Removal, serialNumber});
+    if (pending.size() < MAX_PENDING_OPS)
+    {
+        pending.push_back({PendingOp::Removal, serialNumber});
+    }
+    else
+    {
+        logger.warning("MQTT queue full - removal for " + formatSN(serialNumber) + " dropped");
+    }
 }
 
 void MQTTManager::requestReinit()
@@ -685,15 +750,19 @@ void MQTTManager::requestReinit()
 
 void MQTTManager::processPending()
 {
-    std::vector<PendingOp> ops;
     bool reinit;
+    std::vector<PendingOp> ops;
     {
         std::lock_guard<std::mutex> lock(pendingMutex);
         reinit = reinitRequested;
         reinitRequested = false;
-        if (mqttClient.connected() || reinit)
+        if (!cfg.enabled)
         {
-            ops.swap(pending);
+            pending.clear(); // nothing to deliver to
+        }
+        else if (!reinit && mqttClient.connected())
+        {
+            ops.swap(pending); // kept queued until connected
         }
     }
 
@@ -701,11 +770,17 @@ void MQTTManager::processPending()
     {
         logger.info("Reinitializing MQTT with new configuration...");
         disconnect();
+        mqttClientReady = false;
         init();
         lastReconnectAttempt = 0;
-        return; // discovery of everything follows the reconnect
+        return; // full discovery follows the reconnect, queued ops after it
     }
 
+    if (ops.empty())
+    {
+        return;
+    }
+    WatchdogPause pause; // publishes below can block on a stalled socket
     for (const PendingOp &op : ops)
     {
         if (op.type == PendingOp::Removal)
@@ -713,7 +788,7 @@ void MQTTManager::processPending()
             removeDiscoveryForSensor(op.serialNumber);
             continue;
         }
-        if (!configManager.mqttHAEnabled)
+        if (!cfg.haEnabled)
         {
             continue;
         }
@@ -731,7 +806,7 @@ void MQTTManager::processPending()
 // Check connection
 bool MQTTManager::isConnected()
 {
-    return mqttClient.connected() && configManager.mqttEnabled;
+    return mqttClient.connected() && cfg.enabled;
 }
 
 // Disconnect from MQTT broker
@@ -739,7 +814,10 @@ void MQTTManager::disconnect()
 {
     if (mqttClient.connected())
     {
+        WatchdogPause pause; // the socket may be half-dead (uplink just changed)
         logger.info("Disconnecting from MQTT broker");
+        // A clean disconnect does not trigger the last will
+        mqttClient.publish(statusTopic.c_str(), "offline", true);
         mqttClient.disconnect();
     }
 }
@@ -747,7 +825,7 @@ void MQTTManager::disconnect()
 // Remove discovery for deleted sensor
 void MQTTManager::removeDiscoveryForSensor(uint32_t serialNumber)
 {
-    if (!configManager.mqttHAEnabled) {
+    if (!cfg.haEnabled) {
         return; // Do not send discovery if HA is disabled
     }
 
@@ -759,7 +837,7 @@ void MQTTManager::removeDiscoveryForSensor(uint32_t serialNumber)
     logger.info("Removing MQTT discovery for sensor with SN: " + formatSN(serialNumber));
 
     // Create discovery topics for all possible value types
-    String baseDiscoveryTopic = String(configManager.mqttHAPrefix) + "/sensor/" + String(configManager.mqttPrefix) + "_" +
+    String baseDiscoveryTopic = String(cfg.haPrefix) + "/sensor/" + String(cfg.prefix) + "_" +
                                 formatSN(serialNumber) + "_";
 
     // Remove discovery for all possible types

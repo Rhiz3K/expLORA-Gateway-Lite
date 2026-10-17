@@ -119,7 +119,7 @@ String HTMLGenerator::generateLoginPage(bool hasPassword, const String &error, c
     html += "<input type='password' id='password' name='password' autocomplete='current-password' autofocus>";
     html += "<input type='submit' value='Log in'>";
     html += "</form></div>";
-    addHtmlFooter(html);
+    addHtmlFooter(html, true); // no update button before login
     return html;
 }
 
@@ -155,7 +155,7 @@ String HTMLGenerator::generatePasswordPage(bool hasPassword, const String &error
     html += "<input type='password' id='confirm' name='confirm' autocomplete='new-password' minlength='8' maxlength='64' required>";
     html += "<input type='submit' value='Save Password'>";
     html += "</form></div>";
-    addHtmlFooter(html);
+    addHtmlFooter(html, true); // no update button before login
     return html;
 }
 
@@ -189,15 +189,19 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 
     html += "  function parseJsonSafe(text){ try{ return JSON.parse(text); }catch(e){ return null; } }";
 
-    html += "  window.checkUpdate = function(){";
+    html += "  window.checkUpdate = function(tries){";
+    html += "    tries = tries || 0;";
     html += "    fetch('/firmware/check')";
     html += "      .then(function(response){";
     html += "        return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
     html += "      })";
     html += "      .then(function(res){";
+    html += "        if(res.status===202){ if(tries<60){ setTimeout(function(){ window.checkUpdate(tries+1); },1000); return; } throw new Error('No answer from the update server'); }";
     html += "        if(!res.ok){ throw new Error((res.data && (res.data.error||res.data.message)) || ('HTTP '+res.status)); }";
     html += "        var d=res.data; if(!d){ throw new Error('Bad JSON: '+res.raw); }";
-    html += "        if(d.version && d.version !== '" + String(FIRMWARE_VERSION) + "'){";
+    // Only a newer version (numeric compare of x.y.z), never a downgrade
+    html += "        var newer=function(a,b){a=String(a).split('.');b=String(b).split('.');for(var i=0;i<Math.max(a.length,b.length);i++){var x=parseInt(a[i]||0,10),y=parseInt(b[i]||0,10);if(x!==y)return x>y;}return false;};";
+    html += "        if(d.version && newer(d.version,'" + String(FIRMWARE_VERSION) + "')){";
     html += "          if(confirm('New version '+d.version+' available. Update now?')){";
     html += "            window.updateFirmware(d.url);";
     html += "          }";
@@ -377,7 +381,7 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
 #endif
     if (WiFi.STA.connected())
     {
-        html += "<p><strong>WiFi:</strong> Connected to " + WiFi.SSID() + "</p>";
+        html += "<p><strong>WiFi:</strong> Connected to " + htmlEscape(WiFi.SSID()) + "</p>";
     }
     else
     {
@@ -484,30 +488,12 @@ void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &
     html += "<label for='timezone'>Timezone:</label>";
     html += "<select id='timezone' name='timezone'>";
 
-    html += "<option value='GMT0'";
-    if (timezone == "GMT0")
-        html += " selected";
-    html += ">GMT/UTC (00:00)</option>";
-
-    html += "<option value='WET0WEST,M3.5.0/1,M10.5.0'";
-    if (timezone == "WET0WEST,M3.5.0/1,M10.5.0")
-        html += " selected";
-    html += ">Western European (WET/WEST)</option>";
-
-    html += "<option value='CET-1CEST,M3.5.0,M10.5.0/3'";
-    if (timezone == "CET-1CEST,M3.5.0,M10.5.0/3")
-        html += " selected";
-    html += ">Central European (CET/CEST)</option>";
-
-    html += "<option value='EET-2EEST,M3.5.0/3,M10.5.0/4'";
-    if (timezone == "EET-2EEST,M3.5.0/3,M10.5.0/4")
-        html += " selected";
-    html += ">Eastern European (EET/EEST)</option>";
-
-    html += "<option value='MSK-3'";
-    if (timezone == "MSK-3")
-        html += " selected";
-    html += ">Moscow Time (MSK)</option>";
+    static const char *const zones[][2] = TIMEZONE_OPTIONS;
+    for (const auto &zone : zones)
+    {
+        html += "<option value='" + String(zone[0]) + "'" + String(timezone == zone[0] ? " selected" : "") + ">" +
+                zone[1] + "</option>";
+    }
     html += "</select>";
 
     html += "<input type='submit' value='Save and Restart'>";
@@ -602,6 +588,10 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     html += "<label for='password'>Password (optional):</label>";
     html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
             String(password.length() > 0 ? "(unchanged)" : "") + "'>";
+    if (password.length() > 0)
+    {
+        html += "<label><input type='checkbox' name='clearPassword' value='1'> Remove the stored password</label>";
+    }
     html += "</div>";
 
     // Root prefix
@@ -856,7 +846,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             {
                 html += "<br><small style='color:#c0392b;'>";
                 html += "last reject: ";
-                html += String(h.lastRejectReason);
+                html += htmlEscape(String(h.lastRejectReason));
                 html += " (";
                 html += formatRelativeMillis(nowMillis, h.lastRejectAtMillis, true);
                 html += ")</small>";
@@ -894,8 +884,8 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
 
             html += "<td>";
             html += "<a class='btn' href='/sensors/edit?index=" + String(idx) + "'>Edit</a> ";
-            html += "<a class='btn btn-delete' href='/sensors/delete?index=" + String(idx) +
-                    "' onclick='return confirm(\"Are you sure you want to delete this sensor?\")'>Delete</a>";
+            html += "<a class='btn btn-delete' href='/sensors/delete?index=" + String(idx) + "&sn=" +
+                    formatSN(s.serialNumber) + "' onclick='return confirm(\"Are you sure you want to delete this sensor?\")'>Delete</a>";
             html += "</td></tr>";
         }
         html += "</table>";
@@ -944,7 +934,6 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "      if(!document.getElementById('fwFile').files.length){ alert('Select .bin file first'); return; }";
     html += "      if(b) b.disabled=true;";
     html += "      if(window.showNotice){ window.showNotice('Uploading firmware… Please wait ~2 minutes. Do not power off.'); }";
-    html += "      if (typeof startAutoRefresh==='function') { startAutoRefresh(120000); } else { setTimeout(function(){ location.reload(); },120000); }";
     html += "      var fd=new FormData(f);";
     html += "      fetch('/firmware',{ method:'POST', body:fd })";
     html += "        .then(function(resp){ return resp.text().then(function(t){ return {ok:resp.ok,status:resp.status,data:parseJsonSafe(t),raw:t}; }); })";
@@ -952,10 +941,11 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "          if(!res.ok){ throw new Error((res.data&&(res.data.error||res.data.message))||('HTTP '+res.status)); }";
     html += "          var msg=(res.data&&res.data.message)?res.data.message:'Firmware uploaded. Installing… device will reboot automatically.';";
     html += "          if(window.showNotice){ window.showNotice(msg); } else { alert(msg); }";
+    html += "          setTimeout(function(){ location.reload(); },60000);";
     html += "        })";
     html += "        .catch(function(err){";
     html += "          console.error('Upload error:',err);";
-    html += "          if(window.showNotice){ window.showNotice('Upload request sent. Device may already be updating. Error: '+err.message); }";
+    html += "          if(window.showNotice){ window.showNotice('Upload interrupted - if the session expired, reload the page and log in again. Error: '+err.message); }";
     html += "          else { alert('Upload failed: '+err.message); }";
     html += "        })";
     html += "        .finally(function(){ if(b) b.disabled=false; });";
@@ -1255,6 +1245,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Hidden index
     html += "<input type='hidden' name='index' value='" + String(index) + "'>";
+    // The slot may be reused by another sensor before this form is sent
+    html += "<input type='hidden' name='sn' value='" + formatSN(sensor.serialNumber) + "'>";
 
     // Sensor name
     html += "<label for='name'>Sensor Name:</label>";
@@ -1551,10 +1543,10 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 }
 
 // Generating logs page
-String HTMLGenerator::generateLogsPage(LogLevel currentLevel)
+String HTMLGenerator::generateLogsPageHead(LogLevel currentLevel)
 {
     String html;
-    html.reserve(8192);
+    html.reserve(3072);
 
     // Adding header
     addHtmlHeader(html, "Logs");
@@ -1588,36 +1580,36 @@ String HTMLGenerator::generateLogsPage(LogLevel currentLevel)
     html += "<h2>System Logs</h2>";
     html += "<div class='log-container'>";
 
-    size_t count = Logger::forEachNewestFirst([&html](const LogEntry &entry)
+    return html;
+}
+
+// One log line of the logs page
+String HTMLGenerator::generateLogEntry(const LogEntry &entry)
+{
+    const char *logClass = "log-info";
+    switch (entry.level)
     {
-        const char *logClass = "log-info";
-        switch (entry.level)
-        {
-        case LogLevel::ERROR:
-            logClass = "log-error";
-            break;
-        case LogLevel::WARNING:
-            logClass = "log-warning";
-            break;
-        case LogLevel::DEBUG:
-            logClass = "log-debug";
-            break;
-        case LogLevel::VERBOSE:
-            logClass = "log-verbose";
-            break;
-        default:
-            break;
-        }
-        html += "<div class='log-entry ";
-        html += logClass;
-        html += "'>";
-        html += htmlEscape(entry.getFormattedLog());
-        html += "</div>";
-    });
-    if (count == 0)
-    {
-        html += "<div class='log-entry'>No logs to display</div>";
+    case LogLevel::ERROR:
+        logClass = "log-error";
+        break;
+    case LogLevel::WARNING:
+        logClass = "log-warning";
+        break;
+    case LogLevel::DEBUG:
+        logClass = "log-debug";
+        break;
+    case LogLevel::VERBOSE:
+        logClass = "log-verbose";
+        break;
+    default:
+        break;
     }
+    return "<div class='log-entry " + String(logClass) + "'>" + htmlEscape(entry.getFormattedLog()) + "</div>";
+}
+
+String HTMLGenerator::generateLogsPageTail()
+{
+    String html;
     html += "</div>"; // log-container
     html += "</div>"; // card
 
@@ -1630,11 +1622,17 @@ String HTMLGenerator::generateLogsPage(LogLevel currentLevel)
     return html;
 }
 // Generating JSON for API
-String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
+DynamicJsonDocument HTMLGenerator::buildAPIJson(const std::vector<SensorData> &sensors)
 {
     // Estimating JSON document size
+    // Up to ~20 members per sensor (METEO) plus their copied strings
+    size_t textSize = 0;
+    for (const auto &sensor : sensors)
+    {
+        textSize += sensor.name.length() + 64;
+    }
     const size_t capacity = JSON_OBJECT_SIZE(5) + JSON_ARRAY_SIZE(sensors.size()) +
-                            sensors.size() * JSON_OBJECT_SIZE(15) + 1024; // Extra space for safety
+                            sensors.size() * JSON_OBJECT_SIZE(24) + textSize + 512;
 
     DynamicJsonDocument doc(capacity);
 
@@ -1668,10 +1666,12 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
         }
     }
 
-    // Serialization to string
-    String result;
-    serializeJson(doc, result);
-    return result;
+    if (doc.overflowed())
+    {
+        doc.clear();
+        doc["error"] = "response too large";
+    }
+    return doc;
 }
 
 // Generating API page
@@ -1700,7 +1700,7 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     html += "<pre style='background: #f5f5f5; padding: 10px; overflow-x: auto;'>";
     html += "{\n";
     html += "  \"version\": \"" + String(FIRMWARE_VERSION) + "\",\n";
-    html += "  \"time\": \"2023-08-01 12:34:56\",\n";
+    html += "  \"time\": \"2026-10-17 12:34:56\",\n";
     html += "  \"status\": \"connected\",\n";
     html += "  \"sensors\": [\n";
 
@@ -1709,8 +1709,8 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     {
         const auto &sensor = sensors[0];
         html += "    {\n";
-        html += "      \"name\": \"" + sensor.name + "\",\n";
-        html += "      \"type\": " + String(static_cast<uint8_t>(sensor.deviceType)) + ",\n";
+        html += "      \"name\": \"" + htmlEscape(sensor.name) + "\",\n";
+        html += "      \"deviceType\": " + String(static_cast<uint8_t>(sensor.deviceType)) + ",\n";
         html += "      \"typeName\": \"" + String(sensor.getTypeInfo().name) + "\",\n";
         html += "      \"serialNumber\": \"" + formatSN(sensor.serialNumber) + "\",\n";
         html += "      \"lastSeen\": " + (sensor.lastSeen > 0 ? String((millis() - sensor.lastSeen) / 1000) : "-1") + ",\n";
@@ -1748,7 +1748,7 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     {
         html += "    {\n";
         html += "      \"name\": \"Example Sensor\",\n";
-        html += "      \"type\": 1,\n";
+        html += "      \"deviceType\": 1,\n";
         html += "      \"typeName\": \"CLIMA\",\n";
         html += "      \"serialNumber\": \"123456\",\n";
         html += "      \"lastSeen\": 300,\n";
@@ -1769,7 +1769,7 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     html += "</div>";
 
     // Adding footer
-    addHtmlFooter(html);
+    addHtmlFooter(html, true); // public page: no update button
 
     return html;
 }

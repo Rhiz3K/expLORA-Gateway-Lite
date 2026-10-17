@@ -76,6 +76,8 @@ private:
 
     // Discovery config of one sensor
     void publishSensorDiscovery(const SensorData &sensor);
+    bool publishRetained(const String &topic, const String &payload);
+    volatile bool haRestarted = false; // "online" on <haPrefix>/status
 
     // Work queued by other tasks (web handlers), done in process()
     struct PendingOp
@@ -91,6 +93,8 @@ private:
     std::vector<PendingOp> pending;
     bool reinitRequested = false;
     void processPending();
+
+    String statusTopic;
 
     // Gateway entities: discovery and state
     String gatewayTopic(const char *key) const;
@@ -121,10 +125,33 @@ public:
     // Thread-safe requests (any task), carried out by process()
     void requestSensorDiscovery(uint32_t serialNumber);
     void requestSensorRemoval(uint32_t serialNumber);
+    // Copy of the MQTT configuration taken by init() (loop task), so the
+    // strings in use - PubSubClient keeps the host pointer - never change
+    // under it when the web task saves new settings
+    struct Settings
+    {
+        String host;
+        int port;
+        String user;
+        String password;
+        bool enabled;
+        bool tls;
+        String prefix;
+        String haPrefix;
+        bool haEnabled;
+    };
+
+    // Reconnect with the saved configuration (called after the web form saved it)
     void requestReinit();
+
+private:
+    Settings cfg;
+
+public:
 
     // Check connection
     bool isConnected();
+    bool usesTls() const { return cfg.tls; }
 
     // Disconnect from MQTT broker
     void disconnect();

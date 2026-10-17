@@ -153,6 +153,48 @@ static void test_full_24h_silence_wipes_window_completely(void)
     TEST_ASSERT_EQUAL_UINT32(1, SensorHealth::okLast24h(s));
 }
 
+static void test_event_after_long_silence_survives_next_tick(void)
+{
+    Stats s;
+    SensorHealth::recordSuccess(s, 1000UL);
+
+    // Two days of silence, a new packet, then a periodic tick a minute later:
+    // the new packet must still be counted
+    unsigned long now = 1000UL + 48UL * BUCKET_MS + 5000UL;
+    SensorHealth::recordSuccess(s, now);
+    SensorHealth::advanceBucketsIfNeeded(s, now + 60000UL);
+    TEST_ASSERT_EQUAL_UINT32(1, SensorHealth::okLast24h(s));
+}
+
+static void test_silence_longer_than_signed_millis_range(void)
+{
+    Stats s;
+    SensorHealth::recordSuccess(s, 1000UL);
+
+    // 30 days > 2^31 ms: the window must still advance
+    unsigned long now = 1000UL + 30UL * 24UL * BUCKET_MS;
+    SensorHealth::recordSuccess(s, now);
+    TEST_ASSERT_EQUAL_UINT32(1, SensorHealth::okLast24h(s));
+}
+
+static void test_rejections_only_is_not_healthy(void)
+{
+    Stats s;
+    SensorHealth::recordRejection(s, 1000UL, "invalid checksum");
+    TEST_ASSERT_EQUAL(SensorHealth::Status::Unknown, SensorHealth::status(s, 2000UL));
+}
+
+static void test_stale_survives_millis_wrap(void)
+{
+    Stats s;
+    SensorHealth::recordSuccess(s, 1000UL);
+    SensorHealth::latchStale(s, 1000UL + 7UL * BUCKET_MS); // tick after 7 h
+    // 49.7 days later the 32-bit difference has wrapped to a small value
+    TEST_ASSERT_EQUAL(SensorHealth::Status::Stale, SensorHealth::status(s, 1000UL + 60000UL));
+    SensorHealth::recordSuccess(s, 2000UL);
+    TEST_ASSERT_EQUAL(SensorHealth::Status::Healthy, SensorHealth::status(s, 3000UL));
+}
+
 static void test_window_wraps_around_correctly(void)
 {
     Stats s;
@@ -230,6 +272,10 @@ int main(int, char **)
     RUN_TEST(test_window_does_not_advance_within_hour);
     RUN_TEST(test_multi_hour_silence_zeroes_skipped_buckets);
     RUN_TEST(test_full_24h_silence_wipes_window_completely);
+    RUN_TEST(test_event_after_long_silence_survives_next_tick);
+    RUN_TEST(test_silence_longer_than_signed_millis_range);
+    RUN_TEST(test_rejections_only_is_not_healthy);
+    RUN_TEST(test_stale_survives_millis_wrap);
     RUN_TEST(test_window_wraps_around_correctly);
     RUN_TEST(test_ok_and_reject_buckets_are_independent);
 

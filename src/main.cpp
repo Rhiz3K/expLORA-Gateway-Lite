@@ -42,6 +42,7 @@
 #include "Hardware/PSRAM_Manager.h"
 #include "Hardware/PowerSource.h"
 #include "Hardware/SPI_Manager.h"
+#include "Hardware/WatchdogPause.h"
 
 // Storage
 #include "Storage/ConfigManager.h"
@@ -69,10 +70,30 @@ PowerSource *powerSource;     // Supply source (PoE / USB) on boards that detect
 
 // Timer for disabling AP mode
 
+// Loop task stack: TLS handshakes (update check, URL OTA, HTTPS forwarding,
+// MQTT TLS) run in loop(); 8 kB left under 4 kB headroom (see /diag/heap)
+SET_LOOP_TASK_STACK_SIZE(10 * 1024);
+
 // File system initialization
 bool initFileSystem()
 {
-    if (!LittleFS.begin(true))
+    // Format only when mounting keeps failing (a blank partition on the first
+    // boot) - not on one transient error, which would wipe all settings
+    bool mounted = false;
+    for (int attempt = 0; attempt < 3 && !mounted; attempt++)
+    {
+        if (attempt > 0)
+        {
+            delay(500);
+        }
+        mounted = LittleFS.begin(false);
+    }
+    if (!mounted)
+    {
+        Serial.println("LittleFS mount failed 3 times - formatting (sensors and settings files are lost)");
+        mounted = LittleFS.begin(true);
+    }
+    if (!mounted)
     {
         Serial.println("ERROR: Failed to mount LittleFS");
         return false;
@@ -251,6 +272,13 @@ void loop()
 {
     esp_task_wdt_reset();
 
+    // setup() stopped early (filesystem / configuration failure, logged)
+    if (!uplink || !powerSource)
+    {
+        delay(1000);
+        return;
+    }
+
     // Connectivity: station reconnect, AP / captive portal, time sync
     uplink->process();
     powerSource->process();
@@ -275,10 +303,10 @@ void loop()
         webPortal->handleClient();
     }
 
-    // Process MQTT communication
-    if (mqttManager && uplink->isOnline())
+    // Process MQTT communication (settings changes are applied even offline)
+    if (mqttManager)
     {
-        mqttManager->process();
+        mqttManager->process(); // pauses the watchdog itself around socket work
     }
 
     // Add a check for LoRa packet processing to publish to MQTT
@@ -290,6 +318,7 @@ void loop()
             // If we have a mqttManager and it's connected, publish the latest sensor data
             if (mqttManager && uplink->isOnline())
             {
+                WatchdogPause pause;
                 mqttManager->publishSensorData(loraProtocol->getLastProcessedSensorIndex());
             }
         }
@@ -297,6 +326,46 @@ void loop()
 
     // Short delay for stability
     delay(5);
+
+    // The web server refuses requests while the largest free block is below
+    // 8 kB; if fragmentation keeps it there for 15 minutes, restart rather than stay
+    // unmanageable until someone power-cycles the gateway
+    static unsigned long lowBlockSince = 0;
+    if (ESP.getMaxAllocHeap() < 8192)
+    {
+        if (lowBlockSince == 0)
+        {
+            lowBlockSince = millis() | 1;
+            logger.warning("Heap fragmented: largest free block " + String(ESP.getMaxAllocHeap()) + " B");
+        }
+        else if (millis() - lowBlockSince > 900000)
+        {
+            logger.error("Heap fragmented for 15 minutes - restarting");
+            if (sensorManager)
+            {
+                sensorManager->saveSensors(true); // keep the rain totals
+            }
+            delay(200);
+            ESP.restart();
+        }
+    }
+    else
+    {
+        lowBlockSince = 0;
+    }
+
+    // Radio health: a chip that stopped answering (brown-out, ESD) is
+    // re-initialized instead of silently receiving nothing
+    static unsigned long lastRadioCheck = 0;
+    if (loraModule && millis() - lastRadioCheck > 600000)
+    {
+        lastRadioCheck = millis();
+        if (!loraModule->isConnected())
+        {
+            logger.error("LoRa radio not responding - resetting it");
+            loraModule->reset();
+        }
+    }
 
     if (sensorManager)
     {

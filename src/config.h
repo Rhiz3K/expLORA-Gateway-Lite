@@ -92,6 +92,15 @@ inline String makeApName()
 #define NTP_SERVER_2 "time.cloudflare.com"
 #define NTP_SERVER_3 "time.google.com"
 #define TIME_STALE_AFTER_S (24 * 3600) // no successful sync for this long = stale
+// Timezones offered in the WiFi form (POSIX TZ, label)
+#define TIMEZONE_OPTIONS                                                  \
+    {                                                                     \
+        {"GMT0", "GMT/UTC (00:00)"},                                      \
+        {"WET0WEST,M3.5.0/1,M10.5.0", "Western European (WET/WEST)"},     \
+        {"CET-1CEST,M3.5.0,M10.5.0/3", "Central European (CET/CEST)"},    \
+        {"EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern European (EET/EEST)"},  \
+        {"MSK-3", "Moscow Time (MSK)"},                                   \
+    }
 #define DEFAULT_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3" // Central European Time with auto DST
 
 // MQTT Configuration
@@ -131,5 +140,4 @@ inline String makeApName()
 // PSRAM configuration for web server
 
 // OTA update settings
-#define OTA_PASSWORD "admin" // OTA update password
 #define OTA_PORT 3232        // OTA update port

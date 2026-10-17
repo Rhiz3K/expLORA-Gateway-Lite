@@ -39,7 +39,7 @@ static constexpr int ETH_ROUTE_PRIO = 150;
 #endif
 
 volatile bool Uplink::timeSyncedFlag = false;
-volatile time_t Uplink::lastTimeSync = 0;
+volatile uint32_t Uplink::lastTimeSync = 0;
 
 Uplink::Uplink(ConfigManager &cfg, Logger &log)
     : config(cfg), logger(log)
@@ -241,7 +241,13 @@ void Uplink::processStation(unsigned long now)
         {
             logger.info("Attempting to reconnect to WiFi...");
             config.lastWifiAttempt = now;
-            WiFi.begin(config.wifiSSID.c_str(), config.wifiPassword.c_str());
+            String ssid, password; // copies: the web task may save new ones
+            {
+                std::lock_guard<std::recursive_mutex> guard(config.mutex());
+                ssid = config.wifiSSID;
+                password = config.wifiPassword;
+            }
+            WiFi.begin(ssid.c_str(), password.c_str());
             reconnecting = true;
             reconnectStartedAt = now;
         }
@@ -594,13 +600,18 @@ void Uplink::startTimeSync()
 {
     // Accept an NTP server announced by DHCP (router) in the first slot
     esp_sntp_servermode_dhcp(true);
-    configTzTime(config.timezone.c_str(), NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    String tz;
+    {
+        std::lock_guard<std::recursive_mutex> guard(config.mutex());
+        tz = config.timezone;
+    }
+    configTzTime(tz.c_str(), NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
 }
 
 // SNTP task
 void Uplink::onTimeSync(struct timeval *tv)
 {
-    lastTimeSync = tv ? tv->tv_sec : time(nullptr);
+    lastTimeSync = (uint32_t)(tv ? tv->tv_sec : time(nullptr));
     timeSyncedFlag = true;
 }
 
@@ -611,7 +622,7 @@ bool Uplink::isTimeValid() const
 
 bool Uplink::isTimeStale() const
 {
-    return lastTimeSync == 0 || time(nullptr) - lastTimeSync > TIME_STALE_AFTER_S;
+    return lastTimeSync == 0 || time(nullptr) - (time_t)lastTimeSync > TIME_STALE_AFTER_S;
 }
 
 String Uplink::getTimeStatus() const
@@ -626,7 +637,7 @@ String Uplink::getTimeStatus() const
     char text[24];
     strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &now);
     String status = text;
-    long age = (long)(t - lastTimeSync);
+    long age = (long)(t - (time_t)lastTimeSync);
     if (age < 120)
     {
         status += " (synced " + String(age) + " s ago)";

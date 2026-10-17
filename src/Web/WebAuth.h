@@ -34,8 +34,8 @@
  * an empty password logs in and the user must set one before anything else.
  *
  * Sessions are random tokens in an HttpOnly, SameSite=Strict cookie, kept in
- * RAM (a restart logs everyone out). Repeated failed logins lock the login
- * for a while.
+ * RAM (a restart logs everyone out). Repeated wrong passwords lock the
+ * login for a while - per client address, so others are not locked out.
  */
 class WebAuth
 {
@@ -50,7 +50,7 @@ public:
     // Login: checks the password (empty when none is set), creates a session
     // and returns its token; empty token on failure, retryAfterS set when
     // the login is locked
-    String login(const String &password, unsigned long &retryAfterS);
+    String login(AsyncWebServerRequest *request, const String &password, unsigned long &retryAfterS);
 
     // Session cookie of the request is valid (refreshes its idle timer)
     bool isAuthorized(AsyncWebServerRequest *request);
@@ -58,7 +58,12 @@ public:
     void logout(AsyncWebServerRequest *request);
 
     // Set a new password; ends all sessions. Returns an error, empty on success
-    String changePassword(const String &current, const String &password, const String &confirm);
+    String changePassword(AsyncWebServerRequest *request, const String &current, const String &password,
+                          const String &confirm);
+
+    // New session for the user who just changed the password (bypasses the
+    // login throttle, which another client may have armed)
+    String sessionAfterPasswordChange() { return createSession(); }
 
     // Recovery over the serial console (physical access)
     void resetPassword();
@@ -70,21 +75,45 @@ private:
     struct Session
     {
         char token[33];
-        unsigned long lastUsed;
+        uint64_t lastUsed; // ms since boot (64-bit: no wrap)
+    };
+
+    // Failed password attempts per client address
+    struct Attempts
+    {
+        uint32_t ip;
+        uint8_t failures;
+        uint64_t lockedUntil;
+        uint64_t lastFailureAt; // failures expire LOGIN_LOCK_TIME after the last one
     };
 
     static constexpr size_t MAX_SESSIONS = 4;
-    static constexpr unsigned long SESSION_IDLE_TIMEOUT = 24UL * 3600 * 1000;
+    static constexpr size_t MAX_TRACKED_CLIENTS = 8;
+    static constexpr uint64_t SESSION_IDLE_TIMEOUT = 24ULL * 3600 * 1000;
     static constexpr uint8_t MAX_FAILED_LOGINS = 5;
-    static constexpr unsigned long LOGIN_LOCK_TIME = 60000;
+    static constexpr uint64_t LOGIN_LOCK_TIME = 60000;
 
     ConfigManager &config;
     Logger &logger;
 
     Session sessions[MAX_SESSIONS] = {};
     portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
-    uint8_t failedLogins = 0;
-    unsigned long lockedUntil = 0;
+    Attempts attempts[MAX_TRACKED_CLIENTS] = {};
+    // All clients together: past GLOBAL_FAILURE_LIMIT wrong passwords within a
+    // minute (an attack from changing addresses), one attempt per second
+    static constexpr uint8_t GLOBAL_FAILURE_LIMIT = 10;
+    uint64_t lastFailure = 0;
+    uint64_t globalWindowStart = 0;
+    uint8_t globalFailures = 0;
+
+    static uint64_t nowMs();
+    static uint32_t clientIp(AsyncWebServerRequest *request);
+    // Entry of the client, nullptr when the table is full of clients with
+    // recent failures (then only the global 1 s spacing applies)
+    Attempts *attemptsFor(uint32_t ip);
+    // Seconds until the client may try again, 0 = allowed
+    unsigned long lockedFor(uint32_t ip);
+    void recordFailure(uint32_t ip);
 
     bool verifyPassword(const String &password) const;
     static String hashPassword(const String &password, const String &saltHex);

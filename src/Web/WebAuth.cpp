@@ -21,6 +21,7 @@
 
 #include "WebAuth.h"
 #include <esp_random.h>
+#include <esp_timer.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
 
@@ -34,8 +35,10 @@ WebAuth::WebAuth(ConfigManager &cfg, Logger &log) : config(cfg), logger(log)
 {
 }
 
+// The hash is reset from the loop task (serial console): read it under the lock
 bool WebAuth::hasPassword() const
 {
+    std::lock_guard<std::recursive_mutex> guard(config.mutex());
     return config.adminPasswordHash.length() > 0;
 }
 
@@ -79,7 +82,11 @@ bool WebAuth::verifyPassword(const String &password) const
     {
         return password.length() == 0;
     }
-    const String &stored = config.adminPasswordHash;
+    String stored;
+    {
+        std::lock_guard<std::recursive_mutex> guard(config.mutex());
+        stored = config.adminPasswordHash;
+    }
     int first = stored.indexOf('$');
     int second = stored.indexOf('$', first + 1);
     int third = stored.indexOf('$', second + 1);
@@ -101,10 +108,103 @@ bool WebAuth::verifyPassword(const String &password) const
     return diff == 0;
 }
 
+uint64_t WebAuth::nowMs()
+{
+    return (uint64_t)(esp_timer_get_time() / 1000);
+}
+
+uint32_t WebAuth::clientIp(AsyncWebServerRequest *request)
+{
+    return request->client() ? (uint32_t)request->client()->remoteIP() : 0;
+}
+
+// Entry of this client; a new client takes a free or clean entry (no
+// failures, no running lock). Entries with failures are never evicted, so
+// rotating addresses cannot reset counters - when none is clean, a new
+// address has to wait like a locked one.
+WebAuth::Attempts *WebAuth::attemptsFor(uint32_t ip)
+{
+    uint64_t now = nowMs();
+    Attempts *clean = nullptr;
+    for (Attempts &a : attempts)
+    {
+        if (a.ip == ip)
+        {
+            return &a;
+        }
+        bool expired = a.failures == 0 || now - a.lastFailureAt > LOGIN_LOCK_TIME;
+        if (clean == nullptr && (a.ip == 0 || (expired && a.lockedUntil <= now)))
+        {
+            clean = &a;
+        }
+    }
+    if (clean != nullptr)
+    {
+        *clean = {ip, 0, 0, 0};
+    }
+    return clean;
+}
+
+unsigned long WebAuth::lockedFor(uint32_t ip)
+{
+    uint64_t now = nowMs();
+    // Global throttle, only while many wrong passwords arrive
+    if (globalFailures >= GLOBAL_FAILURE_LIMIT && now - globalWindowStart < 60000 && now - lastFailure < 1000)
+    {
+        return 1;
+    }
+    Attempts *a = attemptsFor(ip);
+    if (a == nullptr)
+    {
+        // Table full of recent failures (an attack from many addresses):
+        // new addresses get the global 1 s spacing, not a lock-out
+        return now - lastFailure < 1000 ? 1 : 0;
+    }
+    return a->lockedUntil > now ? (unsigned long)((a->lockedUntil - now) / 1000 + 1) : 0;
+}
+
+void WebAuth::recordFailure(uint32_t ip)
+{
+    uint64_t now = nowMs();
+    lastFailure = now;
+    if (now - globalWindowStart >= 60000)
+    {
+        globalWindowStart = now;
+        globalFailures = 0;
+    }
+    if (globalFailures < 255)
+    {
+        globalFailures++;
+    }
+    Attempts *entry = attemptsFor(ip);
+    if (entry == nullptr)
+    {
+        return;
+    }
+    Attempts &a = *entry;
+    if (a.failures > 0 && now - a.lastFailureAt > LOGIN_LOCK_TIME)
+    {
+        a.failures = 0; // old failures expired
+    }
+    a.lastFailureAt = now;
+    if (++a.failures >= MAX_FAILED_LOGINS)
+    {
+        a.failures = 0;
+        a.lockedUntil = nowMs() + LOGIN_LOCK_TIME;
+        logger.warning("Web login locked for " + String((unsigned long)(LOGIN_LOCK_TIME / 1000)) + " s for " +
+                       IPAddress(ip).toString() + " after failed attempts");
+    }
+    else if (a.failures == 1)
+    {
+        // First failure only: a guessing client must not flush the log ring
+        logger.warning("Web login failed from " + IPAddress(ip).toString());
+    }
+}
+
 String WebAuth::createSession()
 {
     String token = randomHex(16);
-    unsigned long now = millis();
+    uint64_t now = nowMs();
     portENTER_CRITICAL(&lock);
     // Free slot, expired slot, or the least recently used one
     size_t slot = 0;
@@ -134,33 +234,29 @@ void WebAuth::endAllSessions()
     portEXIT_CRITICAL(&lock);
 }
 
-String WebAuth::login(const String &password, unsigned long &retryAfterS)
+String WebAuth::login(AsyncWebServerRequest *request, const String &password, unsigned long &retryAfterS)
 {
-    retryAfterS = 0;
-    unsigned long now = millis();
-    if (lockedUntil != 0 && (long)(lockedUntil - now) > 0)
+    uint32_t ip = clientIp(request);
+    retryAfterS = lockedFor(ip);
+    if (retryAfterS > 0)
     {
-        retryAfterS = (lockedUntil - now) / 1000 + 1;
         return String();
     }
     if (password.length() > MAX_PASSWORD_LENGTH || !verifyPassword(password))
     {
-        if (++failedLogins >= MAX_FAILED_LOGINS)
-        {
-            failedLogins = 0;
-            lockedUntil = now + LOGIN_LOCK_TIME;
-            retryAfterS = LOGIN_LOCK_TIME / 1000;
-            logger.warning("Web login locked for " + String(LOGIN_LOCK_TIME / 1000) + " s after failed attempts");
-        }
-        else
-        {
-            logger.warning("Web login failed");
-        }
+        recordFailure(ip);
+        // Report this client's lock only (not the 1 s global throttle)
+        Attempts *entry = attemptsFor(ip);
+        uint64_t now = nowMs();
+        retryAfterS = entry && entry->lockedUntil > now ? (unsigned long)((entry->lockedUntil - now) / 1000 + 1) : 0;
         return String();
     }
-    failedLogins = 0;
-    lockedUntil = 0;
-    logger.info("Web login");
+    Attempts *entry = attemptsFor(ip);
+    if (entry != nullptr)
+    {
+        *entry = {ip, 0, 0, 0};
+    }
+    logger.info("Web login from " + IPAddress(ip).toString());
     return createSession();
 }
 
@@ -194,7 +290,7 @@ bool WebAuth::isAuthorized(AsyncWebServerRequest *request)
     {
         return false;
     }
-    unsigned long now = millis();
+    uint64_t now = nowMs();
     bool valid = false;
     portENTER_CRITICAL(&lock);
     for (Session &session : sessions)
@@ -231,11 +327,18 @@ void WebAuth::logout(AsyncWebServerRequest *request)
     portEXIT_CRITICAL(&lock);
 }
 
-String WebAuth::changePassword(const String &current, const String &password, const String &confirm)
+String WebAuth::changePassword(AsyncWebServerRequest *request, const String &current, const String &password,
+                               const String &confirm)
 {
-    if (hasPassword() && !verifyPassword(current))
+    uint32_t ip = clientIp(request);
+    unsigned long retryAfter = lockedFor(ip);
+    if (retryAfter > 0)
     {
-        logger.warning("Admin password change: wrong current password");
+        return "Too many failed attempts - try again in " + String(retryAfter) + " s";
+    }
+    if (hasPassword() && (current.length() > MAX_PASSWORD_LENGTH || !verifyPassword(current)))
+    {
+        recordFailure(ip);
         return "The current password is wrong";
     }
     if (password.length() < MIN_PASSWORD_LENGTH || password.length() > MAX_PASSWORD_LENGTH)

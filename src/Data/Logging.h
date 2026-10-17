@@ -22,7 +22,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <functional>
 #include <mutex>
 #include "../config.h"
 
@@ -147,9 +146,9 @@ public:
     static void debug(const String &message);
     static void verbose(const String &message);
 
-    // Visit the stored entries newest first, under the log lock (the visitor
-    // must not log); returns the number of entries visited
-    static size_t forEachNewestFirst(const std::function<void(const LogEntry &)> &visitor);
+    // Copy of the n-th newest entry (0 = newest) under the log lock; false
+    // past the end
+    static bool copyNewest(size_t n, LogEntry &out);
 
     // Clear all logs
     static void clearLogs();

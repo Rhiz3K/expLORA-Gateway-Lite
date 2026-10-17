@@ -115,7 +115,7 @@ LogLevel Logger::getLogLevel()
 // Get timestamp
 String Logger::getTimeStamp()
 {
-    static char timeBuffer[32];
+    char timeBuffer[32]; // per call: logged from several tasks
 
     if (timeInitialized)
     {
@@ -212,18 +212,15 @@ void Logger::verbose(const String &message)
     log(LogLevel::VERBOSE, message);
 }
 
-size_t Logger::forEachNewestFirst(const std::function<void(const LogEntry &)> &visitor)
+bool Logger::copyNewest(size_t n, LogEntry &out)
 {
     std::lock_guard<std::mutex> lock(logMutex);
-    if (logBuffer == nullptr)
+    if (logBuffer == nullptr || n >= logCount)
     {
-        return 0;
+        return false;
     }
-    for (size_t i = 0; i < logCount; i++)
-    {
-        visitor(logBuffer[(logIndex + logBufferSize - 1 - i) % logBufferSize]);
-    }
-    return logCount;
+    out = logBuffer[(logIndex + logBufferSize - 1 - n) % logBufferSize];
+    return true;
 }
 
 // Clear all logs

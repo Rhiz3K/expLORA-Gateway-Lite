@@ -85,13 +85,17 @@ public:
     static String generateSensorEditPage(const SensorData &sensor, int index);
 
     // Generate logs page
-    static String generateLogsPage(LogLevel currentLevel);
+    // Logs page in pieces, streamed by the web server (see handleLogs)
+    static String generateLogsPageHead(LogLevel currentLevel);
+    static String generateLogEntry(const LogEntry &entry);
+    static String generateLogsPageTail();
 
     // Generate API page
     static String generateAPIPage(const std::vector<SensorData> &sensors);
 
     // Generate JSON for API
-    static String generateAPIJson(const std::vector<SensorData> &sensors);
+    // JSON document for /api (serialized by the caller into a sized buffer)
+    static DynamicJsonDocument buildAPIJson(const std::vector<SensorData> &sensors);
 
     // Generate firmware update page
     static String generateFirmwarePage();

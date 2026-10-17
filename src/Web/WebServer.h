@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <mutex>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <DNSServer.h>
@@ -68,15 +69,38 @@ private:
 
 
     // Firmware upload state
+    bool otaUploadActive = false; // Update.begin() succeeded, not finished/aborted yet
+    AsyncWebServerRequest *otaUploadOwner = nullptr; // request that runs the upload
+    bool otaUploadSawFile = false;                   // the owner already sent one file part
     bool otaUploadHasError = false;
     String otaUploadErrorMsg = "";
     size_t otaUploadExpected = 0;
     size_t otaUploadWritten  = 0;
+    // Image header collected across chunks for the chip check (a TCP
+    // segment boundary can split it)
+    uint8_t otaHeader[32];
+    size_t otaHeaderLen = 0;
 
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
-    bool restartRequested = false;
-    unsigned long restartAt = 0;
+    volatile bool restartRequested = false; // set by handlers (async task), read by the loop
+
+    // Firmware download requested by /firmware/update, done by the loop task
+    String pendingOtaUrl;
+    volatile bool urlOtaRunning = false; // loop task is downloading firmware
+    std::mutex otaUrlMutex;
+    void runUrlOta(const String &url);
+
+    // Update check, also done by the loop task; the page polls for the result
+    bool updateCheckRequested = false;
+    bool updateCheckRunning = false;
+    bool updateCheckDone = false;
+    int updateCheckStatus = 0;
+    String updateCheckResult;
+    unsigned long updateCheckAt = 0;
+    void runUpdateCheck();
+    void abortUpload(const String &reason);
+    volatile unsigned long restartAt = 0; // always written before restartRequested
 
     ConfigManager &configManager; // Reference to configuration
     WebAuth auth;                 // Admin password and login sessions
@@ -91,7 +115,7 @@ private:
 
     // Setup routes for web server
     void setupRoutes();
-    // Guard handlers: if AP mode, redirect to /config and return true
+    // First setup (AP, no WiFi configured, no uplink): redirect to /config, true
     bool guardAPOnly(AsyncWebServerRequest *request);
 
     // Create content for individual pages

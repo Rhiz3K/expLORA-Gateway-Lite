@@ -66,6 +66,7 @@ bool ConfigManager::init()
 // Load configuration from both sources
 bool ConfigManager::load()
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = loadFromFS();
     bool prefSuccess = loadFromPreferences();
 
@@ -85,6 +86,7 @@ bool ConfigManager::load()
 // Save configuration to both sources
 bool ConfigManager::save()
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = saveToFS();
     bool prefSuccess = saveToPreferences();
 
@@ -112,6 +114,13 @@ bool ConfigManager::save()
 // Loading from LittleFS
 bool ConfigManager::loadFromFS()
 {
+    // Power lost between removing the old file and renaming the new one
+    String tmpFile = String(configFile) + ".tmp";
+    if (!LittleFS.exists(configFile) && LittleFS.exists(tmpFile))
+    {
+        LittleFS.rename(tmpFile, configFile);
+    }
+
     // Check if file exists
     if (!LittleFS.exists(configFile))
     {
@@ -127,16 +136,9 @@ bool ConfigManager::loadFromFS()
         return false;
     }
 
-    // Log the raw content for debugging
-    String fileContent = file.readString();
-    logger.debug("Raw config file content: " + fileContent);
-    file.close();
-
-    // Re-open the file for parsing
-    file = LittleFS.open(configFile, "r");
-
+    // (never logged: it holds the WiFi and MQTT passwords)
     // Create JSON document
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, file);
     file.close();
 
@@ -178,18 +180,10 @@ bool ConfigManager::loadFromFS()
 }
 
 // Saving to LittleFS
+// Written to a temporary file and renamed, like sensors.json
 bool ConfigManager::saveToFS()
 {
-    // Open file for writing
-    File file = LittleFS.open(configFile, "w");
-    if (!file)
-    {
-        logger.error("Failed to open config file for writing: " + String(configFile));
-        return false;
-    }
-
-    // Create JSON document
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(1024);
     doc["ssid"] = wifiSSID;
     doc["password"] = wifiPassword;
     doc["configMode"] = configMode;
@@ -204,16 +198,34 @@ bool ConfigManager::saveToFS()
     doc["mqttPrefix"] = mqttPrefix;
     doc["mqttHAEnabled"] = mqttHAEnabled;
     doc["mqttHAPrefix"] = mqttHAPrefix;
-
-    // Serialize to file
-    if (serializeJson(doc, file) == 0)
+    if (doc.overflowed())
     {
-        logger.error("Failed to write config to file");
-        file.close();
+        logger.error("Configuration does not fit the JSON document - not saved");
         return false;
     }
 
+    String tmpFile = String(configFile) + ".tmp";
+    File file = LittleFS.open(tmpFile, "w");
+    if (!file)
+    {
+        logger.error("Failed to open " + tmpFile + " for writing");
+        return false;
+    }
+    size_t expected = measureJson(doc);
+    size_t written = serializeJson(doc, file);
     file.close();
+    if (written == 0 || written != expected)
+    {
+        logger.error("Failed to write config to file");
+        LittleFS.remove(tmpFile);
+        return false;
+    }
+    LittleFS.remove(configFile);
+    if (!LittleFS.rename(tmpFile, configFile))
+    {
+        logger.error("Failed to replace " + String(configFile));
+        return false;
+    }
     return true;
 }
 
@@ -257,15 +269,32 @@ bool ConfigManager::loadFromPreferences()
     {
         mqttPassword = preferences.getString("mqttPassword", MQTT_DEFAULT_PASS);
     }
-    mqttEnabled = preferences.getBool("mqttEnabled", MQTT_DEFAULT_ENABLED);
-    mqttTls = preferences.getBool("mqttTls", MQTT_DEFAULT_TLS);
-    mqttPrefix = preferences.getString("mqttPrefix", MQTT_DEFAULT_PREFIX);
-    mqttHAEnabled = preferences.getBool("mqttHAEnabled", HA_DISCOVERY_DEFAULT_ENABLED);
-    mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
+    // Only stored keys override config.json (erased NVS must not reset them)
+    if (preferences.isKey("mqttEnabled"))
+    {
+        mqttEnabled = preferences.getBool("mqttEnabled", MQTT_DEFAULT_ENABLED);
+    }
+    if (preferences.isKey("mqttTls"))
+    {
+        mqttTls = preferences.getBool("mqttTls", MQTT_DEFAULT_TLS);
+    }
+    if (preferences.isKey("mqttPrefix"))
+    {
+        mqttPrefix = preferences.getString("mqttPrefix", MQTT_DEFAULT_PREFIX);
+    }
+    if (preferences.isKey("mqttHAEnabled"))
+    {
+        mqttHAEnabled = preferences.getBool("mqttHAEnabled", HA_DISCOVERY_DEFAULT_ENABLED);
+    }
+    if (preferences.isKey("mqttHAPrefix"))
+    {
+        mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
+    }
 
     lteEnabled = preferences.getBool("lteEnabled", LTE_DEFAULT_ENABLED);
     lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
     ltePin = preferences.getString("ltePin", "");
+    ltePinRejected = preferences.getBool("ltePinBad", false);
 
     adminPasswordHash = preferences.getString("adminPwd", "");
 
@@ -334,6 +363,7 @@ bool ConfigManager::saveToPreferences()
 // Add a new method to set MQTT configuration
 bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     // PIN: empty or 4-8 digits
     bool pinOk = pin.length() == 0 || (pin.length() >= 4 && pin.length() <= 8);
     for (size_t i = 0; pinOk && i < pin.length(); i++)
@@ -361,6 +391,10 @@ bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &
         }
     }
 
+    if (pin != ltePin)
+    {
+        setLtePinRejected(false);
+    }
     lteEnabled = enabled;
     lteApn = apn;
     ltePin = pin;
@@ -400,6 +434,7 @@ static bool parseIPv4(const String &text, String &normalized)
 String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
                                         const String &dns1, const String &dns2, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     String nIp, nMask, nGateway, nDns1, nDns2;
     bool ipOk = parseIPv4(ip, nIp);
     bool maskOk = parseIPv4(mask, nMask);
@@ -465,19 +500,40 @@ String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const 
     return "";
 }
 
+void ConfigManager::setLtePinRejected(bool rejected)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    ltePinRejected = rejected;
+    if (preferencesInitialized)
+    {
+        preferences.putBool("ltePinBad", rejected);
+    }
+}
+
 bool ConfigManager::setAdminPasswordHash(const String &hash)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     if (!preferencesInitialized)
     {
         return false;
     }
-    adminPasswordHash = hash;
     if (hash.length() == 0)
     {
-        preferences.remove("adminPwd");
+        if (preferences.isKey("adminPwd") && !preferences.remove("adminPwd"))
+        {
+            return false;
+        }
+        adminPasswordHash = "";
         return true;
     }
-    return preferences.putString("adminPwd", hash) == hash.length();
+    // RAM follows only a successful write (a fresh device must not end up
+    // with a password in RAM that is gone after a restart)
+    if (preferences.putString("adminPwd", hash) != hash.length())
+    {
+        return false;
+    }
+    adminPasswordHash = hash;
+    return true;
 }
 
 bool ConfigManager::setMqttConfig(const String &host, int port, const String &user,
@@ -485,8 +541,12 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
                                   const String &rootPrefix, const String &haPrefix, bool haEnable,
                                   bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Validate MQTT topic format (basic validation)
-    if (!isValidMqttTopic(rootPrefix) || !isValidMqttTopic(haPrefix))
+    // A prefix stored by an older version (e.g. with '/') may be kept as it is
+    bool rootOk = isValidMqttTopic(rootPrefix) || rootPrefix == mqttPrefix;
+    bool haOk = isValidMqttTopic(haPrefix) || haPrefix == mqttHAPrefix;
+    if (!rootOk || !haOk)
     {
         logger.error("Invalid MQTT topic format");
         logger.verbose("Root topic: " + rootPrefix);
@@ -495,6 +555,12 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
         logger.verbose("HA check: " + String(isValidMqttTopic(haPrefix)));
         return false;
     }
+
+    // Kept to roll back: RAM must not show settings that are not saved
+    String oldHost = mqttHost, oldUser = mqttUser, oldPassword = mqttPassword;
+    String oldPrefix = mqttPrefix, oldHAPrefix = mqttHAPrefix;
+    int oldPort = mqttPort;
+    bool oldEnabled = mqttEnabled, oldTls = mqttTls, oldHAEnabled = mqttHAEnabled;
 
     mqttHost = host;
     mqttPort = port;
@@ -506,22 +572,37 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
     mqttHAPrefix = haPrefix;
     mqttHAEnabled = haEnable;
 
-    return saveConfig ? save() : true;
+    if (saveConfig && !save())
+    {
+        mqttHost = oldHost;
+        mqttPort = oldPort;
+        mqttUser = oldUser;
+        mqttPassword = oldPassword;
+        mqttEnabled = oldEnabled;
+        mqttTls = oldTls;
+        mqttPrefix = oldPrefix;
+        mqttHAPrefix = oldHAPrefix;
+        mqttHAEnabled = oldHAEnabled;
+        saveToPreferences(); // save() may have written the new values there
+        return false;
+    }
+    return true;
 }
 
 // Helper function to validate MQTT topic format
 bool ConfigManager::isValidMqttTopic(const String &topic)
 {
     // Basic MQTT topic validation
-    if (topic.length() == 0 || topic.length() > 127)
+    // Short: topics and discovery payloads must fit the 1024 B MQTT buffer
+    if (topic.length() == 0 || topic.length() > 32)
         return false;
     
     // Check for invalid characters
     if (topic.indexOf('#') != -1 || topic.indexOf('+') != -1)
         return false;
 
-    // Check for leading or trailing slashes
-    if (topic[0] == '/' || topic[topic.length()-1] == '/') 
+    // One level only: the prefix is also part of discovery node and unique ids
+    if (topic.indexOf('/') != -1)
         return false;
 
     return true;
@@ -541,11 +622,13 @@ void ConfigManager::resetToDefaults()
     mqttUser = MQTT_DEFAULT_USER;
     mqttPassword = MQTT_DEFAULT_PASS;
     mqttEnabled = MQTT_DEFAULT_ENABLED;
+    mqttTls = MQTT_DEFAULT_TLS;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";
+    ltePinRejected = false;
     ethStatic = false;
     ethIp = "";
     ethMask = "";
@@ -596,9 +679,11 @@ String ConfigManager::getDeviceName() const
 // Set WiFi configuration
 bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     wifiSSID = ssid;
     wifiPassword = password;
     configMode = false;
+    lastWifiAttempt = 0;
 
     if (saveConfig)
     {
@@ -611,6 +696,12 @@ bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bo
 // Switch to configuration mode (AP)
 void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // Called on every boot - only write flash when it changes
+    if (configMode == enable)
+    {
+        return;
+    }
     configMode = enable;
 
     if (saveConfig)
@@ -622,6 +713,7 @@ void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 // Set logging level
 void ConfigManager::setLogLevel(LogLevel level, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     logLevel = level;
 
     // Update level in logger

@@ -24,7 +24,7 @@
 #if defined(HAS_LTE)
 
 #include <PPP.h>
-#include <esp_task_wdt.h>
+#include "../Hardware/WatchdogPause.h"
 
 // UART used for the modem (UART0 is the console, UART1 is free but its default
 // pins collide with the flash on WROOM modules)
@@ -50,33 +50,6 @@ static constexpr unsigned long LTE_POWER_DOWN_DELAY = 3000;
 static constexpr unsigned long LTE_RETRY_BASE = 30000;
 static constexpr unsigned long LTE_RETRY_MAX = 600000;
 static constexpr uint8_t LTE_MAX_FAILURES = 20;
-
-// Modem commands block for seconds (command timeouts, mode switches); keep the
-// loop task out of the task watchdog meanwhile
-namespace
-{
-class WatchdogPause
-{
-public:
-    WatchdogPause() : watched(esp_task_wdt_status(NULL) == ESP_OK)
-    {
-        if (watched)
-        {
-            esp_task_wdt_delete(NULL);
-        }
-    }
-    ~WatchdogPause()
-    {
-        if (watched)
-        {
-            esp_task_wdt_add(NULL);
-        }
-    }
-
-private:
-    bool watched;
-};
-}
 
 LteModem::LteModem(ConfigManager &cfg, Logger &log)
     : config(cfg), logger(log), textLock(xSemaphoreCreateMutex())
@@ -108,9 +81,24 @@ void LteModem::begin()
     pinMode(LTE_RX_PIN, INPUT);
     pinMode(LTE_NET_PIN, INPUT);
 
+    // Own copies: the web task may rewrite the configuration (a change of the
+    // LTE settings restarts the gateway, so they never need refreshing)
+    {
+        std::lock_guard<std::recursive_mutex> guard(config.mutex());
+        apn = config.lteApn;
+        pin = config.ltePin;
+    }
+
     if (!config.lteEnabled)
     {
         logger.info("LTE disabled in configuration");
+        setState(State::Disabled);
+        return;
+    }
+    if (config.ltePinRejected && pin.length() > 0)
+    {
+        writeText(lastError, "The SIM rejected the stored PIN - enter the correct one");
+        logger.error("LTE: the SIM rejected the stored PIN before - not trying it again until it is changed");
         setState(State::Disabled);
         return;
     }
@@ -137,6 +125,16 @@ void LteModem::process()
         {
             logger.info("LTE modem responding after " + String(inState / 1000) + " s");
             pinSent = false;
+            pinAccepted = false;
+            // Verbose errors: tells a wrong PIN from a busy SIM
+            Serial2.print("AT+CMEE=2\r");
+            Serial2.flush();
+            delay(100);
+            while (Serial2.available())
+            {
+                Serial2.read();
+            }
+            rxBuffer = "";
             setState(State::SimCheck);
         }
         else if (inState > LTE_BOOT_TIMEOUT)
@@ -171,7 +169,7 @@ void LteModem::process()
             WatchdogPause pause;
             refreshSignal();
             readOperator();
-            if (config.lteApn.length() == 0)
+            if (apn.length() == 0)
             {
                 resolveApn();
             }
@@ -300,21 +298,52 @@ void LteModem::checkSim(unsigned long now)
     }
     if (rxBuffer.indexOf("SIM PIN") >= 0 && !pinSent)
     {
-        if (config.ltePin.length() == 0)
+        if (pin.length() == 0)
         {
             disable("SIM requires a PIN");
             return;
         }
         logger.info("LTE entering SIM PIN");
+        // Let the rest of the AT+CPIN? reply (its "OK") arrive and drop it,
+        // so it is not taken for the answer to the PIN
+        delay(300);
+        while (Serial2.available())
+        {
+            Serial2.read();
+        }
         rxBuffer = "";
-        Serial2.print("AT+CPIN=\"" + config.ltePin + "\"\r");
+        Serial2.print("AT+CPIN=\"" + pin + "\"\r");
         pinSent = true;
         lastPoll = now;
         return;
     }
-    if (pinSent && rxBuffer.indexOf("ERROR") >= 0)
+    // Direct answer to AT+CPIN=<pin>
+    if (pinSent && !pinAccepted)
     {
-        disable("SIM PIN rejected (check it - attempts are limited)");
+        int error = rxBuffer.indexOf("ERROR");
+        if (error >= 0)
+        {
+            String detail = rxBuffer.substring(error);
+            detail.toLowerCase();
+            if (detail.indexOf("busy") >= 0 || detail.indexOf("not inserted") >= 0 ||
+                detail.indexOf("failure") >= 0)
+            {
+                // Transient - the PIN was not checked, try again later
+                fail("SIM not ready for the PIN (" + rxBuffer.substring(error, error + 40) + ")");
+                return;
+            }
+            // "incorrect password", or a bare ERROR: assume the PIN is wrong
+            // rather than risk the remaining attempts
+            config.setLtePinRejected(true);
+            disable("SIM PIN rejected (check it - attempts are limited)");
+            return;
+        }
+        if (rxBuffer.indexOf("OK") >= 0)
+        {
+            pinAccepted = true;
+            rxBuffer = "";
+            lastPoll = now;
+        }
         return;
     }
 
@@ -322,11 +351,8 @@ void LteModem::checkSim(unsigned long now)
     if (now - lastPoll > (pinSent ? 3 * LTE_SIM_POLL : LTE_SIM_POLL))
     {
         lastPoll = now;
-        if (!pinSent || rxBuffer.indexOf("OK") >= 0)
-        {
-            rxBuffer = "";
-            Serial2.print("AT+CPIN?\r");
-        }
+        rxBuffer = "";
+        Serial2.print("AT+CPIN?\r");
     }
 }
 
@@ -396,7 +422,7 @@ void LteModem::startPpp()
     atUartOpen = false;
 
     // Empty APN: attach with the network's default, see resolveApn()
-    PPP.setApn(config.lteApn.c_str());
+    PPP.setApn(apn.c_str());
     // The SIM is already unlocked (checkSim)
     PPP.setPin(nullptr);
     PPP.setPins(LTE_TX_PIN, LTE_RX_PIN);
@@ -415,7 +441,7 @@ void LteModem::startPpp()
     // APN before registration (the driver sets it only when entering data mode);
     // an empty one also clears an APN left in the modem from earlier use
     String response;
-    if (!PPP.cmd("AT+CGDCONT=1,\"IP\",\"" + config.lteApn + "\"", response, 3000))
+    if (!PPP.cmd("AT+CGDCONT=1,\"IP\",\"" + apn + "\"", response, 3000))
     {
         logger.warning("LTE: setting APN failed: " + response);
     }
@@ -530,12 +556,12 @@ void LteModem::resolveApn()
 
 String LteModem::getApn() const
 {
-    if (config.lteApn.length() > 0)
+    if (apn.length() > 0)
     {
-        return config.lteApn;
+        return apn;
     }
-    String apn = readText(detectedApn);
-    return apn.length() > 0 ? apn + " (automatic)" : String("automatic");
+    String detected = readText(detectedApn);
+    return detected.length() > 0 ? detected + " (automatic)" : String("automatic");
 }
 
 void LteModem::refreshSignal()

@@ -86,7 +86,7 @@ public:
     // Time: valid once synced; stale when the last sync is older than
     // TIME_STALE_AFTER_S (the clock keeps running meanwhile)
     bool isTimeValid() const;
-    time_t getLastTimeSync() const { return lastTimeSync; }
+    time_t getLastTimeSync() const { return (time_t)lastTimeSync; }
     bool isTimeStale() const;
     // "2026-10-17 10:15:00 (synced 5 min ago)" or "not synchronized"
     String getTimeStatus() const;
@@ -134,7 +134,9 @@ private:
     unsigned long reconnectStartedAt = 0;
 
     static volatile bool timeSyncedFlag;
-    static volatile time_t lastTimeSync; // wall clock of the last successful SNTP sync
+    // Wall clock of the last successful SNTP sync; 32-bit so the SNTP task's
+    // write cannot be read torn by another task
+    static volatile uint32_t lastTimeSync;
     bool timeSyncLogged = false;
 
     std::function<void(bool)> captiveCallback;

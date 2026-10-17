@@ -84,8 +84,10 @@ Pin assignments live in `variants/<board>/board_config.h`.
    Libraries (ArduinoJson, ESPAsyncWebServer, AsyncTCP, PubSubClient and RadioLib,
    which drives both radios) are installed automatically.
 
-3. **Firmware updates** can also be installed from the web interface (Firmware page).
-   The gateway rejects an image built for the other board.
+3. **Firmware updates** can also be installed from the web interface (Firmware page):
+   upload a binary, or download one over HTTPS (the server certificate is
+   checked against the built-in CA bundle). Images for the other board are
+   refused.
 
 4. **Unit tests** run on the host: `pio test -e native`. An end-to-end test against
    a real device is in `tests/integration`.
@@ -114,6 +116,11 @@ WiFi setup is optional. The access point stays up for 5 minutes after the
 gateway reaches the local network.
 
 ## Login
+
+The setup access point is open (no WiFi password). Until an admin password is
+set, whoever opens the web interface first - on the access point, or over
+Ethernet on the Pro - can set it, so set it right after flashing; after
+`reset-password` the same applies.
 
 The web interface requires the admin password. A gateway updated from a
 version without login asks for a new password at the first login, the same way
@@ -163,9 +170,14 @@ the LTE operator and signal, and the power source (PoE or USB).
    - Serial Number: The unique identifier of the sensor (in hexadecimal)
    - Device Key: The encryption key used by the sensor (in hexadecimal)
 4. Optionally configure:
-   - Custom URL: For forwarding data to external services
+   - Custom URL: For forwarding data to external services (http:// or https://;
+     for https the connection is encrypted but the certificate is not checked,
+     so self-signed endpoints work)
    - Altitude: For pressure sensors, to adjust for elevation
    - Correction values: To calibrate sensor readings
+
+The daily rain total of a meteo station restarts at local midnight. That needs
+the clock (NTP): without a synchronized time the total keeps adding up.
 
 ## Sensor Calibration
 
@@ -190,7 +202,8 @@ To connect to a Home Assistant MQTT broker:
 2. Enable MQTT integration
 3. Enter your MQTT broker details:
    - Host: The IP or hostname of your MQTT broker
-   - Port: Usually 1883 (default) or 8883 (TLS)
+   - Port: Usually 1883 (default) or 8883 (TLS; encrypted, but the broker
+     certificate is not verified, so self-signed brokers work)
    - Username and Password: If your broker requires authentication
 4. Save the configuration
 
@@ -207,13 +220,13 @@ The gateway provides a read-only REST API for sensor data (no login needed):
 Example API response:
 ```json
 {
-  "version": "1.0.6",
-  "time": "2025-05-17 15:30:45",
+  "version": "1.1.13",
+  "time": "2026-10-17 15:30:45",
   "status": "connected",
   "sensors": [
     {
       "name": "Living Room",
-      "type": 1,
+      "deviceType": 1,
       "typeName": "CLIMA",
       "serialNumber": "123ABC",
       "temperature": 21.50,

@@ -25,7 +25,9 @@
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <memory>
 #include "../Network/Uplink.h"
+#include "../Hardware/WatchdogPause.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -77,14 +79,7 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
         return -2;
     }
 
-    // Check if we still have space
-    if (sensorCount >= MAX_SENSORS)
-    {
-        logger.error("Failed to add sensor: maximum number of sensors reached");
-        return -1;
-    }
-
-    // Find first free slot
+    // First free slot (deleted sensors leave free slots below sensorCount)
     int newIndex = -1;
     for (size_t i = 0; i < MAX_SENSORS; i++)
     {
@@ -94,36 +89,28 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
             break;
         }
     }
-
-    // If no free slot, use the last index
-    if (newIndex == -1)
+    if (newIndex < 0)
     {
-        newIndex = sensorCount;
-        sensorCount++;
+        logger.error("Failed to add sensor: maximum number of sensors reached");
+        return -1;
     }
-    else if (newIndex >= sensorCount)
+    if ((size_t)newIndex >= sensorCount)
     {
         sensorCount = newIndex + 1;
     }
 
-    // Initialize new sensor
+    // Fresh state - a reused slot must not inherit the deleted sensor's
+    // health counters, rain totals or corrections
+    sensors[newIndex] = SensorData();
     sensors[newIndex].deviceType = deviceType;
     sensors[newIndex].serialNumber = serialNumber;
     sensors[newIndex].deviceKey = deviceKey;
     sensors[newIndex].name = name;
-    sensors[newIndex].customUrl = "";
-    sensors[newIndex].lastSeen = 0;
-    sensors[newIndex].temperature = 0.0f;
-    sensors[newIndex].humidity = 0.0f;
-    sensors[newIndex].pressure = 0.0f;
-    sensors[newIndex].ppm = 0.0f;
-    sensors[newIndex].lux = 0.0f;
-    sensors[newIndex].batteryVoltage = 0.0f;
-    sensors[newIndex].rssi = 0;
     sensors[newIndex].configured = true;
 
+    // Not saved yet: the web form's updateSensorConfig() saves the complete
+    // sensor once (no half-configured sensor on flash if that fails)
     logger.info("Added new sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
     return newIndex;
 }
 
@@ -382,7 +369,9 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
                 // Create timestamps for comparing dates
                 // Date of last reset
                 struct tm lastResetTime;
-                localtime_r((time_t *)&sensors[index].lastRainReset, &lastResetTime);
+                // time_t is 64-bit, the stored field 32-bit: convert, never cast the pointer
+                time_t lastReset = (time_t)sensors[index].lastRainReset;
+                localtime_r(&lastReset, &lastResetTime);
 
                 // If last reset was on a different day than today, reset the counter
                 if (sensors[index].lastRainReset == 0 ||
@@ -443,11 +432,17 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
         return true;
     }
 
-    // Create a WiFi client for HTTP request
-    HTTPClient http;
-    http.setTimeout(3000); // keep operations short to avoid WDT/starvation
+    // DNS has no timeout of its own and a TLS handshake can be slow; the
+    // loop task stays off the watchdog for this request
+    WatchdogPause pause;
+
+    // Clients first: ~HTTPClient() may still touch its client (stop()), so
+    // they must outlive it
     WiFiClient plainClient;
-    WiFiClientSecure *secureClientPtr = nullptr; // allocated only for HTTPS and deleted after use
+    std::unique_ptr<WiFiClientSecure> secureClient; // only for HTTPS
+    HTTPClient http;
+    http.setTimeout(3000);
+    http.setConnectTimeout(3000);
     http.setReuse(false);
 
     // Format the custom URL by replacing placeholders
@@ -509,14 +504,23 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     url.replace("*SN*", formatSN(sensor.serialNumber));
     url.replace("*TYPE*", String(static_cast<uint8_t>(sensor.deviceType)));
 
-    logger.debug("Forwarding data for sensor " + sensor.name + " to URL: " + url);
+    // Without the query: it may carry tokens (logs are shown on the web page)
+    String urlForLog = url.indexOf('?') >= 0 ? url.substring(0, url.indexOf('?')) : url;
+    logger.debug("Forwarding data for sensor " + sensor.name + " to " + urlForLog);
 
     // For HTTPS, use a secure client, but ensure we delete it after the request
     if (isHttps)
     {
-        secureClientPtr = new WiFiClientSecure();
-        secureClientPtr->setInsecure(); // Skip certificate validation (no CA bundle)
-        http.begin(*secureClientPtr, url);
+        // A TLS session needs ~40 kB (Pro: next to an MQTT TLS session)
+        if (ESP.getFreeHeap() < 48000 || ESP.getMaxAllocHeap() < 24000)
+        {
+            logger.warning("Not forwarding to " + urlForLog + " - not enough memory for HTTPS");
+            return false;
+        }
+        secureClient.reset(new WiFiClientSecure());
+        secureClient->setInsecure(); // custom endpoints may use self-signed certificates
+        secureClient->setHandshakeTimeout(5);
+        http.begin(*secureClient, url);
     }
     else
     {
@@ -530,11 +534,8 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     if (httpCode > 0)
     {
         logger.debug("HTTP request sent, response code: " + String(httpCode));
-        if (httpCode == HTTP_CODE_OK)
-        {
-            String payload = http.getString();
-            logger.debug("Response: " + payload.substring(0, 100)); // Only log first 100 chars
-        }
+        // The body is not read: only the status matters, and an endpoint
+        // could send an unbounded (chunked) reply
     }
     else
     {
@@ -542,11 +543,6 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     }
 
     http.end();
-    if (secureClientPtr)
-    {
-        delete secureClientPtr;
-        secureClientPtr = nullptr;
-    }
 
     return (httpCode == HTTP_CODE_OK);
 }
@@ -578,6 +574,15 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
         return false;
     }
 
+    // Another sensor now (type or serial number changed): its readings, rain
+    // totals and health counters do not belong to it
+    if (sensors[index].deviceType != deviceType || sensors[index].serialNumber != serialNumber)
+    {
+        SensorData fresh;
+        fresh.configured = true;
+        sensors[index] = fresh;
+    }
+
     // Update basic configuration
     sensors[index].name = name;
     sensors[index].deviceType = deviceType;
@@ -598,8 +603,7 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     sensors[index].rainRateCorrection = rainRateCorr;
 
     logger.info("Updated configuration for sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
-    return true;
+    return saveSensors(false); // false: kept in RAM, but not on flash
 }
 
 // Delete sensor
@@ -620,8 +624,7 @@ bool SensorManager::deleteSensor(int index)
     sensors[index].configured = false;
 
     logger.info("Deleted sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    saveSensors(false);
-    return true;
+    return saveSensors(false);
 }
 
 // Get number of sensors
@@ -656,6 +659,7 @@ std::vector<SensorData> SensorManager::getAllSensors() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<SensorData> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; i++)
     {
         result.push_back(sensors[i]);
@@ -668,6 +672,7 @@ std::vector<ActiveSensorEntry> SensorManager::getActiveSensorEntries() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<ActiveSensorEntry> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; ++i)
     {
         if (sensors[i].configured)
@@ -684,6 +689,7 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<SensorData> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; i++)
     {
         if (sensors[i].configured)
@@ -713,6 +719,8 @@ void SensorManager::process(unsigned long now)
     std::lock_guard<std::mutex> lock(sensorMutex);
     if (rainDirty && now - lastRainSave > RAIN_SAVE_INTERVAL)
     {
+        // Next attempt after a full interval even when this one fails
+        lastRainSave = now;
         saveSensorsLocked();
     }
 }
@@ -740,8 +748,14 @@ bool SensorManager::saveSensorsLocked()
     {
         textSize += sensors[i].name.length() + sensors[i].customUrl.length() + 2;
     }
-    DynamicJsonDocument doc(JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(MAX_SENSORS) +
-                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + textSize + 256);
+    // Sized for the sensors present (one smaller block on a fragmented heap)
+    DynamicJsonDocument doc(JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(sensorCount) +
+                            sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + textSize + 256);
+    if (doc.capacity() == 0)
+    {
+        logger.error("Not enough memory to save the sensor configuration");
+        return false;
+    }
     JsonArray sensorArray = doc.createNestedArray("sensors");
 
     // Add sensors to JSON
@@ -1023,6 +1037,7 @@ void SensorManager::tickSensorHealth(unsigned long nowMillis)
         if (sensors[i].configured)
         {
             SensorHealth::advanceBucketsIfNeeded(sensors[i].health, nowMillis);
+            SensorHealth::latchStale(sensors[i].health, nowMillis);
         }
     }
 }
