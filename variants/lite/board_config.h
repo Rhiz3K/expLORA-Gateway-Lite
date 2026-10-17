@@ -4,6 +4,9 @@
 // expLORA Gateway Lite
 #define BOARD_NAME "expLORA Gateway Lite"
 
+// OTA auto-update manifest
+#define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+
 // Radio chip: RFM95W = SX1276
 #define RADIO_SX1276
 

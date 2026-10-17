@@ -32,7 +32,7 @@ MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &
     // Generate unique client ID from MAC address
     clientId = "explora-gw-";
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    getStationMac(mac);
     for (int i = 0; i < 6; i++)
     {
         if (mac[i] < 0x10)

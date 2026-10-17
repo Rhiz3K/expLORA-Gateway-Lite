@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration smoke test for an expLORA Gateway Lite device.
+Integration smoke test for an expLORA Gateway device (Lite or Pro).
 
 Two operating modes:
 
@@ -116,7 +116,7 @@ class Config:
     flash_before_test: bool = False
     rebuild_before_flash: bool = False
     erase_before_flash: bool = False
-    pio_env: str = "esp32-s3-devkitc-1"
+    pio_env: str = "lite"
 
 
 def load_config(path: str) -> Config:
@@ -151,7 +151,7 @@ def load_config(path: str) -> Config:
         cfg.flash_before_test    = parser.getboolean("flash", "before_test", fallback=False)
         cfg.rebuild_before_flash = parser.getboolean("flash", "rebuild", fallback=False)
         cfg.erase_before_flash   = parser.getboolean("flash", "erase", fallback=False)
-        cfg.pio_env              = parser.get("flash", "pio_env", fallback="esp32-s3-devkitc-1").strip()
+        cfg.pio_env              = parser.get("flash", "pio_env", fallback="lite").strip()
 
     if not cfg.home_ssid:
         print(f"{RED}ERROR:{RESET} [wifi].ssid is required in {path}")
@@ -432,7 +432,7 @@ def flash_device(env: str, rebuild: bool, erase: bool) -> None:
 # Regex patterns matching the firmware's serial log. We try several places
 # the SSID can show up because exact timing relative to when we start
 # reading is fragile — whichever line we catch first wins.
-RE_BOOT_BANNER = r"expLORA Gateway Lite starting up"
+RE_BOOT_BANNER = r"expLORA Gateway \w+ starting up"  # Lite / Pro
 RE_STA_IP      = r"WiFi connected[^!]*! IP: (\d+\.\d+\.\d+\.\d+)"
 
 # Each of these has the SSID as the first capture group. Order matters
@@ -543,6 +543,17 @@ def provision_gateway(cfg: Config) -> str:
 
     monitor = SerialMonitor(port, baud=cfg.serial_baud, echo=True)
     monitor.start()
+    on_gateway_ap = False
+
+    def switch_home():
+        nonlocal on_gateway_ap
+        if cfg.home_password:
+            wifi_switch(cfg.wifi_interface, cfg.home_ssid, cfg.home_password)
+        else:
+            # Even for open home networks, the user just specified the SSID
+            wifi_switch(cfg.wifi_interface, cfg.home_ssid)
+        on_gateway_ap = False
+
     try:
         # 1. Trigger a clean reset so we know we're catching the boot
         # output from line one (not mid-way through it). On boards without
@@ -562,6 +573,7 @@ def provision_gateway(cfg: Config) -> str:
         info_(f"  using AP SSID: {ap_ssid}")
 
         # 3. Switch host WiFi to the gateway AP
+        on_gateway_ap = True
         if not wifi_switch(cfg.wifi_interface, ap_ssid):
             raise RuntimeError(f"failed to switch WiFi to {ap_ssid!r}")
 
@@ -608,11 +620,7 @@ def provision_gateway(cfg: Config) -> str:
 
         # 7. Switch host back to home WiFi
         info_("\n  switching host WiFi back to home network …")
-        if cfg.home_password:
-            wifi_switch(cfg.wifi_interface, cfg.home_ssid, cfg.home_password)
-        else:
-            # Even for open home networks, the user just specified the SSID
-            wifi_switch(cfg.wifi_interface, cfg.home_ssid)
+        switch_home()
 
         # 8. Confirm we can reach the device on the home network
         info_("  confirming gateway is reachable from host …")
@@ -628,6 +636,10 @@ def provision_gateway(cfg: Config) -> str:
 
     finally:
         monitor.stop()
+        # Never leave the host on the gateway AP after an error
+        if on_gateway_ap:
+            info_("\n  provisioning failed - switching host WiFi back to home network …")
+            switch_home()
 
 
 def pass_(name: str, detail: str = ""):
@@ -1204,7 +1216,7 @@ def main():
     flash_now   = args.flash or args.rebuild or args.erase or (cfg.flash_before_test if cfg else False)
     rebuild_now = args.rebuild or (cfg.rebuild_before_flash if cfg else False)
     erase_now   = args.erase or (cfg.erase_before_flash if cfg else False)
-    pio_env     = cfg.pio_env if cfg else "esp32-s3-devkitc-1"
+    pio_env     = cfg.pio_env if cfg else "lite"
     if flash_now:
         try:
             flash_device(pio_env, rebuild=rebuild_now, erase=erase_now)

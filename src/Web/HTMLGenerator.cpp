@@ -99,14 +99,14 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
 {
     html += "<!DOCTYPE html><html><head>";
     html += "<meta charset='UTF-8'>";
-    html += "<title>" + title + " - expLORA Gateway Lite</title>";
+    html += "<title>" + title + " - " BOARD_NAME "</title>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
 
     // Add CSS styles
     addStyles(html);
 
     html += "</head><body>";
-    html += "<header><h1>expLORA Gateway Lite</h1><h2>" + title + "</h2></header>";
+    html += "<header><h1>" BOARD_NAME "</h1><h2>" + title + "</h2></header>";
 
     // Navigation: full in STA, minimal in AP (Config + Reboot)
     if (!isAPMode)
@@ -128,7 +128,7 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
 void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 {
     html += "<footer>";
-    html += "<p>expLORA Gateway Lite v" + String(FIRMWARE_VERSION) + " &copy; 2026</p>";
+    html += "<p>" BOARD_NAME " v" + String(FIRMWARE_VERSION) + " &copy; 2026</p>";
     if (!isAPMode)
     {
         html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn' style='font-size:11px;padding:5px 10px;'>Check for update</button></p>";

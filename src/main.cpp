@@ -107,7 +107,7 @@ void setup()
     Serial.begin(115200);
     delay(1000); // Wait for stabilization
 
-    Serial.println("\n\nexpLORA Gateway Lite");
+    Serial.println("\n\n" BOARD_NAME);
     Serial.println("------------------------------------------------------------");
 
 // Explicit PSRAM initialization
@@ -164,7 +164,7 @@ void setup()
     }
 
     // Basic log after initialization
-    logger.info("expLORA Gateway Lite starting up - Firmware v" + String(FIRMWARE_VERSION));
+    logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(FIRMWARE_VERSION));
 
     // HTML generator initialization
     if (!HTMLGenerator::init(true, WEB_BUFFER_SIZE))

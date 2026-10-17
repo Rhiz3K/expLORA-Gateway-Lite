@@ -406,7 +406,7 @@ String ConfigManager::getFirmwareVersion() const
 String ConfigManager::getMacAddress() const
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    getStationMac(mac);
 
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -419,7 +419,7 @@ String ConfigManager::getMacAddress() const
 String ConfigManager::getDeviceName() const
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    getStationMac(mac);
 
     String deviceName = "expLORA-GW-";
     for (int i = 0; i < 6; i++)

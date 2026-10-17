@@ -23,12 +23,13 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 // Firmware version
 #define FIRMWARE_VERSION "1.1.13"
 
-// OTA Configuration
-#define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+// OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
+#include "board_config.h"
 
 // LoRa radio parameters - must match the sensors (receive only)
 #define LORA_FREQUENCY_MHZ 868.0
@@ -64,13 +65,22 @@ inline String formatHex(uint32_t value, uint8_t width)
 #define formatSN(val) formatHex(val, 6)
 #define formatKey(val) formatHex(val, 8)
 
+// WiFi station MAC from eFuse. Unlike WiFi.macAddress() it is valid before
+// the WiFi driver starts (Arduino core 3.x returns zeros until then).
+inline void getStationMac(uint8_t mac[6])
+{
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+}
+
 // Generate the unique AP SSID for this device from its MAC address.
 // Format: "expLORA-GW-XXXXXX" where XXXXXX is the last 3 bytes of the MAC in uppercase hex.
 inline String makeApName()
 {
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    return "expLORA-GW-" + mac.substring(6);
+    uint8_t mac[6];
+    getStationMac(mac);
+    char suffix[7];
+    snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    return "expLORA-GW-" + String(suffix);
 }
 
 #define NTP_SERVER "pool.ntp.org"

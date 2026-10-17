@@ -105,8 +105,11 @@ void WebPortal::setupAP()
 {
     logger.info("Starting AP mode: " + apName);
 
-    // Full WiFi reset sequence
-    WiFi.disconnect(true);
+    // Full WiFi reset sequence (disconnect only if the station is running)
+    if (WiFi.getMode() & WIFI_STA)
+    {
+        WiFi.disconnect(true);
+    }
     WiFi.mode(WIFI_OFF);
     delay(200);
 
