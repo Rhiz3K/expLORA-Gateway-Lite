@@ -74,6 +74,11 @@ public:
     String mqttHAPrefix; // MQTT Homeassistant topic prefix
     bool mqttHAEnabled;  // MQTT Homeassistant discovery enable
 
+    // LTE configuration (boards with HAS_LTE; stored in Preferences only)
+    bool lteEnabled; // Modem enabled
+    String lteApn;   // Access point name
+    String ltePin;   // SIM PIN (empty = none)
+
     // Constructor
     ConfigManager(Logger &log, const char *file = CONFIG_FILE);
 
@@ -112,6 +117,9 @@ public:
                        const String &password, bool enabled, bool tls,
                        const String &rootPrefix, const String &haPrefix, bool haEnable,
                        bool saveConfig = true);
+
+    // Set LTE configuration
+    bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);
 
     // Set logging level
     void setLogLevel(LogLevel level, bool saveConfig = true);

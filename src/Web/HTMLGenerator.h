@@ -79,12 +79,12 @@ public:
     static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
                                     const String &prefix, bool haEnabled, String &haPrefix);
 
-    // Generate sensor list page
-#if defined(HAS_ETHERNET)
-    // Generating network page (interface status)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+    // Generating network page (ethernet / LTE status and LTE settings)
     static String generateNetworkPage(const ConfigManager &config);
 #endif
 
+    // Generate sensor list page
     static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors);
 
     // Generate sensor add page

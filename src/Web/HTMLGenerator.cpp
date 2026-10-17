@@ -59,9 +59,12 @@ bool HTMLGenerator::init(bool usePsram, size_t bufferSize)
         Serial.printf("HTMLGenerator: Failed to allocate PSRAM, using %u bytes in RAM\n", htmlBufferSize);
     }
 #else
+    // No PSRAM: the buffer would only duplicate the page String in scarce
+    // internal RAM; the log page builds without it
     usePSRAM = false;
-    htmlBuffer = new char[htmlBufferSize];
-    Serial.printf("HTMLGenerator: Using %u bytes in RAM for HTML content\n", htmlBufferSize);
+    htmlBuffer = nullptr;
+    Serial.println("HTMLGenerator: no PSRAM, HTML buffer disabled");
+    return true;
 #endif
 
     // Check if memory allocation was successful
@@ -302,7 +305,7 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
     html += "<a href='/' class='" + String(activePage == "Home" ? "active" : "") + "'>Home</a>";
     html += "<a href='/config' class='" + String(activePage == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
     html += "<a href='/sensors' class='" + String(activePage == "Sensors" ? "active" : "") + "'>Sensors</a>";
-#if defined(HAS_ETHERNET)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     html += "<a href='/network' class='" + String(activePage == "Network" ? "active" : "") + "'>Network</a>";
 #endif
     html += "<a href='/mqtt' class='" + String(activePage == "MQTT" ? "active" : "") + "'>MQTT</a>";
@@ -628,7 +631,7 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     return html;
 }
 
-#if defined(HAS_ETHERNET)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
 String HTMLGenerator::generateNetworkPage(const ConfigManager &config)
 {
     String html;
@@ -644,7 +647,7 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config)
         html += ", " + uplink->getLocalIP().toString();
     }
     html += "</p>";
-    html += "<p>Priority: Ethernet, WiFi - the first one with an address carries traffic.</p>";
+    html += "<p>Priority: Ethernet, WiFi, LTE - the first one with an address carries traffic.</p>";
 #if defined(HAS_ETHERNET)
     html += "<p><strong>Ethernet:</strong> ";
     if (uplink->getEthernetIP())
@@ -659,8 +662,53 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config)
 #endif
     html += "<p><strong>WiFi:</strong> " +
             String(WiFi.STA.hasIP() ? "Connected, " + WiFi.STA.localIP().toString() : String("Disconnected")) + "</p>";
+#if defined(HAS_LTE)
+    const LteModem &lte = uplink->getLte();
+    html += "<p><strong>LTE:</strong> " + String(lte.getStateName());
+    if (lte.hasIP())
+    {
+        html += ", " + lte.localIP().toString();
+    }
+    html += "</p>";
+    if (lte.getOperator().length() > 0)
+    {
+        html += "<p><strong>Operator:</strong> " + lte.getOperator() + "</p>";
+    }
+    if (lte.getRssiDbm() != 0)
+    {
+        html += "<p><strong>Signal:</strong> " + String(lte.getRssiDbm()) + " dBm (CSQ " + String(lte.getSignalQuality()) + ")</p>";
+    }
+    if (lte.getModuleName().length() > 0)
+    {
+        html += "<p><strong>Modem:</strong> " + lte.getModuleName() + ", IMEI " + lte.getImei() + "</p>";
+    }
+    if (lte.getLastError().length() > 0)
+    {
+        html += "<p><strong>Last error:</strong> " + lte.getLastError() + "</p>";
+    }
+#endif
     html += "</div>";
 
+#if defined(HAS_LTE)
+    html += "<div class='card'>";
+    html += "<h2>LTE Settings</h2>";
+    html += "<p>The LTE connection is kept ready and used only when neither Ethernet nor WiFi is available. Changes take effect after a restart.</p>";
+    html += "<form method='post' action='/network'>";
+    html += "<div class='form-group'>";
+    html += "<label for='lteEnabled'>Enable LTE:</label>";
+    html += "<input type='checkbox' id='lteEnabled' name='lteEnabled' value='1'" + String(config.lteEnabled ? " checked" : "") + ">";
+    html += "</div>";
+    html += "<div class='form-group'>";
+    html += "<label for='apn'>APN:</label>";
+    html += "<input type='text' id='apn' name='apn' maxlength='63' value='" + config.lteApn + "'>";
+    html += "</div>";
+    html += "<div class='form-group'>";
+    html += "<label for='pin'>SIM PIN (optional):</label>";
+    html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]*' value='" + config.ltePin + "'>";
+    html += "</div>";
+    html += "<input type='submit' value='Save and Restart'>";
+    html += "</form></div>";
+#endif
 
     addHtmlFooter(html);
     return html;

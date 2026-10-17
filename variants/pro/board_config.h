@@ -39,4 +39,8 @@
 #define HAS_PWR_SRC
 #define PWR_SRC_PIN 36 // input only, read by polling (ESP32 errata GPIO-3.14)
 
+// Memory: no PSRAM, and WiFi + Ethernet + LTE share ~300 kB of internal RAM
+#define LOG_BUFFER_SIZE 80
+#define LOG_MESSAGE_CAPACITY 160
+
 #endif

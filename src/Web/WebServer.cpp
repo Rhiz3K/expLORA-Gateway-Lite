@@ -124,9 +124,12 @@ void WebPortal::setupRoutes()
     server.on("/logs/level", HTTP_POST, std::bind(&WebPortal::handleLogLevel, this, std::placeholders::_1));
     server.on("/logs", HTTP_GET, std::bind(&WebPortal::handleLogs, this, std::placeholders::_1));
 
-#if defined(HAS_ETHERNET)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     // Network
     server.on("/network", HTTP_GET, std::bind(&WebPortal::handleNetwork, this, std::placeholders::_1));
+#endif
+#if defined(HAS_LTE)
+    server.on("/network", HTTP_POST, std::bind(&WebPortal::handleNetworkPost, this, std::placeholders::_1));
 #endif
 
     // MQTT
@@ -1068,16 +1071,61 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     eth["link"] = uplink->ethernetLinkUp();
     eth["ip"] = uplink->getEthernetIP().toString();
 #endif
+#if defined(HAS_LTE)
+    const LteModem &lte = uplink->getLte();
+    JsonObject l = doc.createNestedObject("lte");
+    l["state"] = lte.getStateName();
+    l["ip"] = lte.localIP().toString();
+    l["csq"] = lte.getSignalQuality();
+    l["rssi"] = lte.getRssiDbm();
+    l["operator"] = lte.getOperator();
+    l["module"] = lte.getModuleName();
+    l["error"] = lte.getLastError();
+#endif
     String out;
     serializeJson(doc, out);
     request->send(200, "application/json", out);
 }
 
-#if defined(HAS_ETHERNET)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
 void WebPortal::handleNetwork(AsyncWebServerRequest *request)
 {
     if (guardAPOnly(request)) return;
     request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager));
+}
+#endif
+
+#if defined(HAS_LTE)
+void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
+{
+    if (guardAPOnly(request)) return;
+    bool enabled = request->hasParam("lteEnabled", true);
+    String apn = request->hasParam("apn", true) ? request->getParam("apn", true)->value() : String();
+    String pin = request->hasParam("pin", true) ? request->getParam("pin", true)->value() : String();
+    apn.trim();
+    pin.trim();
+    if (enabled && apn.length() == 0)
+    {
+        request->send(400, "text/plain", "APN is required when LTE is enabled");
+        return;
+    }
+    if (!configManager.setLteConfig(enabled, apn, pin))
+    {
+        request->send(400, "text/plain", "Invalid LTE settings (PIN digits only, APN max 63 characters)");
+        return;
+    }
+    logger.info("LTE configuration updated - enabled: " + String(enabled ? "yes" : "no") + ", APN: " + apn);
+
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta http-equiv='refresh' content='15;url=/network'>";
+    html += "<title>Settings Saved</title></head>";
+    html += "<body><h1>Settings Saved</h1>";
+    html += "<p>The device will restart in a few seconds.</p>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+    // Deferred, see handleClient()
+    restartAt = millis() + 1500;
+    restartRequested = true;
 }
 #endif
 

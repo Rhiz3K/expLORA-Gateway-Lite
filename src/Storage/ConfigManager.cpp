@@ -266,6 +266,10 @@ bool ConfigManager::loadFromPreferences()
     mqttHAEnabled = preferences.getBool("mqttHAEnabled", HA_DISCOVERY_DEFAULT_ENABLED);
     mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
 
+    lteEnabled = preferences.getBool("lteEnabled", LTE_DEFAULT_ENABLED);
+    lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
+    ltePin = preferences.getString("ltePin", "");
+
     // Other values should be loaded from LittleFS, but if needed,
     // we can load them from Preferences as a backup solution
     if (wifiSSID.length() == 0 && preferences.isKey("ssid"))
@@ -302,6 +306,10 @@ bool ConfigManager::saveToPreferences()
     preferences.putBool("mqttHAEnabled", mqttHAEnabled);
     preferences.putString("mqttHAPrefix", mqttHAPrefix);
 
+    preferences.putBool("lteEnabled", lteEnabled);
+    preferences.putString("lteApn", lteApn);
+    preferences.putString("ltePin", ltePin);
+
     // Save WiFi configuration (as backup)
     preferences.putString("ssid", wifiSSID);
     preferences.putString("password", wifiPassword);
@@ -311,6 +319,33 @@ bool ConfigManager::saveToPreferences()
 }
 
 // Add a new method to set MQTT configuration
+bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
+{
+    for (size_t i = 0; i < pin.length(); i++)
+    {
+        if (!isDigit(pin[i]))
+        {
+            logger.error("Invalid SIM PIN - digits only");
+            return false;
+        }
+    }
+    if (apn.length() > 63)
+    {
+        logger.error("APN too long");
+        return false;
+    }
+
+    lteEnabled = enabled;
+    lteApn = apn;
+    ltePin = pin;
+
+    if (saveConfig)
+    {
+        return save();
+    }
+    return true;
+}
+
 bool ConfigManager::setMqttConfig(const String &host, int port, const String &user,
                                   const String &password, bool enabled, bool tls,
                                   const String &rootPrefix, const String &haPrefix, bool haEnable,
@@ -393,6 +428,9 @@ void ConfigManager::resetToDefaults()
     mqttEnabled = MQTT_DEFAULT_ENABLED;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
+    lteEnabled = LTE_DEFAULT_ENABLED;
+    lteApn = LTE_DEFAULT_APN;
+    ltePin = "";
     mqttHAPrefix = HA_DISCOVERY_DEFAULT_PREFIX;
 }
 

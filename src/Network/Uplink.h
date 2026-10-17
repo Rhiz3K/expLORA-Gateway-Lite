@@ -30,6 +30,7 @@
 #if defined(HAS_ETHERNET)
 #include <ETH.h>
 #endif
+#include "LteModem.h"
 
 /**
  * Connectivity policy
@@ -42,10 +43,15 @@
  *   the netif route priority, so the default route follows link state
  * - station: connects with the configured credentials, retries every
  *   WIFI_RECONNECT_INTERVAL while down
+ * - LTE (boards with HAS_LTE): PPP session kept up as a hot standby, carries
+ *   traffic only when neither ethernet nor station has an address
  * - access point: up for AP_TIMEOUT after local access (ethernet or station)
  *   comes up, and whenever local access is lost (immediately when there are no
  *   WiFi credentials, otherwise after AP_RESTORE_DELAY)
  * - captive portal (DNS + config UI) whenever the AP is up without local access
+ * - DNS: lwIP keeps one global server list that every interface overwrites
+ *   when it gets an address, so the servers of the active interface are
+ *   remembered per interface and re-applied
  * - time: SNTP is (re)started when the device goes online, without blocking
  */
 class Uplink
@@ -56,6 +62,7 @@ public:
         None,
         Ethernet,
         WiFi,
+        LTE,
     };
 
     Uplink(ConfigManager &config, Logger &log);
@@ -87,6 +94,9 @@ public:
     bool ethernetLinkUp() const;
     IPAddress getEthernetIP() const;
 
+#if defined(HAS_LTE)
+    const LteModem &getLte() const { return *lte; }
+#endif
 
     // Called when the captive portal turns on or off
     void setCaptiveCallback(std::function<void(bool)> callback) { captiveCallback = callback; }
@@ -121,6 +131,19 @@ private:
     std::function<void(bool)> captiveCallback;
     std::function<void(Type)> activeChangeCallback;
 
+#if defined(HAS_LTE)
+    LteModem *lte = nullptr;
+#endif
+
+    // DNS servers per Type, captured on each GOT_IP event (event task)
+    static constexpr size_t TYPE_COUNT = 4;
+    IPAddress dnsServers[TYPE_COUNT][2];
+    portMUX_TYPE dnsMux = portMUX_INITIALIZER_UNLOCKED;
+    volatile bool dnsDirty = false;
+
+    void onGotIp(Type type, NetworkInterface &ifc);
+    void applyDns();
+    NetworkInterface *interfaceFor(Type type) const;
 
     bool stationEnabled() const;
     bool ethernetHasIP() const;

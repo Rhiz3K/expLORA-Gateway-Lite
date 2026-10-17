@@ -21,6 +21,9 @@
 
 #include "Uplink.h"
 #include <esp_sntp.h>
+#if defined(HAS_LTE)
+#include <PPP.h>
+#endif
 
 // Station connect wait during boot (matches the old 20 x 500 ms)
 static constexpr unsigned long WIFI_BOOT_CONNECT_TIMEOUT = 10000;
@@ -57,7 +60,32 @@ void Uplink::begin()
 
     sntp_set_time_sync_notification_cb(onTimeSync);
 
+    Network.onEvent([this](arduino_event_id_t event, arduino_event_info_t)
+                    {
+        switch (event)
+        {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            onGotIp(Type::WiFi, WiFi.STA);
+            break;
+#if defined(HAS_ETHERNET)
+        case ARDUINO_EVENT_ETH_GOT_IP:
+            onGotIp(Type::Ethernet, ETH);
+            break;
+#endif
+#if defined(HAS_LTE)
+        case ARDUINO_EVENT_PPP_GOT_IP:
+            onGotIp(Type::LTE, PPP);
+            break;
+#endif
+        default:
+            break;
+        } });
+
     startEthernet();
+#if defined(HAS_LTE)
+    lte = new LteModem(config, logger);
+    lte->begin();
+#endif
 
     if (!stationEnabled())
     {
@@ -137,10 +165,17 @@ void Uplink::process()
 
     processEthernet();
     processStation(now);
+#if defined(HAS_LTE)
+    lte->process();
+#endif
     processLocalAccess(now);
 
     bool wasOnline = isOnline();
     selectActive();
+    if (dnsDirty)
+    {
+        applyDns();
+    }
     if (!wasOnline && isOnline())
     {
         startTimeSync();
@@ -316,11 +351,18 @@ void Uplink::selectActive()
     {
         next = Type::WiFi;
     }
+#if defined(HAS_LTE)
+    else if (lte->hasIP())
+    {
+        next = Type::LTE;
+    }
+#endif
 
     if (next != active)
     {
         Type previous = active;
         active = next;
+        dnsDirty = true;
         if (active != Type::None)
         {
             logger.info(String("Uplink: ") + getActiveName() + ", IP " + getLocalIP().toString());
@@ -333,6 +375,62 @@ void Uplink::selectActive()
         {
             activeChangeCallback(active);
         }
+    }
+}
+
+// Event task: the global DNS list now holds this interface's servers
+void Uplink::onGotIp(Type type, NetworkInterface &ifc)
+{
+    IPAddress main = ifc.dnsIP(0);
+    IPAddress backup = ifc.dnsIP(1);
+    portENTER_CRITICAL(&dnsMux);
+    dnsServers[(size_t)type][0] = main;
+    dnsServers[(size_t)type][1] = backup;
+    portEXIT_CRITICAL(&dnsMux);
+    dnsDirty = true;
+}
+
+// Point the global DNS list at the active interface's servers
+void Uplink::applyDns()
+{
+    dnsDirty = false;
+    NetworkInterface *ifc = interfaceFor(active);
+    if (!ifc)
+    {
+        return;
+    }
+    portENTER_CRITICAL(&dnsMux);
+    IPAddress main = dnsServers[(size_t)active][0];
+    IPAddress backup = dnsServers[(size_t)active][1];
+    portEXIT_CRITICAL(&dnsMux);
+    if (main == IPAddress() || ifc->dnsIP(0) == main)
+    {
+        return;
+    }
+    ifc->dnsIP(0, main);
+    if (backup != IPAddress())
+    {
+        ifc->dnsIP(1, backup);
+    }
+    logger.info(String("DNS: ") + main.toString() + " (" + getActiveName() + ")");
+}
+
+NetworkInterface *Uplink::interfaceFor(Type type) const
+{
+    switch (type)
+    {
+#if defined(HAS_ETHERNET)
+    case Type::Ethernet:
+        return &ETH;
+#endif
+    case Type::WiFi:
+        return &WiFi.STA;
+#if defined(HAS_LTE)
+    case Type::LTE:
+        return &PPP;
+#endif
+    default:
+        return nullptr;
     }
 }
 
@@ -425,6 +523,8 @@ const char *Uplink::getActiveName() const
         return "Ethernet";
     case Type::WiFi:
         return "WiFi";
+    case Type::LTE:
+        return "LTE";
     default:
         return "none";
     }
@@ -438,6 +538,10 @@ IPAddress Uplink::getLocalIP() const
         return getEthernetIP();
     case Type::WiFi:
         return WiFi.STA.localIP();
+#if defined(HAS_LTE)
+    case Type::LTE:
+        return lte->localIP();
+#endif
     default:
         return IPAddress();
     }

@@ -41,7 +41,9 @@
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
-#define LOG_BUFFER_SIZE 150           // Size of log buffer
+#ifndef LOG_BUFFER_SIZE
+#define LOG_BUFFER_SIZE 150           // Size of log buffer (entries)
+#endif
 #define AP_TIMEOUT 300000             // AP mode timeout (5 minutes in milliseconds)
 #define WIFI_RECONNECT_INTERVAL 60000 // WiFi reconnect attempt interval (1 minute in milliseconds)
 #define WDT_TIMEOUT 10                // Watchdog timeout in seconds
@@ -97,6 +99,10 @@ inline String makeApName()
 #define MQTT_DEFAULT_PREFIX "explora"
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"
+
+// LTE defaults (boards with HAS_LTE)
+#define LTE_DEFAULT_ENABLED false
+#define LTE_DEFAULT_APN "internet"
 
 // CORS headers for API
 #define CORS_HEADER_NAME "Access-Control-Allow-Origin"
