@@ -24,6 +24,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)

@@ -28,7 +28,7 @@ bool PSRAMManager::psramAvailable = false;
 // Initialization
 bool PSRAMManager::init()
 {
-    psramAvailable = esp_spiram_is_initialized();
+    psramAvailable = psramFound();
 
     if (psramAvailable)
     {

@@ -127,10 +127,10 @@ void setup()
     bool psramInitialized = false;
 
     // Try different PSRAM detection methods
-    if (esp_spiram_is_initialized())
+    if (psramFound())
     {
         psramInitialized = true;
-        Serial.println("PSRAM initialized via esp_spiram_is_initialized()");
+        Serial.println("PSRAM initialized via psramFound()");
     }
     else if (ESP.getPsramSize() > 0)
     {
@@ -322,8 +322,17 @@ void setup()
     webPortal->setMqttManager(mqttManager);
 
     // Initialize task watchdog
-    esp_task_wdt_init(WDT_TIMEOUT, true); // Enable panic on timeout
-    esp_task_wdt_add(NULL);               // Add current task to watchdog
+    // The core already starts the TWDT (5 s, idle task on CPU0) - only change timeout, keep panic
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms = WDT_TIMEOUT * 1000,
+        .idle_core_mask = 1 << 0,
+        .trigger_panic = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE)
+    {
+        esp_task_wdt_init(&wdtConfig);
+    }
+    esp_task_wdt_add(NULL); // Add current task to watchdog
     logger.info("Task watchdog initialized with timeout of " + String(WDT_TIMEOUT) + " seconds");
 
     logger.info("System initialization complete");
@@ -506,7 +515,7 @@ void loop()
                     " bytes, Largest block: " + String(ESP.getMaxAllocHeap()) + " bytes");
 
 #ifdef BOARD_HAS_PSRAM
-        if (esp_spiram_is_initialized())
+        if (psramFound())
         {
             logger.debug("PSRAM status - Free: " + String(ESP.getFreePsram()) +
                          " bytes, Largest block: " + String(ESP.getMaxAllocPsram()) + " bytes");
