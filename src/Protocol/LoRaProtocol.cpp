@@ -167,21 +167,16 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, payload.pressure,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, Press: " + String(sensor->pressure, 2) + " hPa, Batt: " +
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -200,21 +195,16 @@ bool LoRaProtocol::processSHT40Packet(uint8_t *data, uint8_t len, int sensorInde
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, 0.0f,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
     }
 
     return result;
@@ -231,18 +221,14 @@ bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIn
         return false;
     }
 
-    SensorData* sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor) {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, 0.0f, 0.0f,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
-    if (result) {
-        logger.info(sensor->name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor)) {
+        logger.info(sensor.name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
                   String(header.batteryVoltage, 2) + "V");
     }
 
@@ -261,21 +247,16 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, 0.0f,
                                                  payload.ppm, 0.0f, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, CO2: " + String(sensor->ppm, 0) + " ppm, Batt: " +
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, CO2: " + String(sensor.ppm, 0) + " ppm, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -294,19 +275,14 @@ bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorI
         return false;
     }
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex, 0.0f, 0.0f, 0.0f, 0.0f,
                                                  payload.lux, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        logger.info(sensor->name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
+        logger.info(sensor.name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 
@@ -332,25 +308,20 @@ bool LoRaProtocol::processMeteoPacket(uint8_t *data, uint8_t len, int sensorInde
                  "m/s at " + String(payload.windDirection) + "°, rain=" + String(payload.rainAmount) +
                  "mm, rate=" + String(payload.rainRate) + "mm/h");
 
-    SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor)
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, payload.pressure,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi,
                                                  payload.windSpeed, payload.windDirection,
                                                  payload.rainAmount, payload.rainRate);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
-                    String(sensor->humidity, 2) + "%, Press: " + String(sensor->pressure, 2) + " hPa, Wind: " +
-                    String(sensor->windSpeed, 1) + " m/s at " + String(sensor->windDirection) + "°, Rain: " +
-                    String(sensor->rainAmount, 1) + " mm (rate: " + String(sensor->rainRate, 1) + " mm/h), Batt: " +
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Wind: " +
+                    String(sensor.windSpeed, 1) + " m/s at " + String(sensor.windDirection) + "°, Rain: " +
+                    String(sensor.rainAmount, 1) + " mm (rate: " + String(sensor.rainRate, 1) + " mm/h), Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 

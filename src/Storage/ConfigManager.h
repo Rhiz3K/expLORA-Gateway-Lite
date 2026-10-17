@@ -136,8 +136,6 @@ public:
     // Set logging level
     void setLogLevel(LogLevel level, bool saveConfig = true);
 
-    // Set timezone
-    bool setTimezone(const String &newTimezone, bool saveConfig = true);
 
 private:
     // Helper function to validate MQTT topic format

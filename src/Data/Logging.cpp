@@ -120,7 +120,7 @@ String Logger::getTimeStamp()
     if (timeInitialized)
     {
         struct tm timeinfo;
-        if (getLocalTime(&timeinfo))
+        if (getLocalTime(&timeinfo, 0))
         {
             strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
             return String(timeBuffer);
@@ -212,12 +212,18 @@ void Logger::verbose(const String &message)
     log(LogLevel::VERBOSE, message);
 }
 
-// Get all logs (for web interface)
-const LogEntry *Logger::getLogs(size_t &count)
+size_t Logger::forEachNewestFirst(const std::function<void(const LogEntry &)> &visitor)
 {
     std::lock_guard<std::mutex> lock(logMutex);
-    count = logCount;
-    return logBuffer;
+    if (logBuffer == nullptr)
+    {
+        return 0;
+    }
+    for (size_t i = 0; i < logCount; i++)
+    {
+        visitor(logBuffer[(logIndex + logBufferSize - 1 - i) % logBufferSize]);
+    }
+    return logCount;
 }
 
 // Clear all logs

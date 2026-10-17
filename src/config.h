@@ -85,7 +85,13 @@ inline String makeApName()
     return "expLORA-GW-" + String(suffix);
 }
 
-#define NTP_SERVER "pool.ntp.org"
+// NTP: up to three servers; a server announced by DHCP takes the first slot.
+// SNTP re-syncs every 3 h (CONFIG_LWIP_SNTP_UPDATE_DELAY); between syncs and
+// when a sync fails the clock keeps running.
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.cloudflare.com"
+#define NTP_SERVER_3 "time.google.com"
+#define TIME_STALE_AFTER_S (24 * 3600) // no successful sync for this long = stale
 #define DEFAULT_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3" // Central European Time with auto DST
 
 // MQTT Configuration
@@ -123,7 +129,6 @@ inline String makeApName()
 // Add additional sensor types here...
 
 // PSRAM configuration for web server
-#define WEB_BUFFER_SIZE 16384 // Reduced to 16KB
 
 // OTA update settings
 #define OTA_PASSWORD "admin" // OTA update password

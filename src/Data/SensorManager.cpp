@@ -69,19 +69,12 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
 
-    // Check if sensor already exists
-    int existingIndex = findSensorBySN(serialNumber);
-    if (existingIndex >= 0)
+    // A second sensor with the same serial number would never receive data
+    // (and silently replacing the key of the first one is worse)
+    if (findSensorBySN(serialNumber) >= 0)
     {
-        // Update existing sensor
-        sensors[existingIndex].deviceType = deviceType;
-        sensors[existingIndex].deviceKey = deviceKey;
-        sensors[existingIndex].name = name;
-        sensors[existingIndex].configured = true;
-
-        logger.info("Updated existing sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-        saveSensors(false);
-        return existingIndex;
+        logger.warning("Failed to add sensor: SN " + formatSN(serialNumber) + " already exists");
+        return -2;
     }
 
     // Check if we still have space
@@ -178,7 +171,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
                                      float windSpeed, uint16_t windDirection,
                                      float rainAmount, float rainRate)
 {
-    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::unique_lock<std::mutex> lock(sensorMutex);
 
     if (index < 0 || index >= sensorCount || !sensors[index].configured)
     {
@@ -384,7 +377,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
             time_t now;
             time(&now);
 
-            if (getLocalTime(&timeinfo))
+            if (getLocalTime(&timeinfo, 0))
             {
                 // Create timestamps for comparing dates
                 // Date of last reset
@@ -411,7 +404,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
         // Log the updated daily total if it has changed
         if (rainAmount > 0)
         {
-           saveSensors(false); // Save immediately after updating daily total
+            rainDirty = true; // saved from process(), not on every packet
         }
     }
 
@@ -425,28 +418,26 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
     sensors[index].rssi = rssi;
     sensors[index].lastSeen = millis();
 
-    if (uplink->isOnline())
+    if (sensors[index].customUrl.length() == 0)
     {
-        forwardSensorData(index);
+        return true;
     }
-    else
+    if (!uplink->isOnline())
     {
-        logger.debug("Not forwarding data - WiFi not connected");
+        logger.debug("Not forwarding data - offline");
+        return true;
     }
-
+    // The HTTP request blocks for up to seconds; web handlers wait on the lock
+    SensorData copy = sensors[index];
+    lock.unlock();
+    forwardSensorData(copy);
     return true;
 }
 
-bool SensorManager::forwardSensorData(int index)
+bool SensorManager::forwardSensorData(const SensorData &sensor)
 {
-    if (index < 0 || index >= sensorCount || !sensors[index].configured)
-    {
-        logger.warning("Attempt to forward data for non-existent sensor at index " + String(index));
-        return false;
-    }
-
     // Check if the sensor has a custom endpoint configured
-    if (sensors[index].customUrl.length() == 0)
+    if (sensor.customUrl.length() == 0)
     {
         // No endpoint configured, nothing to do
         return true;
@@ -460,7 +451,7 @@ bool SensorManager::forwardSensorData(int index)
     http.setReuse(false);
 
     // Format the custom URL by replacing placeholders
-    String url = sensors[index].customUrl;
+    String url = sensor.customUrl;
 
     // Skip if no URL is configured
     if (url.length() == 0)
@@ -472,53 +463,53 @@ bool SensorManager::forwardSensorData(int index)
     bool isHttps = url.startsWith("https://");
 
     // Process the URL - replace placeholders with actual values
-    if (sensors[index].hasTemperature())
+    if (sensor.hasTemperature())
     {
-        url.replace("*TEMP*", String(sensors[index].temperature, 2));
+        url.replace("*TEMP*", String(sensor.temperature, 2));
     }
-    if (sensors[index].hasHumidity())
+    if (sensor.hasHumidity())
     {
-        url.replace("*HUM*", String(sensors[index].humidity, 2));
+        url.replace("*HUM*", String(sensor.humidity, 2));
     }
-    if (sensors[index].hasPressure())
+    if (sensor.hasPressure())
     {
-        url.replace("*PRESS*", String(sensors[index].pressure, 2));
+        url.replace("*PRESS*", String(sensor.pressure, 2));
     }
-    if (sensors[index].hasPPM())
+    if (sensor.hasPPM())
     {
-        url.replace("*PPM*", String(sensors[index].ppm, 0));
+        url.replace("*PPM*", String(sensor.ppm, 0));
     }
-    if (sensors[index].hasLux())
+    if (sensor.hasLux())
     {
-        url.replace("*LUX*", String(sensors[index].lux, 1));
+        url.replace("*LUX*", String(sensor.lux, 1));
     }
 
     // Added placeholders for METEO data
-    if (sensors[index].hasWindSpeed())
+    if (sensor.hasWindSpeed())
     {
-        url.replace("*WIND_SPEED*", String(sensors[index].windSpeed, 1));
+        url.replace("*WIND_SPEED*", String(sensor.windSpeed, 1));
     }
-    if (sensors[index].hasWindDirection())
+    if (sensor.hasWindDirection())
     {
-        url.replace("*WIND_DIR*", String(sensors[index].windDirection));
+        url.replace("*WIND_DIR*", String(sensor.windDirection));
     }
-    if (sensors[index].hasRainAmount())
+    if (sensor.hasRainAmount())
     {
-        url.replace("*RAIN*", String(sensors[index].rainAmount, 1));
-        url.replace("*DAILY_RAIN*", String(sensors[index].dailyRainTotal, 1)); // New placeholder
+        url.replace("*RAIN*", String(sensor.rainAmount, 1));
+        url.replace("*DAILY_RAIN*", String(sensor.dailyRainTotal, 1)); // New placeholder
     }
-    if (sensors[index].hasRainRate())
+    if (sensor.hasRainRate())
     {
-        url.replace("*RAIN_RATE*", String(sensors[index].rainRate, 1));
+        url.replace("*RAIN_RATE*", String(sensor.rainRate, 1));
     }
 
     // Replace other common placeholders
-    url.replace("*BAT*", String(sensors[index].batteryVoltage, 2));
-    url.replace("*RSSI*", String(sensors[index].rssi));
-    url.replace("*SN*", formatSN(sensors[index].serialNumber));
-    url.replace("*TYPE*", String(static_cast<uint8_t>(sensors[index].deviceType)));
+    url.replace("*BAT*", String(sensor.batteryVoltage, 2));
+    url.replace("*RSSI*", String(sensor.rssi));
+    url.replace("*SN*", formatSN(sensor.serialNumber));
+    url.replace("*TYPE*", String(static_cast<uint8_t>(sensor.deviceType)));
 
-    logger.debug("Forwarding data for sensor " + sensors[index].name + " to URL: " + url);
+    logger.debug("Forwarding data for sensor " + sensor.name + " to URL: " + url);
 
     // For HTTPS, use a secure client, but ensure we delete it after the request
     if (isHttps)
@@ -703,24 +694,54 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
     return result;
 }
 
+bool SensorManager::getSensorCopy(int index, SensorData &out) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (index < 0 || index >= (int)sensorCount || !sensors[index].configured)
+    {
+        return false;
+    }
+    out = sensors[index];
+    return true;
+}
+
+// Rain totals: at most one flash write per interval
+static constexpr unsigned long RAIN_SAVE_INTERVAL = 600000;
+
+void SensorManager::process(unsigned long now)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (rainDirty && now - lastRainSave > RAIN_SAVE_INTERVAL)
+    {
+        saveSensorsLocked();
+    }
+}
+
+// JSON members per stored sensor (see saveSensorsLocked)
+static constexpr size_t SENSOR_JSON_FIELDS = 20;
+
 // Save sensor configuration to file
 bool SensorManager::saveSensors(bool lockMutex)
 {
     if (lockMutex)
     {
         std::lock_guard<std::mutex> lock(sensorMutex);
+        return saveSensorsLocked();
     }
+    return saveSensorsLocked();
+}
 
-    // Open file for writing
-    File file = LittleFS.open(sensorsFile, "w");
-    if (!file)
+// Caller holds sensorMutex. Written to a temporary file and renamed, so a
+// failure never leaves a truncated configuration behind.
+bool SensorManager::saveSensorsLocked()
+{
+    size_t textSize = 0;
+    for (size_t i = 0; i < sensorCount; i++)
     {
-        logger.info("Failed to open sensors file for writing: " + String(sensorsFile));
-        return false;
+        textSize += sensors[i].name.length() + sensors[i].customUrl.length() + 2;
     }
-
-    // Create JSON document
-    DynamicJsonDocument doc(4096); // Sufficiently large buffer
+    DynamicJsonDocument doc(JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(MAX_SENSORS) +
+                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + textSize + 256);
     JsonArray sensorArray = doc.createNestedArray("sensors");
 
     // Add sensors to JSON
@@ -754,28 +775,37 @@ bool SensorManager::saveSensors(bool lockMutex)
             sensor["rainRateCorrection"] = sensors[i].rainRateCorrection;
         }
     }
-    logger.info("Serializing sensors to JSON");
-    
-    String jsonString;
-    size_t jsonSize = serializeJson(doc, jsonString);
-    if (jsonSize == 0)
+    if (doc.overflowed())
     {
-        logger.error("Failed to serialize sensors to JSON");
-        file.close();
+        logger.error("Sensor configuration does not fit the JSON document - not saved");
         return false;
     }
 
-    // Write JSON string to file
-    size_t bytesWritten = file.print(jsonString);
-    file.flush(); // Ensure data is written to flash
+    String tmpFile = String(sensorsFile) + ".tmp";
+    File file = LittleFS.open(tmpFile, "w");
+    if (!file)
+    {
+        logger.error("Failed to open " + tmpFile + " for writing");
+        return false;
+    }
+    size_t jsonSize = measureJson(doc);
+    size_t bytesWritten = serializeJson(doc, file);
     file.close();
-
-    if (bytesWritten != jsonSize)
+    if (jsonSize == 0 || bytesWritten != jsonSize)
     {
-        logger.error("Failed to write complete JSON to file");
+        logger.error("Failed to write sensor configuration");
+        LittleFS.remove(tmpFile);
+        return false;
+    }
+    LittleFS.remove(sensorsFile);
+    if (!LittleFS.rename(tmpFile, sensorsFile))
+    {
+        logger.error("Failed to replace " + String(sensorsFile));
         return false;
     }
 
+    rainDirty = false;
+    lastRainSave = millis();
     logger.info("Saved " + String(sensorArray.size()) + " sensors to " + String(sensorsFile));
     return true;
 }
@@ -790,6 +820,14 @@ bool SensorManager::loadSensors()
     for (size_t i = 0; i < MAX_SENSORS; i++)
     {
         sensors[i].configured = false;
+    }
+
+    // Power lost between removing the old file and renaming the new one
+    String tmpFile = String(sensorsFile) + ".tmp";
+    if (!LittleFS.exists(sensorsFile) && LittleFS.exists(tmpFile))
+    {
+        logger.warning("Recovering sensor configuration from " + tmpFile);
+        LittleFS.rename(tmpFile, sensorsFile);
     }
 
     // Check if file exists
@@ -829,17 +867,19 @@ bool SensorManager::loadSensors()
         return true;
     }
 
-    // Create JSON document
-    DynamicJsonDocument doc(4096); // Sufficiently large buffer
-
-    // Deserialize JSON from file
+    // Strings are copied into the document, so its size follows the file
+    DynamicJsonDocument doc(fileContent.length() + JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(MAX_SENSORS) +
+                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + 256);
     DeserializationError error = deserializeJson(doc, fileContent);
-    file.close();
-
     if (error)
     {
-        logger.error("Failed to parse sensors file: " + String(error.c_str()));
-        return false;
+        // Keep the file for recovery instead of overwriting it with the next
+        // save, and start empty
+        String corruptFile = String(sensorsFile) + ".corrupt";
+        LittleFS.remove(corruptFile);
+        LittleFS.rename(sensorsFile, corruptFile);
+        logger.error("Failed to parse sensors file (" + String(error.c_str()) + "), moved to " + corruptFile);
+        return true;
     }
 
     // Load sensors from JSON

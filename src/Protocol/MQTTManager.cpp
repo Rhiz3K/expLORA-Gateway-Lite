@@ -129,6 +129,8 @@ bool MQTTManager::connect()
 // Process MQTT communication (call in main loop)
 void MQTTManager::process()
 {
+    processPending();
+
     // Skip if MQTT is disabled in configuration
     if (!configManager.mqttEnabled || !mqttClientReady)
     {
@@ -188,106 +190,111 @@ void MQTTManager::publishDiscovery()
     // Get all active sensors
     std::vector<SensorData> sensors = sensorManager.getActiveSensors();
 
-    // Publish discovery information for each sensor
     for (const auto &sensor : sensors)
     {
-        // Base state topic for this sensor
-        String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor.serialNumber);
-
-        // Publish discovery for each supported value type based on sensor type
-        if (sensor.hasTemperature())
-        {
-            String topic = buildDiscoveryTopic(sensor, "temperature");
-            String payload = buildDiscoveryJson(sensor, "temperature", baseTopic + "/temperature");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true); // Retained message
-            logger.debug("Published temperature discovery for " + sensor.name);
-        }
-
-        if (sensor.hasHumidity())
-        {
-            String topic = buildDiscoveryTopic(sensor, "humidity");
-            String payload = buildDiscoveryJson(sensor, "humidity", baseTopic + "/humidity");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published humidity discovery for " + sensor.name);
-        }
-
-        if (sensor.hasPressure())
-        {
-            String topic = buildDiscoveryTopic(sensor, "pressure");
-            String payload = buildDiscoveryJson(sensor, "pressure", baseTopic + "/pressure");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published pressure discovery for " + sensor.name);
-        }
-
-        if (sensor.hasPPM())
-        {
-            String topic = buildDiscoveryTopic(sensor, "co2");
-            String payload = buildDiscoveryJson(sensor, "co2", baseTopic + "/co2");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published CO2 discovery for " + sensor.name);
-        }
-
-        if (sensor.hasLux())
-        {
-            String topic = buildDiscoveryTopic(sensor, "illuminance");
-            String payload = buildDiscoveryJson(sensor, "illuminance", baseTopic + "/illuminance");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published illuminance discovery for " + sensor.name);
-        }
-
-        if (sensor.hasWindSpeed())
-        {
-            String topic = buildDiscoveryTopic(sensor, "wind_speed");
-            String payload = buildDiscoveryJson(sensor, "wind_speed", baseTopic + "/wind_speed");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published wind speed discovery for " + sensor.name);
-        }
-
-        if (sensor.hasWindDirection())
-        {
-            String topic = buildDiscoveryTopic(sensor, "wind_direction");
-            String payload = buildDiscoveryJson(sensor, "wind_direction", baseTopic + "/wind_direction");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published wind direction discovery for " + sensor.name);
-        }
-
-        if (sensor.hasRainAmount())
-        {
-            String topic = buildDiscoveryTopic(sensor, "rain_amount");
-            String payload = buildDiscoveryJson(sensor, "rain_amount", baseTopic + "/rain_amount");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published rain amount discovery for " + sensor.name);
-
-            // Also for daily rain total
-            topic = buildDiscoveryTopic(sensor, "daily_rain");
-            payload = buildDiscoveryJson(sensor, "daily_rain", baseTopic + "/daily_rain");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published daily rain discovery for " + sensor.name);
-        }
-
-        if (sensor.hasRainRate())
-        {
-            String topic = buildDiscoveryTopic(sensor, "rain_rate");
-            String payload = buildDiscoveryJson(sensor, "rain_rate", baseTopic + "/rain_rate");
-            mqttClient.publish(topic.c_str(), payload.c_str(), true);
-            logger.debug("Published rain rate discovery for " + sensor.name);
-        }
-
-        // Battery voltage - available for all sensors
-        String topic = buildDiscoveryTopic(sensor, "battery");
-        String payload = buildDiscoveryJson(sensor, "battery", baseTopic + "/battery");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
-        logger.debug("Published battery discovery for " + sensor.name);
-
-        // RSSI (signal strength) - available for all sensors
-        topic = buildDiscoveryTopic(sensor, "rssi");
-        payload = buildDiscoveryJson(sensor, "rssi", baseTopic + "/rssi");
-        mqttClient.publish(topic.c_str(), payload.c_str(), true);
-        logger.debug("Published RSSI discovery for " + sensor.name);
+        publishSensorDiscovery(sensor);
     }
 
     logger.info("Home Assistant discovery completed for " + String(sensors.size()) + " sensors");
     lastDiscoveryUpdate = millis();
+}
+
+// Discovery config of every value a sensor provides
+void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
+{
+    // Base state topic for this sensor
+    String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor.serialNumber);
+
+    // Publish discovery for each supported value type based on sensor type
+    if (sensor.hasTemperature())
+    {
+        String topic = buildDiscoveryTopic(sensor, "temperature");
+        String payload = buildDiscoveryJson(sensor, "temperature", baseTopic + "/temperature");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true); // Retained message
+        logger.debug("Published temperature discovery for " + sensor.name);
+    }
+
+    if (sensor.hasHumidity())
+    {
+        String topic = buildDiscoveryTopic(sensor, "humidity");
+        String payload = buildDiscoveryJson(sensor, "humidity", baseTopic + "/humidity");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published humidity discovery for " + sensor.name);
+    }
+
+    if (sensor.hasPressure())
+    {
+        String topic = buildDiscoveryTopic(sensor, "pressure");
+        String payload = buildDiscoveryJson(sensor, "pressure", baseTopic + "/pressure");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published pressure discovery for " + sensor.name);
+    }
+
+    if (sensor.hasPPM())
+    {
+        String topic = buildDiscoveryTopic(sensor, "co2");
+        String payload = buildDiscoveryJson(sensor, "co2", baseTopic + "/co2");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published CO2 discovery for " + sensor.name);
+    }
+
+    if (sensor.hasLux())
+    {
+        String topic = buildDiscoveryTopic(sensor, "illuminance");
+        String payload = buildDiscoveryJson(sensor, "illuminance", baseTopic + "/illuminance");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published illuminance discovery for " + sensor.name);
+    }
+
+    if (sensor.hasWindSpeed())
+    {
+        String topic = buildDiscoveryTopic(sensor, "wind_speed");
+        String payload = buildDiscoveryJson(sensor, "wind_speed", baseTopic + "/wind_speed");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published wind speed discovery for " + sensor.name);
+    }
+
+    if (sensor.hasWindDirection())
+    {
+        String topic = buildDiscoveryTopic(sensor, "wind_direction");
+        String payload = buildDiscoveryJson(sensor, "wind_direction", baseTopic + "/wind_direction");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published wind direction discovery for " + sensor.name);
+    }
+
+    if (sensor.hasRainAmount())
+    {
+        String topic = buildDiscoveryTopic(sensor, "rain_amount");
+        String payload = buildDiscoveryJson(sensor, "rain_amount", baseTopic + "/rain_amount");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published rain amount discovery for " + sensor.name);
+
+        // Also for daily rain total
+        topic = buildDiscoveryTopic(sensor, "daily_rain");
+        payload = buildDiscoveryJson(sensor, "daily_rain", baseTopic + "/daily_rain");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published daily rain discovery for " + sensor.name);
+    }
+
+    if (sensor.hasRainRate())
+    {
+        String topic = buildDiscoveryTopic(sensor, "rain_rate");
+        String payload = buildDiscoveryJson(sensor, "rain_rate", baseTopic + "/rain_rate");
+        mqttClient.publish(topic.c_str(), payload.c_str(), true);
+        logger.debug("Published rain rate discovery for " + sensor.name);
+    }
+
+    // Battery voltage - available for all sensors
+    String topic = buildDiscoveryTopic(sensor, "battery");
+    String payload = buildDiscoveryJson(sensor, "battery", baseTopic + "/battery");
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    logger.debug("Published battery discovery for " + sensor.name);
+
+    // RSSI (signal strength) - available for all sensors
+    topic = buildDiscoveryTopic(sensor, "rssi");
+    payload = buildDiscoveryJson(sensor, "rssi", baseTopic + "/rssi");
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    logger.debug("Published RSSI discovery for " + sensor.name);
 }
 
 String MQTTManager::gatewayTopic(const char *key) const
@@ -338,6 +345,7 @@ void MQTTManager::publishGatewayDiscovery()
 {
     publishGatewayEntity("uplink", "Uplink", nullptr, nullptr, "mdi:lan-connect");
     publishGatewayEntity("ip", "IP address", nullptr, nullptr, "mdi:ip-network");
+    publishGatewayEntity("time_sync", "Last time sync", "timestamp", nullptr, nullptr);
 #if defined(HAS_PWR_SRC)
     publishGatewayEntity("power_source", "Power source", nullptr, nullptr, "mdi:power-plug");
 #endif
@@ -359,7 +367,18 @@ void MQTTManager::publishGatewayState(bool force)
 
     String uplinkName = uplink->getActiveName();
     String ip = uplink->getLocalIP().toString();
-    String state = uplinkName + "|" + ip;
+    // ISO 8601 UTC for the HA timestamp class, "None" = unknown
+    String timeSync = "None";
+    time_t synced = uplink->getLastTimeSync();
+    if (synced != 0)
+    {
+        struct tm utc;
+        gmtime_r(&synced, &utc);
+        char text[24];
+        strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%SZ", &utc);
+        timeSync = text;
+    }
+    String state = uplinkName + "|" + ip + "|" + timeSync;
 #if defined(HAS_PWR_SRC)
     String power = powerSource->getName();
     state += "|" + power;
@@ -384,6 +403,7 @@ void MQTTManager::publishGatewayState(bool force)
 
     mqttClient.publish(gatewayTopic("uplink").c_str(), uplinkName.c_str(), true);
     mqttClient.publish(gatewayTopic("ip").c_str(), ip.c_str(), true);
+    mqttClient.publish(gatewayTopic("time_sync").c_str(), timeSync.c_str(), true);
 #if defined(HAS_PWR_SRC)
     mqttClient.publish(gatewayTopic("power_source").c_str(), power.c_str(), true);
 #endif
@@ -565,12 +585,12 @@ void MQTTManager::publishSensorData(int sensorIndex)
         return;
     }
 
-    // Get sensor data
-    const SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor || !sensor->configured)
+    SensorData copy;
+    if (!sensorManager.getSensorCopy(sensorIndex, copy))
     {
         return;
     }
+    const SensorData *sensor = &copy;
 
     // Base topic for this sensor
     String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor->serialNumber);
@@ -643,94 +663,69 @@ void MQTTManager::publishSensorData(int sensorIndex)
     logger.debug("Published MQTT data for sensor: " + sensor->name);
 }
 
-void MQTTManager::publishDiscoveryForSensor(int sensorIndex)
+// Web handlers run in the async server task; PubSubClient is used only from
+// the loop task, so they queue the work here and process() does it
+void MQTTManager::requestSensorDiscovery(uint32_t serialNumber)
 {
-    if (!configManager.mqttHAEnabled) {
-        return; // Do not send discovery if HA is disabled
-    }
+    std::lock_guard<std::mutex> lock(pendingMutex);
+    pending.push_back({PendingOp::Discovery, serialNumber});
+}
 
-    if (!mqttClient.connected())
+void MQTTManager::requestSensorRemoval(uint32_t serialNumber)
+{
+    std::lock_guard<std::mutex> lock(pendingMutex);
+    pending.push_back({PendingOp::Removal, serialNumber});
+}
+
+void MQTTManager::requestReinit()
+{
+    std::lock_guard<std::mutex> lock(pendingMutex);
+    reinitRequested = true;
+}
+
+void MQTTManager::processPending()
+{
+    std::vector<PendingOp> ops;
+    bool reinit;
     {
-        return;
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        reinit = reinitRequested;
+        reinitRequested = false;
+        if (mqttClient.connected() || reinit)
+        {
+            ops.swap(pending);
+        }
     }
 
-    const SensorData *sensor = sensorManager.getSensor(sensorIndex);
-    if (!sensor || !sensor->configured)
+    if (reinit)
     {
-        return;
+        logger.info("Reinitializing MQTT with new configuration...");
+        disconnect();
+        init();
+        lastReconnectAttempt = 0;
+        return; // discovery of everything follows the reconnect
     }
 
-    logger.info("Publishing MQTT discovery for sensor: " + sensor->name);
-
-    // Base state topic for this sensor
-    String baseTopic = String(configManager.mqttPrefix) + "/" + formatSN(sensor->serialNumber);
-
-    // Publish each value based on sensor type
-    if (sensor->hasTemperature())
+    for (const PendingOp &op : ops)
     {
-        mqttClient.publish((baseTopic + "/temperature").c_str(),
-                           String(sensor->temperature, 2).c_str());
+        if (op.type == PendingOp::Removal)
+        {
+            removeDiscoveryForSensor(op.serialNumber);
+            continue;
+        }
+        if (!configManager.mqttHAEnabled)
+        {
+            continue;
+        }
+        for (const SensorData &sensor : sensorManager.getActiveSensors())
+        {
+            if (sensor.serialNumber == op.serialNumber)
+            {
+                logger.info("Publishing MQTT discovery for sensor: " + sensor.name);
+                publishSensorDiscovery(sensor);
+            }
+        }
     }
-
-    if (sensor->hasHumidity())
-    {
-        mqttClient.publish((baseTopic + "/humidity").c_str(),
-                           String(sensor->humidity, 2).c_str());
-    }
-
-    if (sensor->hasPressure())
-    {
-        mqttClient.publish((baseTopic + "/pressure").c_str(),
-                           String(sensor->pressure, 2).c_str());
-    }
-
-    if (sensor->hasPPM())
-    {
-        mqttClient.publish((baseTopic + "/co2").c_str(),
-                           String(int(sensor->ppm)).c_str());
-    }
-
-    if (sensor->hasLux())
-    {
-        mqttClient.publish((baseTopic + "/illuminance").c_str(),
-                           String(sensor->lux, 1).c_str());
-    }
-
-    if (sensor->hasWindSpeed())
-    {
-        mqttClient.publish((baseTopic + "/wind_speed").c_str(),
-                           String(sensor->windSpeed, 1).c_str());
-    }
-
-    if (sensor->hasWindDirection())
-    {
-        mqttClient.publish((baseTopic + "/wind_direction").c_str(),
-                           String(sensor->windDirection).c_str());
-    }
-
-    if (sensor->hasRainAmount())
-    {
-        mqttClient.publish((baseTopic + "/rain_amount").c_str(),
-                           String(sensor->rainAmount, 1).c_str());
-        mqttClient.publish((baseTopic + "/daily_rain").c_str(),
-                           String(sensor->dailyRainTotal, 1).c_str());
-    }
-
-    if (sensor->hasRainRate())
-    {
-        mqttClient.publish((baseTopic + "/rain_rate").c_str(),
-                           String(sensor->rainRate, 1).c_str());
-    }
-
-    // Battery voltage - available for all sensors
-    mqttClient.publish((baseTopic + "/battery").c_str(),
-                       String(sensor->batteryVoltage, 2).c_str());
-
-    // RSSI - available for all sensors
-    mqttClient.publish((baseTopic + "/rssi").c_str(),
-                       String(sensor->rssi).c_str());
-
-    logger.debug("Published MQTT data for sensor: " + sensor->name);
 }
 
 // Check connection

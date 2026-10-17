@@ -39,6 +39,7 @@ static constexpr int ETH_ROUTE_PRIO = 150;
 #endif
 
 volatile bool Uplink::timeSyncedFlag = false;
+volatile time_t Uplink::lastTimeSync = 0;
 
 Uplink::Uplink(ConfigManager &cfg, Logger &log)
     : config(cfg), logger(log)
@@ -189,6 +190,17 @@ void Uplink::process()
         timeSyncLogged = true;
         logger.setTimeInitialized(true);
         logger.info("NTP time synchronized successfully");
+    }
+
+    // A stale clock is still used (it drifts by seconds per day), just flagged
+    static bool staleLogged = false;
+    if (timeSyncLogged && isTimeStale() != staleLogged)
+    {
+        staleLogged = !staleLogged;
+        if (staleLogged)
+        {
+            logger.warning("No successful NTP sync for " + String(TIME_STALE_AFTER_S / 3600) + " h");
+        }
     }
 }
 
@@ -576,13 +588,60 @@ IPAddress Uplink::getApIP() const
     return apActive ? WiFi.softAPIP() : IPAddress();
 }
 
-// (Re)start SNTP; the result arrives in onTimeSync()
+// (Re)start SNTP; the result arrives in onTimeSync(). SNTP itself re-syncs
+// periodically and retries after failures, without touching the clock.
 void Uplink::startTimeSync()
 {
-    configTzTime(config.timezone.c_str(), NTP_SERVER);
+    // Accept an NTP server announced by DHCP (router) in the first slot
+    esp_sntp_servermode_dhcp(true);
+    configTzTime(config.timezone.c_str(), NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
 }
 
+// SNTP task
 void Uplink::onTimeSync(struct timeval *tv)
 {
+    lastTimeSync = tv ? tv->tv_sec : time(nullptr);
     timeSyncedFlag = true;
+}
+
+bool Uplink::isTimeValid() const
+{
+    return time(nullptr) > 1700000000; // after 2023-11
+}
+
+bool Uplink::isTimeStale() const
+{
+    return lastTimeSync == 0 || time(nullptr) - lastTimeSync > TIME_STALE_AFTER_S;
+}
+
+String Uplink::getTimeStatus() const
+{
+    if (!isTimeValid())
+    {
+        return "not synchronized";
+    }
+    struct tm now;
+    time_t t = time(nullptr);
+    localtime_r(&t, &now);
+    char text[24];
+    strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &now);
+    String status = text;
+    long age = (long)(t - lastTimeSync);
+    if (age < 120)
+    {
+        status += " (synced " + String(age) + " s ago)";
+    }
+    else if (age < 7200)
+    {
+        status += " (synced " + String(age / 60) + " min ago)";
+    }
+    else
+    {
+        status += " (synced " + String(age / 3600) + " h ago)";
+    }
+    if (isTimeStale())
+    {
+        status += " - not verified for over " + String(TIME_STALE_AFTER_S / 3600) + " h";
+    }
+    return status;
 }

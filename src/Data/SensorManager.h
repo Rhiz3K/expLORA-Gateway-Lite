@@ -45,6 +45,12 @@ private:
     // Filename for storing sensor configuration
     const char *sensorsFile;
 
+    // Daily rain totals changed since the last save (saved from process())
+    bool rainDirty = false;
+    unsigned long lastRainSave = 0;
+
+    bool saveSensorsLocked();
+
 public:
     // Constructor
     SensorManager(Logger &log, const char *file = SENSORS_FILE);
@@ -55,8 +61,15 @@ public:
     // Sensor manager initialization
     bool init();
 
-    // Add a new sensor
+    // Add a new sensor; returns its index, -1 when full, -2 when the serial
+    // number is already used
     int addSensor(SensorType deviceType, uint32_t serialNumber, uint32_t deviceKey, const String &name);
+
+    // Copy of a configured sensor, taken under the lock; false if none
+    bool getSensorCopy(int index, SensorData &out) const;
+
+    // Deferred work (rain total saves), call from loop()
+    void process(unsigned long now);
 
     // Find sensor by serial number
     int findSensorBySN(uint32_t serialNumber);
@@ -102,8 +115,8 @@ public:
     // Load sensor configuration from file
     bool loadSensors();
 
-    // Forward sensor data to HTTP
-    bool forwardSensorData(int index);
+    // Forward sensor data to HTTP (blocking - never call with the lock held)
+    bool forwardSensorData(const SensorData &sensor);
 
     // Convert relative pressure to absolute pressure
     double relativeToAbsolutePressure(double p0_hpa, int altitude_m, double temp_c);

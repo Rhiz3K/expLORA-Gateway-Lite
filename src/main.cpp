@@ -69,27 +69,6 @@ PowerSource *powerSource;     // Supply source (PoE / USB) on boards that detect
 
 // Timer for disabling AP mode
 
-// NTP synchronization helper - returns true if time was successfully synchronized
-bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000)
-{
-    configTime(0, 0, NTP_SERVER);
-    setenv("TZ", timezone.c_str(), 1);
-    tzset();
-
-    // Wait for actual NTP sync with timeout
-    struct tm timeinfo;
-    unsigned long startWait = millis();
-    while (!getLocalTime(&timeinfo, 100))
-    {
-        if (millis() - startWait > timeoutMs)
-        {
-            return false;
-        }
-        delay(100);
-    }
-    return true;
-}
-
 // File system initialization
 bool initFileSystem()
 {
@@ -167,13 +146,6 @@ void setup()
 
     // Basic log after initialization
     logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(FIRMWARE_VERSION));
-
-    // HTML generator initialization
-    if (!HTMLGenerator::init(true, WEB_BUFFER_SIZE))
-    {
-        logger.error("Failed to initialize HTML generator");
-        return;
-    }
 
     // Configuration manager initialization
     configManager = new ConfigManager(logger);
@@ -326,6 +298,11 @@ void loop()
     // Short delay for stability
     delay(5);
 
+    if (sensorManager)
+    {
+        sensorManager->process(millis());
+    }
+
     // Periodically rotate per-sensor health buckets so a dead-silent sensor
     // (no packets at all) eventually drops out of the 24h "OK" tally instead
     // of clinging to whatever was in the last bucket at boot.
@@ -339,7 +316,7 @@ void loop()
         }
     }
 
-    // Memory diagnostics and time check every 10 minutes
+    // Memory diagnostics every 10 minutes
     static unsigned long lastMemCheck = 0;
     if (millis() - lastMemCheck > 600000)
     { // 10 minutes
@@ -355,30 +332,5 @@ void loop()
                          " bytes, Largest block: " + String(ESP.getMaxAllocPsram()) + " bytes");
         }
 #endif
-
-        // Periodic time check - re-sync if time was lost
-        struct tm timeinfo;
-        if (!getLocalTime(&timeinfo, 100))
-        {
-            logger.warning("System time invalid - attempting NTP re-sync");
-            if (uplink->isOnline())
-            {
-                if (syncNTPTime(configManager->timezone, 5000))
-                {
-                    logger.info("NTP time recovered successfully");
-                    logger.setTimeInitialized(true);
-                }
-                else
-                {
-                    logger.error("NTP re-sync failed - time remains unavailable");
-                    logger.setTimeInitialized(false);
-                }
-            }
-            else
-            {
-                logger.warning("Cannot sync time - offline");
-                logger.setTimeInitialized(false);
-            }
-        }
     }
 }

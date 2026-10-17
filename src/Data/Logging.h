@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 #include <mutex>
 #include "../config.h"
 
@@ -146,8 +147,9 @@ public:
     static void debug(const String &message);
     static void verbose(const String &message);
 
-    // Get all logs (for web interface)
-    static const LogEntry *getLogs(size_t &count);
+    // Visit the stored entries newest first, under the log lock (the visitor
+    // must not log); returns the number of entries visited
+    static size_t forEachNewestFirst(const std::function<void(const LogEntry &)> &visitor);
 
     // Clear all logs
     static void clearLogs();
@@ -163,6 +165,4 @@ public:
 
     static bool isTimeInitialized() { return timeInitialized; }
 
-    static size_t getLogIndex() { return logIndex; }
-    static size_t getLogBufferSize() { return logBufferSize; }
 };

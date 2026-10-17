@@ -25,9 +25,6 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
-// External NTP sync function from main.cpp
-extern bool syncNTPTime(const String &timezone, unsigned long timeoutMs = 10000);
-
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)
     : logger(log), preferencesInitialized(false), configFile(file)
@@ -493,25 +490,6 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
     mqttHAEnabled = haEnable;
 
     return saveConfig ? save() : true;
-}
-
-// Add a new method to set the timezone
-bool ConfigManager::setTimezone(const String &newTimezone, bool saveConfig)
-{
-    timezone = newTimezone;
-
-    // Configure the time with new timezone using verified sync
-    if (!syncNTPTime(timezone))
-    {
-        logger.warning("NTP sync failed during timezone change");
-    }
-
-    if (saveConfig)
-    {
-        return save();
-    }
-
-    return true;
 }
 
 // Helper function to validate MQTT topic format

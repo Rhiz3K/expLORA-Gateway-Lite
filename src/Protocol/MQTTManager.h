@@ -21,6 +21,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
@@ -71,6 +74,24 @@ private:
     // Helper function to capitalize first letter
     String capitalizeFirst(const String &input);
 
+    // Discovery config of one sensor
+    void publishSensorDiscovery(const SensorData &sensor);
+
+    // Work queued by other tasks (web handlers), done in process()
+    struct PendingOp
+    {
+        enum Type : uint8_t
+        {
+            Discovery,
+            Removal,
+        } type;
+        uint32_t serialNumber;
+    };
+    std::mutex pendingMutex;
+    std::vector<PendingOp> pending;
+    bool reinitRequested = false;
+    void processPending();
+
     // Gateway entities: discovery and state
     String gatewayTopic(const char *key) const;
     void publishGatewayEntity(const char *key, const char *name, const char *deviceClass,
@@ -94,11 +115,13 @@ public:
     // Publish sensor data
     void publishSensorData(int sensorIndex);
 
-    // Publish discovery for specific sensor
-    void publishDiscoveryForSensor(int sensorIndex);
-
     // Remove discovery for deleted sensor
     void removeDiscoveryForSensor(uint32_t serialNumber);
+
+    // Thread-safe requests (any task), carried out by process()
+    void requestSensorDiscovery(uint32_t serialNumber);
+    void requestSensorRemoval(uint32_t serialNumber);
+    void requestReinit();
 
     // Check connection
     bool isConnected();

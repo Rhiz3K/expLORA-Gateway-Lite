@@ -28,77 +28,6 @@
 #include "../Network/Uplink.h"
 #include "../config.h"
 
-// Initialization of static variables
-char *HTMLGenerator::htmlBuffer = nullptr;
-size_t HTMLGenerator::htmlBufferSize = WEB_BUFFER_SIZE;
-bool HTMLGenerator::usePSRAM = false;
-
-// Generator initialization
-bool HTMLGenerator::init(bool usePsram, size_t bufferSize)
-{
-    // If buffer is already initialized, free it first
-    if (htmlBuffer != nullptr)
-    {
-        deinit();
-    }
-
-    htmlBufferSize = bufferSize;
-
-#ifdef BOARD_HAS_PSRAM
-    usePSRAM = true;
-    htmlBuffer = (char *)heap_caps_malloc(htmlBufferSize, MALLOC_CAP_SPIRAM);
-
-    if (htmlBuffer != nullptr)
-    {
-        Serial.printf("HTMLGenerator: Allocated %u bytes in PSRAM for HTML content\n", htmlBufferSize);
-    }
-    else
-    {
-        // Fallback to regular RAM
-        usePSRAM = false;
-        htmlBuffer = new char[htmlBufferSize];
-        Serial.printf("HTMLGenerator: Failed to allocate PSRAM, using %u bytes in RAM\n", htmlBufferSize);
-    }
-#else
-    // No PSRAM: the buffer would only duplicate the page String in scarce
-    // internal RAM; the log page builds without it
-    usePSRAM = false;
-    htmlBuffer = nullptr;
-    Serial.println("HTMLGenerator: no PSRAM, HTML buffer disabled");
-    return true;
-#endif
-
-    // Check if memory allocation was successful
-    if (htmlBuffer == nullptr)
-    {
-        Serial.println("HTMLGenerator: Failed to allocate memory for HTML buffer");
-        return false;
-    }
-
-    return true;
-}
-
-// Resource release
-void HTMLGenerator::deinit()
-{
-    if (htmlBuffer != nullptr)
-    {
-#ifdef BOARD_HAS_PSRAM
-        if (usePSRAM)
-        {
-            heap_caps_free(htmlBuffer);
-        }
-        else
-        {
-#endif
-            delete[] htmlBuffer;
-#ifdef BOARD_HAS_PSRAM
-        }
-#endif
-        htmlBuffer = nullptr;
-    }
-}
-
 String HTMLGenerator::htmlEscape(const String &text)
 {
     String out;
@@ -396,7 +325,7 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
 
     // Current time
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
+    if (getLocalTime(&timeinfo, 0))
     {
         char timeStr[64];
         strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -469,46 +398,6 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     return html;
 }
 
-// Generating sensor table (optimized version for buffer)
-void HTMLGenerator::generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors)
-{
-    size_t contentLen = 0;
-
-    // Table start
-    contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                           "<table>"
-                           "<tr><th>Name</th><th>Type</th><th>Serial Number</th><th>Last Seen</th><th>Sensor Data</th></tr>");
-
-    // Process all sensors
-    for (const auto &sensor : sensors)
-    {
-        if (sensor.configured)
-        {
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<tr>"
-                                   "<td>%s</td>"
-                                   "<td>%s</td>"
-                                   "<td>%X</td>",
-                                   htmlEscape(sensor.name).c_str(),
-                                   sensor.getTypeInfo().name,
-                                   sensor.serialNumber);
-
-            // Last Seen
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<td>%s</td>",
-                                   sensor.getLastSeenString().c_str());
-
-            // Sensor Data
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<td>%s</td>"
-                                   "</tr>",
-                                   sensor.getDataString().c_str());
-        }
-    }
-
-    // Table end
-    contentLen += snprintf(buffer + contentLen, maxLen - contentLen, "</table>");
-}
 
 // Generating configuration page
 // WiFi settings form, used by the AP setup page and the network page
@@ -519,8 +408,10 @@ void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &
     html += "<form method='post' action='/config'>";
     html += "<label for='ssid'>SSID:</label>";
     html += "<input type='text' id='ssid' name='ssid' value='" + htmlEscape(ssid) + "' required>";
+    // Stored secrets never go into the page; empty = keep the stored one
     html += "<label for='password'>Password:</label>";
-    html += "<input type='password' id='password' name='password' value='" + htmlEscape(password) + "'>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
+            String(password.length() > 0 ? "(unchanged)" : "(open network)") + "'>";
     html += "<label for='timezone'>Timezone:</label>";
     html += "<select id='timezone' name='timezone'>";
 
@@ -640,7 +531,8 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     // Password
     html += "<div class='form-group'>";
     html += "<label for='password'>Password (optional):</label>";
-    html += "<input type='password' id='password' name='password' value='" + htmlEscape(password) + "'>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
+            String(password.length() > 0 ? "(unchanged)" : "") + "'>";
     html += "</div>";
 
     // Root prefix
@@ -691,6 +583,7 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
 #if defined(HAS_PWR_SRC)
     html += "<p><strong>Power source:</strong> " + String(powerSource->getName()) + "</p>";
 #endif
+    html += "<p><strong>Time:</strong> " + htmlEscape(uplink->getTimeStatus()) + "</p>";
 #if defined(HAS_ETHERNET)
     html += "<p><strong>Ethernet:</strong> ";
     if (uplink->getEthernetIP())
@@ -797,7 +690,12 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
     html += "</div>";
     html += "<div class='form-group'>";
     html += "<label for='pin'>SIM PIN (optional):</label>";
-    html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]{4,8}' value='" + htmlEscape(config.ltePin) + "'>";
+    html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]{4,8}' autocomplete='off' placeholder='" +
+            String(config.ltePin.length() > 0 ? "(unchanged)" : "") + "'>";
+    if (config.ltePin.length() > 0)
+    {
+        html += "<label><input type='checkbox' name='clearPin' value='1'> Remove the stored PIN</label>";
+    }
     html += "</div>";
     html += "<input type='submit' value='Save and Restart'>";
     html += "</form></div>";
@@ -1364,7 +1262,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Device key
     html += "<label for='deviceKey'>Device Key:</label>";
-    html += "<input type='text' id='deviceKey' name='deviceKey' value='" + formatKey(sensor.deviceKey) + "' required>";
+    html += "<input type='text' id='deviceKey' name='deviceKey' placeholder='(unchanged)'>";
 
     // New code with a single field
     html += "<label for='customUrl'>Custom URL with Placeholders (Optional):</label>";
@@ -1584,7 +1482,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 }
 
 // Generating logs page
-String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, LogLevel currentLevel)
+String HTMLGenerator::generateLogsPage(LogLevel currentLevel)
 {
     String html;
     html.reserve(8192);
@@ -1621,55 +1519,36 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
     html += "<h2>System Logs</h2>";
     html += "<div class='log-container'>";
 
-    // Using optimized method for log generation
-    if (htmlBuffer != nullptr)
+    size_t count = Logger::forEachNewestFirst([&html](const LogEntry &entry)
     {
-        memset(htmlBuffer, 0, htmlBufferSize);
-        size_t maxLen = htmlBufferSize;
-        generateLogTable(htmlBuffer, maxLen, logs, logCount);
-        html += htmlBuffer;
-    }
-    else
+        const char *logClass = "log-info";
+        switch (entry.level)
+        {
+        case LogLevel::ERROR:
+            logClass = "log-error";
+            break;
+        case LogLevel::WARNING:
+            logClass = "log-warning";
+            break;
+        case LogLevel::DEBUG:
+            logClass = "log-debug";
+            break;
+        case LogLevel::VERBOSE:
+            logClass = "log-verbose";
+            break;
+        default:
+            break;
+        }
+        html += "<div class='log-entry ";
+        html += logClass;
+        html += "'>";
+        html += htmlEscape(entry.getFormattedLog());
+        html += "</div>";
+    });
+    if (count == 0)
     {
-        // Fallback if buffer is not available
-        if (logCount > 0)
-        {
-            for (size_t i = 0; i < logCount; i++)
-            {
-                size_t index = (logCount - 1 - i); // Display from newest
-                String logClass = "log-";
-
-                switch (logs[index].level)
-                {
-                case LogLevel::ERROR:
-                    logClass += "error";
-                    break;
-                case LogLevel::WARNING:
-                    logClass += "warning";
-                    break;
-                case LogLevel::INFO:
-                    logClass += "info";
-                    break;
-                case LogLevel::DEBUG:
-                    logClass += "debug";
-                    break;
-                case LogLevel::VERBOSE:
-                    logClass += "verbose";
-                    break;
-                default:
-                    logClass += "info";
-                    break;
-                }
-
-                html += "<div class='log-entry " + logClass + "'>" + htmlEscape(logs[index].getFormattedLog()) + "</div>";
-            }
-        }
-        else
-        {
-            html += "<div class='log-entry'>No logs to display</div>";
-        }
+        html += "<div class='log-entry'>No logs to display</div>";
     }
-
     html += "</div>"; // log-container
     html += "</div>"; // card
 
@@ -1681,65 +1560,6 @@ String HTMLGenerator::generateLogsPage(const LogEntry *logs, size_t logCount, Lo
 
     return html;
 }
-// Generating log table
-// In HTMLGenerator.cpp
-void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const LogEntry *logs, size_t logCount)
-{
-    size_t contentLen = 0;
-
-    if (logCount > 0)
-    {
-        // Loop through from newest to oldest
-        for (size_t i = 0; i < logCount; i++)
-        {
-            // Calculate correct index in the circular buffer
-            // This is critical to display logs correctly
-            size_t logIdx = (Logger::getLogIndex() - 1 - i + Logger::getLogBufferSize()) % Logger::getLogBufferSize();
-
-            const char *logClass = "";
-            switch (logs[logIdx].level)
-            {
-            case LogLevel::ERROR:
-                logClass = "log-error";
-                break;
-            case LogLevel::WARNING:
-                logClass = "log-warning";
-                break;
-            case LogLevel::INFO:
-                logClass = "log-info";
-                break;
-            case LogLevel::DEBUG:
-                logClass = "log-debug";
-                break;
-            case LogLevel::VERBOSE:
-                logClass = "log-verbose";
-                break;
-            default:
-                logClass = "log-info";
-                break;
-            }
-
-            contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                   "<div class='log-entry %s'>%s</div>",
-                                   logClass,
-                                   htmlEscape(logs[logIdx].getFormattedLog()).c_str());
-
-            // Safety check to avoid buffer overflow
-            if (contentLen >= maxLen - 100)
-            {
-                contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                                       "<div class='log-entry log-warning'>Log output truncated due to buffer size limitations</div>");
-                break;
-            }
-        }
-    }
-    else
-    {
-        contentLen += snprintf(buffer + contentLen, maxLen - contentLen,
-                               "<div class='log-entry'>No logs to display</div>");
-    }
-}
-
 // Generating JSON for API
 String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
 {
@@ -1754,7 +1574,7 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
 
     // Current time
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
+    if (getLocalTime(&timeinfo, 0))
     {
         char timeStr[64];
         strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);

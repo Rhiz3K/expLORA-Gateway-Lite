@@ -82,6 +82,14 @@ public:
     // Interface carrying traffic and its address
     Type getActive() const { return active; }
     const char *getActiveName() const;
+
+    // Time: valid once synced; stale when the last sync is older than
+    // TIME_STALE_AFTER_S (the clock keeps running meanwhile)
+    bool isTimeValid() const;
+    time_t getLastTimeSync() const { return lastTimeSync; }
+    bool isTimeStale() const;
+    // "2026-10-17 10:15:00 (synced 5 min ago)" or "not synchronized"
+    String getTimeStatus() const;
     IPAddress getLocalIP() const;
 
     // Access point
@@ -126,6 +134,7 @@ private:
     unsigned long reconnectStartedAt = 0;
 
     static volatile bool timeSyncedFlag;
+    static volatile time_t lastTimeSync; // wall clock of the last successful SNTP sync
     bool timeSyncLogged = false;
 
     std::function<void(bool)> captiveCallback;

@@ -36,17 +36,6 @@
 class HTMLGenerator
 {
 private:
-    // Buffer for generating HTML content
-    static char *htmlBuffer;
-    static size_t htmlBufferSize;
-    static bool usePSRAM;
-
-    // Buffer initialization
-    static bool initBuffer();
-
-    // Free buffer
-    static void freeBuffer();
-
 
     // Add HTML opening code
     static void addHtmlHeader(String &html, const String &title, bool isAPMode = false);
@@ -66,12 +55,6 @@ private:
 public:
     // Escape text for HTML content and quoted attributes
     static String htmlEscape(const String &text);
-
-    // Initialize generator
-    static bool init(bool usePsram = true, size_t bufferSize = 32768);
-
-    // Free resources
-    static void deinit();
 
     // Generate home page
     static String generateHomePage(const std::vector<SensorData> &sensors);
@@ -98,7 +81,7 @@ public:
     static String generateSensorEditPage(const SensorData &sensor, int index);
 
     // Generate logs page
-    static String generateLogsPage(const LogEntry *logs, size_t logCount, LogLevel currentLevel);
+    static String generateLogsPage(LogLevel currentLevel);
 
     // Generate API page
     static String generateAPIPage(const std::vector<SensorData> &sensors);
@@ -110,8 +93,6 @@ public:
     static String generateFirmwarePage();
 
     // Optimized versions using buffer
-    static void generateSensorTable(char *buffer, size_t &maxLen, const std::vector<SensorData> &sensors);
-    static void generateLogTable(char *buffer, size_t &maxLen, const LogEntry *logs, size_t logCount);
 
     // Additional helper methods
     static String getWifiNetworkOptions(const String &currentSSID);
