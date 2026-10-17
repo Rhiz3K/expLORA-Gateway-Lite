@@ -146,6 +146,9 @@ bool LoRaProtocol::processPacketByType(SensorType type, uint8_t *data, uint8_t l
     case SensorType::DIY_TEMP: 
         return processDIYTempPacket(data, len, sensorIndex, rssi);
 
+    case SensorType::SHT40:
+        return processSHT40Packet(data, len, sensorIndex, rssi);
+
     default:
         logger.warning("Unknown device type: 0x" + String(static_cast<uint8_t>(type), HEX));
         return false;
@@ -180,6 +183,38 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
         logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
                     String(sensor->humidity, 2) + "%, Press: " + String(sensor->pressure, 2) + " hPa, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
+    }
+
+    return result;
+}
+
+// Process packet from SHT40 sensor
+bool LoRaProtocol::processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
+{
+    SensorParsers::CommonHeader header;
+    SensorParsers::SHT40Data    payload;
+    if (!SensorParsers::parseCommonHeader(data, len, header) ||
+        !SensorParsers::parseSHT40(data, len, payload))
+    {
+        logger.warning("Packet too short for SHT40");
+        return false;
+    }
+
+    SensorData *sensor = sensorManager.getSensor(sensorIndex);
+    if (!sensor)
+    {
+        logger.error("Error accessing sensor data at index " + String(sensorIndex));
+        return false;
+    }
+
+    bool result = sensorManager.updateSensorData(sensorIndex,
+                                                 payload.temperature, payload.humidity, 0.0f,
+                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
+
+    if (result)
+    {
+        logger.info(sensor->name + " data updated - Temp: " + String(sensor->temperature, 2) + "°C, Hum: " +
+                    String(sensor->humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
     }
 
     return result;

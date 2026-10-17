@@ -40,6 +40,7 @@ enum class SensorType : uint8_t
     SCD40 = SENSOR_TYPE_SCD40,         // Temperature, humidity, CO2
     VEML7700 = SENSOR_TYPE_VEML7700,   // Light sensor (LUX)
     METEO = SENSOR_TYPE_METEO,         // Meteorological station
+    SHT40 = SENSOR_TYPE_SHT40,         // Temperature, humidity
     DIY_TEMP = SENSOR_TYPE_DIY_TEMP,   // Temperature sensor (DS18B20)
     // Add more sensor types here...
 };
@@ -70,6 +71,7 @@ const SensorTypeInfo SENSOR_TYPE_DEFINITIONS[] = {
     {SensorType::BME280,    "CLIMA",  6, 7, true,  true,  true,  false, false, false, false, false, false},
     {SensorType::SCD40,    "CARBON",  6, 7, true,  true,  false,  true, false, false, false, false, false},
     {SensorType::METEO,     "METEO", 14, 7, true,  true,  true,  false, false,  true,  true,  true,  true},
+    {SensorType::SHT40,     "SHT40",  4, 7, true,  true,  false, false, false, false, false, false, false},
     //{SensorType::VEML7700,  "VEML7700",     4,     7,    false, false, false, false, true,  false, false, false, false},
     {SensorType::DIY_TEMP, "DIY_TEMP",     2,     7,    true,  false, false, false, false, false, false, false, false},
 

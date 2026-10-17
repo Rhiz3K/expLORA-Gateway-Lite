@@ -1211,8 +1211,8 @@ String HTMLGenerator::generateSensorAddPage()
     html += "    console.log('Selected device type:', type);";
 
     // Define which devices have which capabilities
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1241,8 +1241,8 @@ String HTMLGenerator::generateSensorAddPage()
     html += "    console.log('Selected device type:', type);"; // Debugging
 
     // Device type definitions for individual placeholders
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1517,8 +1517,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "    console.log('Selected device type:', type);";
 
     // Define which devices have which capabilities
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1548,8 +1548,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "    console.log('Selected device type:', type);"; // Debugging
 
     // Device type definitions for individual placeholders
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700

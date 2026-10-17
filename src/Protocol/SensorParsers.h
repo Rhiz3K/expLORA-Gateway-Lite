@@ -117,6 +117,25 @@ inline bool parseSCD40(const uint8_t *data, uint8_t len, SCD40Data &out)
 }
 
 // ---------------------------------------------------------------------------
+// SHT40 — temperature, humidity
+// ---------------------------------------------------------------------------
+
+struct SHT40Data
+{
+    float temperature; // °C (raw int16 / 100)
+    float humidity;    // %  (raw uint16 / 100)
+};
+
+// Minimum bytes to parse: 12 (indices 0..11).
+inline bool parseSHT40(const uint8_t *data, uint8_t len, SHT40Data &out)
+{
+    if (len < 12) return false;
+    out.temperature = readI16BE(data, 8)  / 100.0f;
+    out.humidity    = readU16BE(data, 10) / 100.0f;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // DIY temperature sensor — temperature only
 // ---------------------------------------------------------------------------
 

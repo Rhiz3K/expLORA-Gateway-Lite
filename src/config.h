@@ -118,6 +118,7 @@ inline String makeApName()
 #define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2
 #define SENSOR_TYPE_METEO    0x03  // Meteorological station
 #define SENSOR_TYPE_VEML7700 0x04  // Light sensor (LUX)
+#define SENSOR_TYPE_SHT40    0x05  // Temperature, humidity
 #define SENSOR_TYPE_DIY_TEMP 0x51  // Temperature
 // Add additional sensor types here...
 
