@@ -25,6 +25,7 @@
 #include <vector>
 #include "../Data/SensorData.h"
 #include "../Data/Logging.h"
+#include "../Storage/ConfigManager.h"
 
 /**
  * Class for generating HTML content
@@ -79,6 +80,11 @@ public:
                                     const String &prefix, bool haEnabled, String &haPrefix);
 
     // Generate sensor list page
+#if defined(HAS_ETHERNET)
+    // Generating network page (interface status)
+    static String generateNetworkPage(const ConfigManager &config);
+#endif
+
     static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors);
 
     // Generate sensor add page

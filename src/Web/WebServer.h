@@ -56,7 +56,6 @@ private:
     Logger &logger;               // Reference to logger
 
     bool isAPMode; // AP mode (true) or client mode (false)
-    String apName; // AP name in AP mode
     bool routesRegistered = false; // Ensure routes are registered only once
     bool serverStarted = false;    // Track server begin/end state
 
@@ -72,12 +71,6 @@ private:
     String otaUploadErrorMsg = "";
     size_t otaUploadExpected = 0;
     size_t otaUploadWritten  = 0;
-
-    // Full AP (re)initialization with hard WiFi reset — only safe at boot.
-    void setupAP();
-
-    // Bring the AP up additively without disturbing an active STA. Idempotent.
-    void ensureAPUp();
 
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
@@ -114,6 +107,10 @@ private:
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);
     void handleAPI(AsyncWebServerRequest *request);
+#if defined(HAS_ETHERNET)
+    void handleNetwork(AsyncWebServerRequest *request);
+#endif
+    void handleDiagNetwork(AsyncWebServerRequest *request);
     void handleMqtt(AsyncWebServerRequest *request);
     void handleMqttPost(AsyncWebServerRequest *request);
     void handleFirmwareVersion(AsyncWebServerRequest *request);

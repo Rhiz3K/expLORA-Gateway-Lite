@@ -22,6 +22,7 @@
 #include "MQTTManager.h"
 #include <ArduinoJson.h>
 #include "config.h"
+#include "../Network/Uplink.h"
 
 // Constructor
 MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &log)
@@ -127,8 +128,8 @@ void MQTTManager::process()
         return;
     }
 
-    // Check connection to WiFi and MQTT broker
-    if (WiFi.status() == WL_CONNECTED)
+    // Check network connection and MQTT broker
+    if (uplink->isOnline())
     {
         if (!mqttClient.connected())
         {

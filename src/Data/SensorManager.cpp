@@ -25,6 +25,7 @@
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include "../Network/Uplink.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -424,7 +425,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
     sensors[index].rssi = rssi;
     sensors[index].lastSeen = millis();
 
-    if (WiFi.status() == WL_CONNECTED)
+    if (uplink->isOnline())
     {
         forwardSensorData(index);
     }

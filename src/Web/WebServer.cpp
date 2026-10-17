@@ -22,6 +22,7 @@
 #include "WebServer.h"
 #include "HTMLGenerator.h"
 #include <WiFi.h>
+#include "../Network/Uplink.h"
 #include <AsyncJson.h>
 #include <ArduinoJson.h>
 #include <esp_ota_ops.h>
@@ -61,15 +62,10 @@ bool WebPortal::init()
 {
     logger.info("Initializing web portal");
 
-    // Derive the same AP name used at boot (see makeApName() in config.h)
-    apName = makeApName();
-
-    // Set mode based on current configuration
-    isAPMode = configMode || (WiFi.status() != WL_CONNECTED);
-
-    if (isAPMode)
+    // Captive portal while the AP runs without local network access (see Uplink)
+    if (uplink->isCaptive())
     {
-        setupAP();
+        setAPMode(true);
     }
 
     // Setup routes (idempotent)
@@ -100,50 +96,6 @@ bool WebPortal::init()
     return true;
 }
 
-// AP mode initialization
-void WebPortal::setupAP()
-{
-    logger.info("Starting AP mode: " + apName);
-
-    // Full WiFi reset sequence (disconnect only if the station is running)
-    if (WiFi.getMode() & WIFI_STA)
-    {
-        WiFi.disconnect(true);
-    }
-    WiFi.mode(WIFI_OFF);
-    delay(200);
-
-    // AP configuration with optimized parameters
-    WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum power
-
-    // Set up AP mode with optimized settings
-    WiFi.mode(WIFI_AP);
-    logger.info("Setting up AP: " + apName);
-
-    // AP configuration: channel 6 (less crowded usually), max 4 clients
-    bool apStarted = WiFi.softAP(apName.c_str(), nullptr, 6, 0, 4);
-    delay(1000); // Give AP time to fully initialize
-
-    if (apStarted)
-    {
-        logger.info("AP setup successful");
-    }
-    else
-    {
-        logger.error("AP setup failed");
-    }
-
-    IPAddress apIP = WiFi.softAPIP();
-    logger.info("AP IP assigned: " + apIP.toString());
-
-    // Configure DNS server with custom TTL for faster responses
-    dnsServer.setTTL(30); // TTL in seconds (lower value = more responsive)
-    dnsServer.start(DNS_PORT, "*", apIP);
-    logger.info("DNS server started on port " + String(DNS_PORT));
-
-    isAPMode = true;
-}
-
 // Setup routes for web server
 // Modify WebPortal::setupRoutes() in WebServer.cpp
 void WebPortal::setupRoutes()
@@ -172,6 +124,11 @@ void WebPortal::setupRoutes()
     server.on("/logs/level", HTTP_POST, std::bind(&WebPortal::handleLogLevel, this, std::placeholders::_1));
     server.on("/logs", HTTP_GET, std::bind(&WebPortal::handleLogs, this, std::placeholders::_1));
 
+#if defined(HAS_ETHERNET)
+    // Network
+    server.on("/network", HTTP_GET, std::bind(&WebPortal::handleNetwork, this, std::placeholders::_1));
+#endif
+
     // MQTT
     server.on("/mqtt", HTTP_GET, std::bind(&WebPortal::handleMqtt, this, std::placeholders::_1));
     server.on("/mqtt", HTTP_POST, std::bind(&WebPortal::handleMqttPost, this, std::placeholders::_1));
@@ -181,6 +138,7 @@ void WebPortal::setupRoutes()
 
     // Diagnostics
     server.on("/diag/heap", HTTP_GET, std::bind(&WebPortal::handleDiagHeap, this, std::placeholders::_1));
+    server.on("/diag/network", HTTP_GET, std::bind(&WebPortal::handleDiagNetwork, this, std::placeholders::_1));
 
     // Firmware update endpoints
     server.on("/firmware/version", HTTP_GET, std::bind(&WebPortal::handleFirmwareVersion, this, std::placeholders::_1));
@@ -235,53 +193,7 @@ void WebPortal::processDNS()
     // called automatically in handleClient()
 }
 
-// Bring the AP up additively. Safe to call while STA is connected or trying
-// to connect — does NOT tear down WiFi the way setupAP() does. Idempotent.
-void WebPortal::ensureAPUp()
-{
-    wifi_mode_t curMode = WiFi.getMode();
-    bool needsApStart = false;
-
-    if (curMode == WIFI_OFF)
-    {
-        WiFi.mode(WIFI_AP);
-        needsApStart = true;
-    }
-    else if (curMode == WIFI_STA)
-    {
-        // Add AP capability without dropping STA
-        WiFi.mode(WIFI_AP_STA);
-        needsApStart = true;
-    }
-    else
-    {
-        // WIFI_AP or WIFI_AP_STA: AP capability present, but the AP may have
-        // been stopped (e.g. after WIFI_OFF + mode flip). softAPIP() returns
-        // 0.0.0.0 when the AP is not actually started.
-        if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0))
-        {
-            needsApStart = true;
-        }
-    }
-
-    if (needsApStart)
-    {
-        WiFi.setTxPower(WIFI_POWER_19_5dBm);
-        bool ok = WiFi.softAP(apName.c_str(), nullptr, 6, 0, 4);
-        delay(100);
-        if (ok)
-        {
-            logger.info("AP brought up additively: " + apName + " @ " + WiFi.softAPIP().toString());
-        }
-        else
-        {
-            logger.error("Failed to start AP additively: " + apName);
-        }
-    }
-}
-
-// Toggle the captive-portal UI/DNS layer. STA is intentionally left alone so
-// the auto-reconnect path keeps working during transient outages.
+// Toggle the captive-portal UI/DNS layer. The AP radio itself is managed by Uplink.
 void WebPortal::setAPMode(bool enable)
 {
     if (enable == isAPMode)
@@ -291,9 +203,7 @@ void WebPortal::setAPMode(bool enable)
 
     if (enable)
     {
-        ensureAPUp();
-
-        IPAddress apIP = WiFi.softAPIP();
+        IPAddress apIP = uplink->getApIP();
         if (apIP != IPAddress(0, 0, 0, 0))
         {
             dnsServer.setTTL(30);
@@ -308,8 +218,7 @@ void WebPortal::setAPMode(bool enable)
     }
     else
     {
-        // Stop captive portal DNS but leave the AP hardware alone. The actual
-        // teardown of the AP radio is handled by main.cpp (AP_TIMEOUT path).
+        // Stop captive portal DNS; the AP radio is handled by Uplink
         dnsServer.stop();
         isAPMode = false;
     }
@@ -377,7 +286,7 @@ void WebPortal::handleConfig(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /config");
 
-    String currentIP = isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+    String currentIP = isAPMode ? uplink->getApIP().toString() : uplink->getLocalIP().toString();
 
     // Generate HTML (use isAPMode to drive UI state)
     String html = HTMLGenerator::generateConfigPage(wifiSSID, wifiPassword, isAPMode, currentIP, timezone);
@@ -1087,7 +996,7 @@ void WebPortal::handleNotFound(AsyncWebServerRequest *request)
         // For Apple devices
         if (requestUrl == "/hotspot-detect.html" || requestUrl.indexOf("captive.apple.com") >= 0)
         {
-            request->redirect("http://" + WiFi.softAPIP().toString() + "/config");
+            request->redirect("http://" + uplink->getApIP().toString() + "/config");
             return;
         }
 
@@ -1095,7 +1004,7 @@ void WebPortal::handleNotFound(AsyncWebServerRequest *request)
         if (requestUrl == "/generate_204" || requestUrl == "/ncsi.txt" ||
             requestUrl.indexOf("detectportal.firefox.com") >= 0)
         {
-            request->redirect("http://" + WiFi.softAPIP().toString() + "/config");
+            request->redirect("http://" + uplink->getApIP().toString() + "/config");
             return;
         }
 
@@ -1136,10 +1045,41 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     res->print("\"psramFree\":"); res->print((unsigned long)psramFree); res->print(",");
     res->print("\"uptimeMs\":"); res->print((unsigned long)millis()); res->print(",");
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
-    res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false");
+    res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
+    res->print("\"uplink\":\""); res->print(uplink->getActiveName()); res->print("\",");
+    res->print("\"ip\":\""); res->print(uplink->getLocalIP().toString()); res->print("\"");
     res->print("}");
     request->send(res);
 }
+
+// Network state as JSON
+void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
+{
+    DynamicJsonDocument doc(1024);
+    doc["uplink"] = uplink->getActiveName();
+    doc["ip"] = uplink->getLocalIP().toString();
+    doc["ap"] = uplink->isApActive();
+    doc["captive"] = uplink->isCaptive();
+    JsonObject wifi = doc.createNestedObject("wifi");
+    wifi["connected"] = WiFi.STA.hasIP();
+    wifi["ip"] = WiFi.STA.localIP().toString();
+#if defined(HAS_ETHERNET)
+    JsonObject eth = doc.createNestedObject("ethernet");
+    eth["link"] = uplink->ethernetLinkUp();
+    eth["ip"] = uplink->getEthernetIP().toString();
+#endif
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+}
+
+#if defined(HAS_ETHERNET)
+void WebPortal::handleNetwork(AsyncWebServerRequest *request)
+{
+    if (guardAPOnly(request)) return;
+    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager));
+}
+#endif
 
 // Handle firmware version request
 void WebPortal::handleFirmwareVersion(AsyncWebServerRequest *request)

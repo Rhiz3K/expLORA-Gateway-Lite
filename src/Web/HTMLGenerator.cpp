@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <Arduino.h>
 #include <WiFi.h>
+#include "../Network/Uplink.h"
 #include "../config.h"
 
 // Initialization of static variables
@@ -301,6 +302,9 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
     html += "<a href='/' class='" + String(activePage == "Home" ? "active" : "") + "'>Home</a>";
     html += "<a href='/config' class='" + String(activePage == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
     html += "<a href='/sensors' class='" + String(activePage == "Sensors" ? "active" : "") + "'>Sensors</a>";
+#if defined(HAS_ETHERNET)
+    html += "<a href='/network' class='" + String(activePage == "Network" ? "active" : "") + "'>Network</a>";
+#endif
     html += "<a href='/mqtt' class='" + String(activePage == "MQTT" ? "active" : "") + "'>MQTT</a>";
     html += "<a href='/firmware' class='" + String(activePage == "Firmware" ? "active" : "") + "'>Firmware</a>";
     html += "<a href='/logs' class='" + String(activePage == "Logs" ? "active" : "") + "'>Logs</a>";
@@ -319,26 +323,40 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     html.reserve(4096);
 
     // Add header with reduced content
-    addHtmlHeader(html, "Home", WiFi.status() != WL_CONNECTED);
+    addHtmlHeader(html, "Home", uplink->isCaptive());
 
     // Status card
     html += "<div class='card'>";
     html += "<h2>System Status</h2>";
 
-    html += "<p><strong>Mode:</strong> " + String(WiFi.status() == WL_CONNECTED ? "Client" : "Access Point") + "</p>";
+    html += "<p><strong>Mode:</strong> " + String(uplink->isOnline() ? "Client" : "Access Point") + "</p>";
 
-    if (WiFi.status() == WL_CONNECTED)
+#if defined(HAS_ETHERNET)
+    if (uplink->ethernetLinkUp())
+    {
+        html += "<p><strong>Ethernet:</strong> Connected" +
+                String(uplink->getEthernetIP() ? ", " + uplink->getEthernetIP().toString() : String()) + "</p>";
+    }
+    else
+    {
+        html += "<p><strong>Ethernet:</strong> Disconnected</p>";
+    }
+#endif
+    if (WiFi.STA.connected())
     {
         html += "<p><strong>WiFi:</strong> Connected to " + WiFi.SSID() + "</p>";
-        html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
     }
     else
     {
         html += "<p><strong>WiFi:</strong> Disconnected</p>";
-        if (WiFi.getMode() == WIFI_AP)
-        {
-            html += "<p><strong>AP IP:</strong> " + WiFi.softAPIP().toString() + "</p>";
-        }
+    }
+    if (uplink->isOnline())
+    {
+        html += "<p><strong>IP:</strong> " + uplink->getLocalIP().toString() + " (" + uplink->getActiveName() + ")</p>";
+    }
+    if (uplink->isApActive())
+    {
+        html += "<p><strong>AP IP:</strong> " + uplink->getApIP().toString() + "</p>";
     }
 
     // Current time
@@ -411,7 +429,7 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     html += "<script>startAutoRefresh(60000);</script>"; // 60 seconds instead of 30
 
     // Add footer (hide update button in AP mode)
-    addHtmlFooter(html, WiFi.status() != WL_CONNECTED);
+    addHtmlFooter(html, uplink->isCaptive());
 
     return html;
 }
@@ -472,17 +490,17 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     if (configMode)
     {
         html += "<p><strong>Mode:</strong> Access Point</p>";
-        html += "<p><strong>AP Name:</strong> " + WiFi.softAPSSID() + "</p>";
-        html += "<p><strong>AP IP:</strong> " + WiFi.softAPIP().toString() + "</p>";
+        html += "<p><strong>AP Name:</strong> " + uplink->getApName() + "</p>";
+        html += "<p><strong>AP IP:</strong> " + uplink->getApIP().toString() + "</p>";
     }
     else
     {
         html += "<p><strong>Mode:</strong> Client</p>";
         html += "<p><strong>SSID:</strong> " + ssid + "</p>";
-        html += "<p><strong>Status:</strong> " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "</p>";
-        if (WiFi.status() == WL_CONNECTED)
+        html += "<p><strong>Status:</strong> " + String(WiFi.STA.connected() ? "Connected" : "Disconnected") + "</p>";
+        if (WiFi.STA.hasIP())
         {
-            html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
+            html += "<p><strong>IP:</strong> " + WiFi.STA.localIP().toString() + "</p>";
         }
     }
     html += "</div>";
@@ -609,6 +627,45 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     addHtmlFooter(html);
     return html;
 }
+
+#if defined(HAS_ETHERNET)
+String HTMLGenerator::generateNetworkPage(const ConfigManager &config)
+{
+    String html;
+    html.reserve(4096);
+
+    addHtmlHeader(html, "Network");
+
+    html += "<div class='card'>";
+    html += "<h2>Status</h2>";
+    html += "<p><strong>Active uplink:</strong> " + String(uplink->getActiveName());
+    if (uplink->isOnline())
+    {
+        html += ", " + uplink->getLocalIP().toString();
+    }
+    html += "</p>";
+    html += "<p>Priority: Ethernet, WiFi - the first one with an address carries traffic.</p>";
+#if defined(HAS_ETHERNET)
+    html += "<p><strong>Ethernet:</strong> ";
+    if (uplink->getEthernetIP())
+    {
+        html += "Connected, " + uplink->getEthernetIP().toString();
+    }
+    else
+    {
+        html += uplink->ethernetLinkUp() ? "Link up, waiting for DHCP" : "Disconnected";
+    }
+    html += "</p>";
+#endif
+    html += "<p><strong>WiFi:</strong> " +
+            String(WiFi.STA.hasIP() ? "Connected, " + WiFi.STA.localIP().toString() : String("Disconnected")) + "</p>";
+    html += "</div>";
+
+
+    addHtmlFooter(html);
+    return html;
+}
+#endif
 
 // Generating page with sensor list
 // Format milliseconds-since-event as a short relative string ("3 min ago",
@@ -1568,7 +1625,7 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
         doc["time"] = "Time not set";
     }
 
-    doc["status"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
+    doc["status"] = uplink->isOnline() ? "connected" : "disconnected";
 
     // Sensors array
     JsonArray sensorsArray = doc.createNestedArray("sensors");
