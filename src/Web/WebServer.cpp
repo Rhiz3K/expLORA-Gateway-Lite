@@ -23,6 +23,7 @@
 #include "HTMLGenerator.h"
 #include <WiFi.h>
 #include "../Network/Uplink.h"
+#include "../Hardware/PowerSource.h"
 #include <AsyncJson.h>
 #include <ArduinoJson.h>
 #include <esp_ota_ops.h>
@@ -31,7 +32,30 @@
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <esp_app_format.h>
 #include "../config.h"
+
+// Reject images built for another chip (Lite = ESP32-S3, Pro = ESP32) before
+// anything is written; the image header starts every application binary
+static bool firmwareImageMatches(const uint8_t *data, size_t len, String &error)
+{
+    if (len < sizeof(esp_image_header_t))
+    {
+        return true; // too short to tell, Update.end() still validates the image
+    }
+    const esp_image_header_t *header = (const esp_image_header_t *)data;
+    if (header->magic != ESP_IMAGE_HEADER_MAGIC)
+    {
+        error = "Not an ESP32 firmware image";
+        return false;
+    }
+    if (header->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID)
+    {
+        error = "Firmware is for a different board (" BOARD_NAME " expected)";
+        return false;
+    }
+    return true;
+}
 
 // Constructor
 WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &password,
@@ -1063,6 +1087,9 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     doc["ip"] = uplink->getLocalIP().toString();
     doc["ap"] = uplink->isApActive();
     doc["captive"] = uplink->isCaptive();
+#if defined(HAS_PWR_SRC)
+    doc["power"] = powerSource->getName();
+#endif
     JsonObject wifi = doc.createNestedObject("wifi");
     wifi["connected"] = WiFi.STA.hasIP();
     wifi["ip"] = WiFi.STA.localIP().toString();
@@ -1187,7 +1214,7 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request) {
     request->send(500, "application/json", "{\"error\":\"HTTP begin failed\"}");
     return;
   }
-  http.addHeader("User-Agent", "explora-gw-lite/" + String(FIRMWARE_VERSION));
+  http.addHeader("User-Agent", "expLORA-Gateway/" + String(FIRMWARE_VERSION));
 
   const int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
@@ -1254,6 +1281,16 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request) {
         delay(1);
         esp_task_wdt_reset();
         continue;
+      }
+
+      String imageError;
+      if (totalWritten == 0 && !firmwareImageMatches(buf, r, imageError)) {
+        logger.error("Aborting OTA: " + imageError);
+        Update.abort();
+        http.end();
+        delay(500);
+        ESP.restart();  // restart for clean state (FS will remount in setup)
+        return;
       }
 
       // Protection against slot overflow even with chunked transfer
@@ -1349,6 +1386,11 @@ void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
     {
         String msg = "{\"error\":\"" + otaUploadErrorMsg + "\"}";
         request->send(500, "application/json", msg);
+        // The upload unmounted the filesystem - bring it back
+        if (!LittleFS.begin(false))
+        {
+            logger.error("Failed to remount LittleFS after failed upload");
+        }
         // reset state for next attempts
         otaUploadHasError = false;
         otaUploadErrorMsg = "";
@@ -1420,6 +1462,16 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         {
             otaUploadHasError = true;
             otaUploadErrorMsg = "Data exceed OTA slot size";
+            return;
+        }
+
+        String imageError;
+        if (otaUploadWritten == 0 && !firmwareImageMatches(data, len, imageError))
+        {
+            Update.abort();
+            otaUploadHasError = true;
+            otaUploadErrorMsg = imageError;
+            logger.error("Firmware upload rejected: " + imageError);
             return;
         }
 

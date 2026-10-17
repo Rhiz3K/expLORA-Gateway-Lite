@@ -23,6 +23,11 @@
 #include <ArduinoJson.h>
 #include "config.h"
 #include "../Network/Uplink.h"
+#include "../Hardware/PowerSource.h"
+
+// Gateway state: checked for changes every 5 s, republished at least every 5 min
+static constexpr unsigned long GATEWAY_STATE_CHECK = 5000;
+static constexpr unsigned long GATEWAY_STATE_REFRESH = 300000;
 
 // Constructor
 MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &log)
@@ -40,6 +45,7 @@ MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &
             clientId += '0';
         clientId += String(mac[i], HEX);
     }
+    gatewayId = makeApName();
 }
 
 // Initialization
@@ -110,6 +116,7 @@ bool MQTTManager::connect()
         // Give HA time to subscribe this topic
         delay(500);
         mqttClient.publish(String(configManager.mqttPrefix + "/status").c_str(), "online", true);
+        publishGatewayState(true);
     }
     else
     {
@@ -148,6 +155,7 @@ void MQTTManager::process()
         {
             // Process MQTT loop
             mqttClient.loop();
+            publishGatewayState(false);
 
             // Republish discovery information periodically (every hour)
             unsigned long now = millis();
@@ -174,6 +182,8 @@ void MQTTManager::publishDiscovery()
     }
 
     logger.info("Publishing Home Assistant discovery information...");
+
+    publishGatewayDiscovery();
 
     // Get all active sensors
     std::vector<SensorData> sensors = sensorManager.getActiveSensors();
@@ -278,6 +288,105 @@ void MQTTManager::publishDiscovery()
 
     logger.info("Home Assistant discovery completed for " + String(sensors.size()) + " sensors");
     lastDiscoveryUpdate = millis();
+}
+
+String MQTTManager::gatewayTopic(const char *key) const
+{
+    return String(configManager.mqttPrefix) + "/gateway/" + key;
+}
+
+// One diagnostic sensor of the gateway device
+void MQTTManager::publishGatewayEntity(const char *key, const char *name, const char *deviceClass,
+                                       const char *unit, const char *icon)
+{
+    DynamicJsonDocument doc(768);
+    doc["name"] = name;
+    doc["state_topic"] = gatewayTopic(key);
+    doc["unique_id"] = String(configManager.mqttPrefix) + "_" + gatewayId + "_" + key;
+    doc["entity_category"] = "diagnostic";
+    doc["availability_topic"] = String(configManager.mqttPrefix) + "/status";
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    if (deviceClass)
+    {
+        doc["device_class"] = deviceClass;
+    }
+    if (unit)
+    {
+        doc["unit_of_measurement"] = unit;
+    }
+    if (icon)
+    {
+        doc["icon"] = icon;
+    }
+
+    JsonObject device = doc.createNestedObject("device");
+    device["identifiers"] = gatewayId;
+    device["name"] = gatewayId;
+    device["model"] = BOARD_NAME;
+    device["manufacturer"] = "expLORA";
+    device["sw_version"] = FIRMWARE_VERSION;
+
+    String payload;
+    serializeJson(doc, payload);
+    String topic = String(configManager.mqttHAPrefix) + "/sensor/" + String(configManager.mqttPrefix) + "_" +
+                   gatewayId + "_" + key + "/config";
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void MQTTManager::publishGatewayDiscovery()
+{
+    publishGatewayEntity("uplink", "Uplink", nullptr, nullptr, "mdi:lan-connect");
+    publishGatewayEntity("ip", "IP address", nullptr, nullptr, "mdi:ip-network");
+#if defined(HAS_PWR_SRC)
+    publishGatewayEntity("power_source", "Power source", nullptr, nullptr, "mdi:power-plug");
+#endif
+#if defined(HAS_LTE)
+    publishGatewayEntity("lte_signal", "LTE signal", "signal_strength", "dBm", nullptr);
+    publishGatewayEntity("lte_state", "LTE state", nullptr, nullptr, "mdi:signal-cellular-3");
+#endif
+}
+
+// Publish gateway state when it changed, or periodically
+void MQTTManager::publishGatewayState(bool force)
+{
+    unsigned long now = millis();
+    if (!force && now - lastGatewayCheck < GATEWAY_STATE_CHECK)
+    {
+        return;
+    }
+    lastGatewayCheck = now;
+
+    String uplinkName = uplink->getActiveName();
+    String ip = uplink->getLocalIP().toString();
+    String state = uplinkName + "|" + ip;
+#if defined(HAS_PWR_SRC)
+    String power = powerSource->getName();
+    state += "|" + power;
+#endif
+#if defined(HAS_LTE)
+    const LteModem &lte = uplink->getLte();
+    String lteSignal = lte.getRssiDbm() != 0 ? String(lte.getRssiDbm()) : String("unknown");
+    String lteState = lte.getStateName();
+    state += "|" + lteSignal + "|" + lteState;
+#endif
+
+    if (!force && state == lastGatewayState && now - lastGatewayPublish < GATEWAY_STATE_REFRESH)
+    {
+        return;
+    }
+    lastGatewayState = state;
+    lastGatewayPublish = now;
+
+    mqttClient.publish(gatewayTopic("uplink").c_str(), uplinkName.c_str(), true);
+    mqttClient.publish(gatewayTopic("ip").c_str(), ip.c_str(), true);
+#if defined(HAS_PWR_SRC)
+    mqttClient.publish(gatewayTopic("power_source").c_str(), power.c_str(), true);
+#endif
+#if defined(HAS_LTE)
+    mqttClient.publish(gatewayTopic("lte_signal").c_str(), lteSignal.c_str(), true);
+    mqttClient.publish(gatewayTopic("lte_state").c_str(), lteState.c_str(), true);
+#endif
 }
 
 // Create discovery topic for sensor

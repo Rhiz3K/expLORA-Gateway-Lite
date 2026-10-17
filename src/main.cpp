@@ -40,6 +40,7 @@
 #include "Hardware/LoRaRadio.h"
 #include "Network/Uplink.h"
 #include "Hardware/PSRAM_Manager.h"
+#include "Hardware/PowerSource.h"
 #include "Hardware/SPI_Manager.h"
 
 // Storage
@@ -64,6 +65,7 @@ SensorManager *sensorManager; // Sensor manager
 LoRaProtocol *loraProtocol;   // LoRa protocol
 MQTTManager *mqttManager;     // MQTT Manager
 WebPortal *webPortal;         // Web interface
+PowerSource *powerSource;     // Supply source (PoE / USB) on boards that detect it
 
 // Timer for disabling AP mode
 
@@ -184,6 +186,9 @@ void setup()
     // Setting logging level according to configuration
     logger.setLogLevel(configManager->logLevel);
 
+    powerSource = new PowerSource(logger);
+    powerSource->begin();
+
     // SPI manager initialization
     spiManager = new SPIManager(logger);
     if (!spiManager->init())
@@ -276,6 +281,7 @@ void loop()
 
     // Connectivity: station reconnect, AP / captive portal, time sync
     uplink->process();
+    powerSource->process();
 
     // Process LoRa packets
     // if (loraModule && loraProtocol) {

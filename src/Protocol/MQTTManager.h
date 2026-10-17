@@ -53,6 +53,12 @@ private:
     // MQTT flag representing if client is ready
     bool mqttClientReady = false;
 
+    // Gateway's own entities (uplink, power source, LTE signal)
+    String gatewayId;                   // Device identifier, same as the AP name
+    String lastGatewayState;            // Last published state, to publish on change
+    unsigned long lastGatewayCheck = 0;
+    unsigned long lastGatewayPublish = 0;
+
     // Connect to MQTT broker
     bool connect();
 
@@ -64,6 +70,13 @@ private:
 
     // Helper function to capitalize first letter
     String capitalizeFirst(const String &input);
+
+    // Gateway entities: discovery and state
+    String gatewayTopic(const char *key) const;
+    void publishGatewayEntity(const char *key, const char *name, const char *deviceClass,
+                              const char *unit, const char *icon);
+    void publishGatewayDiscovery();
+    void publishGatewayState(bool force);
 
 public:
     // Constructor

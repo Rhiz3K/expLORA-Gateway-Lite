@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <Arduino.h>
 #include <WiFi.h>
+#include "../Hardware/PowerSource.h"
 #include "../Network/Uplink.h"
 #include "../config.h"
 
@@ -648,6 +649,9 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config)
     }
     html += "</p>";
     html += "<p>Priority: Ethernet, WiFi, LTE - the first one with an address carries traffic.</p>";
+#if defined(HAS_PWR_SRC)
+    html += "<p><strong>Power source:</strong> " + String(powerSource->getName()) + "</p>";
+#endif
 #if defined(HAS_ETHERNET)
     html += "<p><strong>Ethernet:</strong> ";
     if (uplink->getEthernetIP())
