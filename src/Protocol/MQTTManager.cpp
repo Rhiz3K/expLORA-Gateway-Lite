@@ -366,9 +366,13 @@ void MQTTManager::publishGatewayState(bool force)
 #endif
 #if defined(HAS_LTE)
     const LteModem &lte = uplink->getLte();
-    String lteSignal = lte.getRssiDbm() != 0 ? String(lte.getRssiDbm()) : String("unknown");
+    int rssi = lte.getRssiDbm();
+    // "None" is Home Assistant's payload for an unknown numeric state
+    String lteSignal = rssi != 0 ? String(rssi) : String("None");
     String lteState = lte.getStateName();
-    state += "|" + lteSignal + "|" + lteState;
+    // Signal in 6 dB steps for change detection - CSQ jitters on every poll and
+    // each publish costs data on a metered LTE link
+    state += "|" + (rssi != 0 ? String(rssi / 6) : String("-")) + "|" + lteState;
 #endif
 
     if (!force && state == lastGatewayState && now - lastGatewayPublish < GATEWAY_STATE_REFRESH)

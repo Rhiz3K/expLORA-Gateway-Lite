@@ -79,6 +79,14 @@ public:
     String lteApn;   // Access point name
     String ltePin;   // SIM PIN (empty = none)
 
+    // Ethernet configuration (boards with HAS_ETHERNET; stored in Preferences only)
+    bool ethStatic;     // Static address instead of DHCP
+    String ethIp;       // Static address
+    String ethMask;     // Subnet mask
+    String ethGateway;  // Default gateway
+    String ethDns1;     // Primary DNS (empty = gateway)
+    String ethDns2;     // Secondary DNS (optional)
+
     // Constructor
     ConfigManager(Logger &log, const char *file = CONFIG_FILE);
 
@@ -120,6 +128,10 @@ public:
 
     // Set LTE configuration
     bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);
+
+    // Set ethernet addressing; returns an error message, empty on success
+    String setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
+                             const String &dns1, const String &dns2, bool saveConfig = true);
 
     // Set logging level
     void setLogLevel(LogLevel level, bool saveConfig = true);

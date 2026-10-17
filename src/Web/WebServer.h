@@ -107,10 +107,8 @@ private:
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);
     void handleAPI(AsyncWebServerRequest *request);
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     void handleNetwork(AsyncWebServerRequest *request);
-#endif
-#if defined(HAS_LTE)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     void handleNetworkPost(AsyncWebServerRequest *request);
 #endif
     void handleDiagNetwork(AsyncWebServerRequest *request);

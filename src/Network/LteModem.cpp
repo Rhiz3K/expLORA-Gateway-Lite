@@ -31,6 +31,9 @@
 static constexpr uint8_t LTE_UART = 2;
 static constexpr int LTE_BAUD = 115200;
 
+// SIM status after the modem answers AT (SIM init can take a few seconds)
+static constexpr unsigned long LTE_SIM_TIMEOUT = 20000;
+static constexpr unsigned long LTE_SIM_POLL = 1000;
 // The modem powers up on its own once +5V_LTE is switched on (PWRKEY is
 // held active by hardware); it answers AT after ~10-15 s
 static constexpr unsigned long LTE_BOOT_TIMEOUT = 40000;
@@ -46,10 +49,53 @@ static constexpr unsigned long LTE_POWER_DOWN_DELAY = 3000;
 // Retry back-off after a failure: 30 s, 60 s, ... up to 10 min
 static constexpr unsigned long LTE_RETRY_BASE = 30000;
 static constexpr unsigned long LTE_RETRY_MAX = 600000;
+static constexpr uint8_t LTE_MAX_FAILURES = 20;
+
+// Modem commands block for seconds (command timeouts, mode switches); keep the
+// loop task out of the task watchdog meanwhile
+namespace
+{
+class WatchdogPause
+{
+public:
+    WatchdogPause() : watched(esp_task_wdt_status(NULL) == ESP_OK)
+    {
+        if (watched)
+        {
+            esp_task_wdt_delete(NULL);
+        }
+    }
+    ~WatchdogPause()
+    {
+        if (watched)
+        {
+            esp_task_wdt_add(NULL);
+        }
+    }
+
+private:
+    bool watched;
+};
+}
 
 LteModem::LteModem(ConfigManager &cfg, Logger &log)
-    : config(cfg), logger(log)
+    : config(cfg), logger(log), textLock(xSemaphoreCreateMutex())
 {
+}
+
+String LteModem::readText(const String &field) const
+{
+    xSemaphoreTake(textLock, portMAX_DELAY);
+    String copy = field;
+    xSemaphoreGive(textLock);
+    return copy;
+}
+
+void LteModem::writeText(String &field, const String &value)
+{
+    xSemaphoreTake(textLock, portMAX_DELAY);
+    field = value;
+    xSemaphoreGive(textLock);
 }
 
 void LteModem::begin()
@@ -65,13 +111,6 @@ void LteModem::begin()
     if (!config.lteEnabled)
     {
         logger.info("LTE disabled in configuration");
-        setState(State::Disabled);
-        return;
-    }
-    if (config.lteApn.length() == 0)
-    {
-        logger.warning("LTE enabled but no APN configured - LTE stays off");
-        lastError = "No APN configured";
         setState(State::Disabled);
         return;
     }
@@ -97,11 +136,23 @@ void LteModem::process()
         if (probeAt(now))
         {
             logger.info("LTE modem responding after " + String(inState / 1000) + " s");
-            startPpp();
+            pinSent = false;
+            setState(State::SimCheck);
         }
         else if (inState > LTE_BOOT_TIMEOUT)
         {
             fail("Modem does not respond to AT");
+        }
+        break;
+
+    case State::SimCheck:
+        if (inState > LTE_SIM_TIMEOUT)
+        {
+            fail("SIM not ready (inserted?)");
+        }
+        else
+        {
+            checkSim(now);
         }
         break;
 
@@ -117,8 +168,13 @@ void LteModem::process()
         lastPoll = now;
         if (PPP.attached())
         {
+            WatchdogPause pause;
             refreshSignal();
-            operatorName = PPP.operatorName();
+            readOperator();
+            if (config.lteApn.length() == 0)
+            {
+                resolveApn();
+            }
             logger.info("LTE registered: " + operatorName + ", CSQ " + String(csq) +
                         " (" + String(getRssiDbm()) + " dBm), switching to data mode");
             setState(State::Connecting);
@@ -139,7 +195,7 @@ void LteModem::process()
         {
             logger.info("LTE connected, IP: " + PPP.localIP().toString());
             failures = 0;
-            lastError = "";
+            writeText(lastError, "");
             setState(State::Online);
             lastPoll = now;
         }
@@ -199,12 +255,79 @@ void LteModem::setState(State next)
 
 void LteModem::fail(const String &reason)
 {
-    failures++;
-    lastError = reason;
+    if (failures < LTE_MAX_FAILURES)
+    {
+        failures++;
+    }
+    writeText(lastError, reason);
     logger.warning("LTE: " + reason + ", powering off");
     stopPpp();
     powerOff();
     setState(State::PowerCycle);
+}
+
+// Not recoverable by retrying - stay off until the configuration changes
+void LteModem::disable(const String &reason)
+{
+    writeText(lastError, reason);
+    logger.error("LTE: " + reason + " - LTE stays off until the settings change");
+    stopPpp();
+    powerOff();
+    setState(State::Disabled);
+}
+
+// Raw AT: query the SIM, enter the PIN once if needed
+void LteModem::checkSim(unsigned long now)
+{
+    while (Serial2.available())
+    {
+        rxBuffer += (char)Serial2.read();
+        if (rxBuffer.length() > 256)
+        {
+            rxBuffer.remove(0, 128);
+        }
+    }
+
+    if (rxBuffer.indexOf("+CPIN: READY") >= 0)
+    {
+        startPpp();
+        return;
+    }
+    if (rxBuffer.indexOf("SIM PUK") >= 0)
+    {
+        disable("SIM is locked (PUK required)");
+        return;
+    }
+    if (rxBuffer.indexOf("SIM PIN") >= 0 && !pinSent)
+    {
+        if (config.ltePin.length() == 0)
+        {
+            disable("SIM requires a PIN");
+            return;
+        }
+        logger.info("LTE entering SIM PIN");
+        rxBuffer = "";
+        Serial2.print("AT+CPIN=\"" + config.ltePin + "\"\r");
+        pinSent = true;
+        lastPoll = now;
+        return;
+    }
+    if (pinSent && rxBuffer.indexOf("ERROR") >= 0)
+    {
+        disable("SIM PIN rejected (check it - attempts are limited)");
+        return;
+    }
+
+    // (Re)query; after the PIN give the SIM time to unlock first
+    if (now - lastPoll > (pinSent ? 3 * LTE_SIM_POLL : LTE_SIM_POLL))
+    {
+        lastPoll = now;
+        if (!pinSent || rxBuffer.indexOf("OK") >= 0)
+        {
+            rxBuffer = "";
+            Serial2.print("AT+CPIN?\r");
+        }
+    }
 }
 
 void LteModem::powerOn()
@@ -232,7 +355,7 @@ void LteModem::powerOff()
     pinMode(LTE_TX_PIN, INPUT);
     pinMode(LTE_RX_PIN, INPUT);
     csq = 99;
-    operatorName = "";
+    writeText(operatorName, "");
 }
 
 // Send AT once per interval on the raw UART, true when OK came back
@@ -259,10 +382,11 @@ bool LteModem::probeAt(unsigned long now)
     return false;
 }
 
-// Hand the UART to the PPP driver: SIM check, module info
+// Hand the UART to the PPP driver: module info, APN
 void LteModem::startPpp()
 {
     setState(State::Starting);
+    WatchdogPause pause;
 
     // Echo off for the driver's response parsing
     Serial2.print("ATE0\r");
@@ -271,27 +395,33 @@ void LteModem::startPpp()
     Serial2.end();
     atUartOpen = false;
 
+    // Empty APN: attach with the network's default, see resolveApn()
     PPP.setApn(config.lteApn.c_str());
-    PPP.setPin(config.ltePin.length() > 0 ? config.ltePin.c_str() : nullptr);
+    // The SIM is already unlocked (checkSim)
+    PPP.setPin(nullptr);
     PPP.setPins(LTE_TX_PIN, LTE_RX_PIN);
     if (!PPP.begin(PPP_MODEM_SIM7600, LTE_UART, LTE_BAUD))
     {
-        // begin() cleans up after itself
-        fail("PPP driver start failed (SIM / PIN?)");
+        // begin() cleans up after itself; reopen the raw UART so powerOff()
+        // can still shut the modem down with AT+CPOF
+        Serial2.begin(LTE_BAUD, SERIAL_8N1, LTE_RX_PIN, LTE_TX_PIN);
+        atUartOpen = true;
+        fail("PPP driver start failed");
         return;
     }
     pppStarted = true;
 
     // LTE attach already uses PDP context 1, so it must carry the configured
-    // APN before registration (the driver sets it only when entering data mode)
+    // APN before registration (the driver sets it only when entering data mode);
+    // an empty one also clears an APN left in the modem from earlier use
     String response;
     if (!PPP.cmd("AT+CGDCONT=1,\"IP\",\"" + config.lteApn + "\"", response, 3000))
     {
         logger.warning("LTE: setting APN failed: " + response);
     }
 
-    moduleName = PPP.moduleName();
-    imei = PPP.IMEI();
+    writeText(moduleName, PPP.moduleName());
+    writeText(imei, PPP.IMEI());
     logger.info("LTE modem " + moduleName + ", IMEI " + imei);
     setState(State::Registering);
 }
@@ -303,12 +433,8 @@ void LteModem::stopPpp()
         return;
     }
     // Modem commands and driver teardown can each take seconds (command
-    // timeouts, CMUX close) - keep the task watchdog out of it
-    bool watched = esp_task_wdt_status(NULL) == ESP_OK;
-    if (watched)
-    {
-        esp_task_wdt_delete(NULL);
-    }
+    // timeouts, CMUX close)
+    WatchdogPause pause;
 
     // AT+CPOF; works in command and CMUX mode
     if (PPP.mode() == ESP_MODEM_MODE_DATA || !PPP.powerDown())
@@ -318,11 +444,98 @@ void LteModem::stopPpp()
     delay(LTE_POWER_DOWN_DELAY);
     PPP.end();
     pppStarted = false;
+}
 
-    if (watched)
+// Some networks report only the numeric MCC+MNC
+static const char *operatorFromCode(const String &code)
+{
+    static const struct
     {
-        esp_task_wdt_add(NULL);
+        const char *code;
+        const char *name;
+    } known[] = {
+        {"23001", "T-Mobile CZ"},
+        {"23002", "O2 CZ"},
+        {"23003", "Vodafone CZ"},
+        {"23101", "Orange SK"},
+        {"23102", "Telekom SK"},
+        {"23103", "4ka"},
+        {"23106", "O2 SK"},
+    };
+    for (const auto &k : known)
+    {
+        if (code == k.code)
+        {
+            return k.name;
+        }
     }
+    return nullptr;
+}
+
+void LteModem::readOperator()
+{
+    // Long alphanumeric format for +COPS? (the modem may default to numeric)
+    String response;
+    PPP.cmd("AT+COPS=3,0", response, 3000);
+    String name = PPP.operatorName();
+    name.trim();
+
+    bool numeric = name.length() > 0;
+    for (size_t i = 0; i < name.length(); i++)
+    {
+        numeric = numeric && isDigit(name[i]);
+    }
+    if (numeric && operatorFromCode(name))
+    {
+        name = operatorFromCode(name);
+    }
+    writeText(operatorName, name);
+}
+
+// Automatic APN: read the one the network assigned to the default bearer
+// and use it for the data session
+void LteModem::resolveApn()
+{
+    String response;
+    String apn;
+    if (PPP.cmd("AT+CGCONTRDP=1", response, 3000))
+    {
+        // +CGCONTRDP: <cid>,<bearer>,"<apn>",...
+        int start = response.indexOf('"');
+        int end = start >= 0 ? response.indexOf('"', start + 1) : -1;
+        if (end > start)
+        {
+            apn = response.substring(start + 1, end);
+            // Drop the operator suffix (".mnc001.mcc230.gprs")
+            String lower = apn;
+            lower.toLowerCase();
+            int suffix = lower.indexOf(".mnc");
+            if (suffix > 0 && lower.indexOf(".mcc", suffix) > 0)
+            {
+                apn = apn.substring(0, suffix);
+            }
+        }
+    }
+    if (apn.length() > 0 && esp_modem_set_apn(PPP.handle(), apn.c_str()) == ESP_OK)
+    {
+        logger.info("LTE APN from network: " + apn);
+    }
+    else
+    {
+        apn = "";
+        logger.info("LTE APN not reported by the network, using its default");
+    }
+    writeText(detectedApn, apn);
+}
+
+String LteModem::getApn() const
+{
+    if (config.lteApn.length() > 0)
+    {
+        return config.lteApn;
+    }
+    String apn = readText(detectedApn);
+    return apn.length() > 0 ? apn + " (automatic)" : String("automatic");
 }
 
 void LteModem::refreshSignal()
@@ -357,6 +570,8 @@ const char *LteModem::getStateName() const
         return "off";
     case State::Booting:
         return "booting";
+    case State::SimCheck:
+        return "checking SIM";
     case State::Starting:
         return "starting";
     case State::Registering:

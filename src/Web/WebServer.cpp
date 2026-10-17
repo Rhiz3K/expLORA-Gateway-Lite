@@ -148,11 +148,9 @@ void WebPortal::setupRoutes()
     server.on("/logs/level", HTTP_POST, std::bind(&WebPortal::handleLogLevel, this, std::placeholders::_1));
     server.on("/logs", HTTP_GET, std::bind(&WebPortal::handleLogs, this, std::placeholders::_1));
 
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
-    // Network
+    // Network (WiFi settings post to /config, shared with the AP setup page)
     server.on("/network", HTTP_GET, std::bind(&WebPortal::handleNetwork, this, std::placeholders::_1));
-#endif
-#if defined(HAS_LTE)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     server.on("/network", HTTP_POST, std::bind(&WebPortal::handleNetworkPost, this, std::placeholders::_1));
 #endif
 
@@ -312,6 +310,13 @@ bool WebPortal::guardAPOnly(AsyncWebServerRequest *request)
 void WebPortal::handleConfig(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /config");
+
+    // Outside AP mode the WiFi settings live on the network page
+    if (!isAPMode)
+    {
+        request->redirect("/network");
+        return;
+    }
 
     String currentIP = isAPMode ? uplink->getApIP().toString() : uplink->getLocalIP().toString();
 
@@ -1097,6 +1102,7 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     JsonObject eth = doc.createNestedObject("ethernet");
     eth["link"] = uplink->ethernetLinkUp();
     eth["ip"] = uplink->getEthernetIP().toString();
+    eth["mode"] = configManager.ethStatic ? "static" : "dhcp";
 #endif
 #if defined(HAS_LTE)
     const LteModem &lte = uplink->getLte();
@@ -1106,6 +1112,7 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     l["csq"] = lte.getSignalQuality();
     l["rssi"] = lte.getRssiDbm();
     l["operator"] = lte.getOperator();
+    l["apn"] = lte.getApn();
     l["module"] = lte.getModuleName();
     l["error"] = lte.getLastError();
 #endif
@@ -1114,41 +1121,77 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     request->send(200, "application/json", out);
 }
 
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+// Also served in AP mode, so ethernet / LTE settings stay reachable from the
+// access point (e.g. LTE-only installs or a wrong static address)
 void WebPortal::handleNetwork(AsyncWebServerRequest *request)
 {
-    if (guardAPOnly(request)) return;
-    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager));
+    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager, wifiSSID, wifiPassword, timezone, isAPMode));
 }
-#endif
 
-#if defined(HAS_LTE)
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+// One form per section (hidden field "section"), both apply after a restart
 void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
 {
-    if (guardAPOnly(request)) return;
-    bool enabled = request->hasParam("lteEnabled", true);
-    String apn = request->hasParam("apn", true) ? request->getParam("apn", true)->value() : String();
-    String pin = request->hasParam("pin", true) ? request->getParam("pin", true)->value() : String();
-    apn.trim();
-    pin.trim();
-    if (enabled && apn.length() == 0)
+    auto param = [request](const char *name)
     {
-        request->send(400, "text/plain", "APN is required when LTE is enabled");
+        String value = request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
+        value.trim();
+        return value;
+    };
+    String section = param("section");
+
+    if (false)
+    {
+    }
+#if defined(HAS_ETHERNET)
+    else if (section == "ethernet")
+    {
+        bool useStatic = param("ethMode") == "static";
+        String error = configManager.setEthernetConfig(useStatic, param("ip"), param("mask"), param("gateway"),
+                                                       param("dns1"), param("dns2"));
+        if (error.length() > 0)
+        {
+            request->send(400, "text/plain", error);
+            return;
+        }
+        logger.info("Ethernet configuration updated - " +
+                    String(useStatic ? "static " + configManager.ethIp : String("DHCP")));
+    }
+#endif
+#if defined(HAS_LTE)
+    else if (section == "lte")
+    {
+        bool enabled = request->hasParam("lteEnabled", true);
+        String apn = param("apn");
+        String pin = param("pin");
+        if (!configManager.setLteConfig(enabled, apn, pin))
+        {
+            request->send(400, "text/plain", "Invalid LTE settings (PIN 4-8 digits, APN max 63 characters: letters, digits, . - _)");
+            return;
+        }
+        logger.info("LTE configuration updated - enabled: " + String(enabled ? "yes" : "no") +
+                    ", APN: " + (apn.length() > 0 ? apn : String("automatic")));
+    }
+#endif
+    else
+    {
+        request->send(400, "text/plain", "Unknown settings section");
         return;
     }
-    if (!configManager.setLteConfig(enabled, apn, pin))
-    {
-        request->send(400, "text/plain", "Invalid LTE settings (PIN digits only, APN max 63 characters)");
-        return;
-    }
-    logger.info("LTE configuration updated - enabled: " + String(enabled ? "yes" : "no") + ", APN: " + apn);
 
     String html = "<!DOCTYPE html><html><head>";
     html += "<meta http-equiv='refresh' content='15;url=/network'>";
     html += "<title>Settings Saved</title></head>";
     html += "<body><h1>Settings Saved</h1>";
-    html += "<p>The device will restart in a few seconds.</p>";
-    html += "</body></html>";
+    html += "<p>The device will restart in a few seconds.";
+#if defined(HAS_ETHERNET)
+    if (section == "ethernet" && configManager.ethStatic)
+    {
+        String ip = HTMLGenerator::htmlEscape(configManager.ethIp);
+        html += " Ethernet address: <a href='http://" + ip + "/network'>" + ip + "</a>";
+    }
+#endif
+    html += "</p></body></html>";
     request->send(200, "text/html", html);
     // Deferred, see handleClient()
     restartAt = millis() + 1500;

@@ -270,6 +270,13 @@ bool ConfigManager::loadFromPreferences()
     lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
     ltePin = preferences.getString("ltePin", "");
 
+    ethStatic = preferences.getBool("ethStatic", false);
+    ethIp = preferences.getString("ethIp", "");
+    ethMask = preferences.getString("ethMask", "");
+    ethGateway = preferences.getString("ethGateway", "");
+    ethDns1 = preferences.getString("ethDns1", "");
+    ethDns2 = preferences.getString("ethDns2", "");
+
     // Other values should be loaded from LittleFS, but if needed,
     // we can load them from Preferences as a backup solution
     if (wifiSSID.length() == 0 && preferences.isKey("ssid"))
@@ -310,6 +317,13 @@ bool ConfigManager::saveToPreferences()
     preferences.putString("lteApn", lteApn);
     preferences.putString("ltePin", ltePin);
 
+    preferences.putBool("ethStatic", ethStatic);
+    preferences.putString("ethIp", ethIp);
+    preferences.putString("ethMask", ethMask);
+    preferences.putString("ethGateway", ethGateway);
+    preferences.putString("ethDns1", ethDns1);
+    preferences.putString("ethDns2", ethDns2);
+
     // Save WiFi configuration (as backup)
     preferences.putString("ssid", wifiSSID);
     preferences.putString("password", wifiPassword);
@@ -321,18 +335,31 @@ bool ConfigManager::saveToPreferences()
 // Add a new method to set MQTT configuration
 bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
 {
-    for (size_t i = 0; i < pin.length(); i++)
+    // PIN: empty or 4-8 digits
+    bool pinOk = pin.length() == 0 || (pin.length() >= 4 && pin.length() <= 8);
+    for (size_t i = 0; pinOk && i < pin.length(); i++)
     {
-        if (!isDigit(pin[i]))
-        {
-            logger.error("Invalid SIM PIN - digits only");
-            return false;
-        }
+        pinOk = isDigit(pin[i]);
     }
+    if (!pinOk)
+    {
+        logger.error("Invalid SIM PIN - 4 to 8 digits");
+        return false;
+    }
+    // APN: letters, digits, '.', '-' and '_' (it goes into an AT command)
     if (apn.length() > 63)
     {
         logger.error("APN too long");
         return false;
+    }
+    for (size_t i = 0; i < apn.length(); i++)
+    {
+        char c = apn[i];
+        if (!isAlphaNumeric(c) && c != '.' && c != '-' && c != '_')
+        {
+            logger.error("Invalid APN character");
+            return false;
+        }
     }
 
     lteEnabled = enabled;
@@ -344,6 +371,99 @@ bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &
         return save();
     }
     return true;
+}
+
+// Contiguous netmask, at least /1 and at most /30
+static bool isValidNetmask(const IPAddress &mask)
+{
+    uint32_t m = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) | ((uint32_t)mask[2] << 8) | mask[3];
+    uint32_t inverted = ~m;
+    return m != 0 && (inverted & (inverted + 1)) == 0 && inverted >= 3;
+}
+
+// Dotted IPv4 only (fromString() also accepts IPv6); empty input gives ""
+static bool parseIPv4(const String &text, String &normalized)
+{
+    IPAddress addr;
+    normalized = "";
+    if (text.length() == 0)
+    {
+        return true;
+    }
+    if (!addr.fromString(text) || addr.type() != IPv4 || addr == IPAddress())
+    {
+        return false;
+    }
+    normalized = addr.toString();
+    return true;
+}
+
+String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
+                                        const String &dns1, const String &dns2, bool saveConfig)
+{
+    String nIp, nMask, nGateway, nDns1, nDns2;
+    bool ipOk = parseIPv4(ip, nIp);
+    bool maskOk = parseIPv4(mask, nMask);
+    bool gatewayOk = parseIPv4(gateway, nGateway);
+    bool dns1Ok = parseIPv4(dns1, nDns1);
+    bool dns2Ok = parseIPv4(dns2, nDns2);
+
+    if (useStatic)
+    {
+        IPAddress a, m, g;
+        if (!ipOk || nIp.length() == 0)
+        {
+            return "Invalid IP address";
+        }
+        m.fromString(nMask);
+        if (!maskOk || nMask.length() == 0 || !isValidNetmask(m))
+        {
+            return "Invalid subnet mask";
+        }
+        if (!gatewayOk || nGateway.length() == 0)
+        {
+            return "Invalid gateway";
+        }
+        a.fromString(nIp);
+        g.fromString(nGateway);
+        for (int i = 0; i < 4; i++)
+        {
+            if ((a[i] & m[i]) != (g[i] & m[i]))
+            {
+                return "Gateway is not in the same subnet as the IP address";
+            }
+        }
+        if (a == g)
+        {
+            return "IP address and gateway must differ";
+        }
+        if (!dns1Ok)
+        {
+            return "Invalid primary DNS";
+        }
+        if (!dns2Ok)
+        {
+            return "Invalid secondary DNS";
+        }
+    }
+
+    ethStatic = useStatic;
+    // With DHCP the form fields are disabled and not sent; keep the stored
+    // addresses so switching back is easy, but never store invalid text
+    if (useStatic || ip.length() > 0)
+    {
+        ethIp = ipOk ? nIp : "";
+        ethMask = maskOk ? nMask : "";
+        ethGateway = gatewayOk ? nGateway : "";
+        ethDns1 = dns1Ok ? nDns1 : "";
+        ethDns2 = dns2Ok ? nDns2 : "";
+    }
+
+    if (saveConfig && !save())
+    {
+        return "Saving configuration failed";
+    }
+    return "";
 }
 
 bool ConfigManager::setMqttConfig(const String &host, int port, const String &user,
@@ -431,6 +551,12 @@ void ConfigManager::resetToDefaults()
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";
+    ethStatic = false;
+    ethIp = "";
+    ethMask = "";
+    ethGateway = "";
+    ethDns1 = "";
+    ethDns2 = "";
     mqttHAPrefix = HA_DISCOVERY_DEFAULT_PREFIX;
 }
 

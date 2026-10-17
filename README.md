@@ -114,16 +114,24 @@ gateway reaches the local network.
 The Pro board can use three uplinks. The first one that has an IP address carries
 the traffic:
 
-1. **Ethernet** - DHCP, plug in a cable (PoE powers the board as well)
-2. **WiFi** - configured on the WiFi Setup page
-3. **LTE** - needs the A7682E carrier and a SIM card; enable it on the Network
-   page and enter the APN (and the SIM PIN, if the card has one)
+1. **Ethernet** - plug in a cable (PoE powers the board as well); DHCP by
+   default, a static address can be set on the Network page
+2. **WiFi** - configured on the Network page
+3. **LTE** - needs the A7682E module and a SIM card. LTE is disabled by
+   default; enable it on the Network page. The APN is detected from the network
+   when left empty - set it only if the operator requires a specific one. Enter
+   the SIM PIN if the card has one
 
 All configured uplinks stay connected, so switching takes only a moment when a
 cable is unplugged or WiFi drops. The LTE connection is used only when neither
 Ethernet nor WiFi is available. The access point and captive portal come back
 when the gateway loses its local network (Ethernet and WiFi), so it can always
-be reached for configuration.
+be reached for configuration; the Network page is available on the access point
+too (http://192.168.4.1/network).
+
+If a wrong static Ethernet address makes the gateway unreachable, restart it:
+the access point runs for 5 minutes after boot, so the address can be fixed on
+its Network page.
 
 The Network page and `/diag/network` (JSON) show the state of each interface,
 the LTE operator and signal, and the power source (PoE or USB).

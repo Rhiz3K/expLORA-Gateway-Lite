@@ -102,7 +102,7 @@ inline String makeApName()
 
 // LTE defaults (boards with HAS_LTE)
 #define LTE_DEFAULT_ENABLED false
-#define LTE_DEFAULT_APN "internet"
+#define LTE_DEFAULT_APN "" // empty = APN assigned by the network
 
 // CORS headers for API
 #define CORS_HEADER_NAME "Access-Control-Allow-Origin"

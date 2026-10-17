@@ -32,9 +32,12 @@
  * LTE modem (SIMCom A7682E) driven through the core's PPP interface
  *
  * Non-blocking state machine, call process() from loop():
- *   Off -> Booting (power on, wait for AT) -> Starting (PPP driver, SIM)
- *   -> Registering (wait for network) -> Connecting (CMUX, PPP) -> Online
- * Failures end in PowerCycle (AT+CPOF, power off, retry later).
+ *   Off -> Booting (power on, wait for AT) -> SimCheck (SIM / PIN)
+ *   -> Starting (PPP driver) -> Registering (wait for network)
+ *   -> Connecting (CMUX, PPP) -> Online
+ * Failures end in PowerCycle (AT+CPOF, power off, retry later). SIM problems
+ * that a retry cannot fix (PIN rejected or missing, PUK lock) end in
+ * Disabled until the configuration changes, so a wrong PIN is tried once.
  *
  * The PPP netif keeps its default route priority (20), below ethernet and
  * WiFi, so the session is a hot standby used only when nothing else is up.
@@ -47,6 +50,7 @@ public:
         Disabled,
         Off,
         Booting,
+        SimCheck,
         Starting,
         Registering,
         Connecting,
@@ -67,10 +71,13 @@ public:
     // Cached diagnostics, refreshed while registered
     int getSignalQuality() const { return csq; } // 0..31, 99 = unknown
     int getRssiDbm() const;                      // 0 = unknown
-    const String &getOperator() const { return operatorName; }
-    const String &getModuleName() const { return moduleName; }
-    const String &getImei() const { return imei; }
-    const String &getLastError() const { return lastError; }
+    // Copies: the strings are rewritten by the loop task while web handlers
+    // read them from the async server task
+    String getOperator() const { return readText(operatorName); }
+    String getModuleName() const { return readText(moduleName); }
+    String getImei() const { return readText(imei); }
+    String getLastError() const { return readText(lastError); }
+    String getApn() const; // configured, or the one detected from the network
 
 private:
     ConfigManager &config;
@@ -81,6 +88,7 @@ private:
     unsigned long lastPoll = 0;
     uint8_t failures = 0;
     bool pppStarted = false;
+    bool pinSent = false;
     bool atUartOpen = false; // raw AT access before the PPP driver owns the UART
     String rxBuffer;
 
@@ -89,15 +97,24 @@ private:
     String moduleName;
     String imei;
     String lastError;
+    String detectedApn;
+    SemaphoreHandle_t textLock;
+
+    String readText(const String &field) const;
+    void writeText(String &field, const String &value);
 
     void setState(State next);
     void fail(const String &reason);
+    void disable(const String &reason);
+    void checkSim(unsigned long now);
     void powerOn();
     void powerOff();
     bool probeAt(unsigned long now);
     void startPpp();
     void stopPpp();
     void refreshSignal();
+    void readOperator();
+    void resolveApn();
 };
 
 #endif

@@ -457,6 +457,28 @@ void Uplink::startEthernet()
     }
     ETH.setRoutePrio(ETH_ROUTE_PRIO);
     ethernetStarted = true;
+
+    if (config.ethStatic)
+    {
+        IPAddress ip, mask, gateway, dns1, dns2;
+        ip.fromString(config.ethIp);
+        mask.fromString(config.ethMask);
+        gateway.fromString(config.ethGateway);
+        if (!dns1.fromString(config.ethDns1))
+        {
+            dns1 = gateway;
+        }
+        dns2.fromString(config.ethDns2);
+        if (ETH.config(ip, gateway, mask, dns1, dns2))
+        {
+            logger.info("Ethernet static address " + ip.toString() + ", gateway " + gateway.toString() +
+                        ", DNS " + dns1.toString());
+        }
+        else
+        {
+            logger.error("Ethernet static address configuration failed, using DHCP");
+        }
+    }
     logger.info("Ethernet started, waiting for link");
 #endif
 }
@@ -489,7 +511,9 @@ void Uplink::processEthernet()
 bool Uplink::ethernetHasIP() const
 {
 #if defined(HAS_ETHERNET)
-    return ethernetStarted && ETH.hasIP();
+    // hasIP() stays true without a link for a static address (the core
+    // clears only the DHCP bit on disconnect)
+    return ethernetStarted && ETH.connected() && ETH.hasIP();
 #else
     return false;
 #endif

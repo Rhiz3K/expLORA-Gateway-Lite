@@ -47,6 +47,7 @@ private:
     // Free buffer
     static void freeBuffer();
 
+
     // Add HTML opening code
     static void addHtmlHeader(String &html, const String &title, bool isAPMode = false);
 
@@ -63,6 +64,9 @@ private:
     static void addNavigation(String &html, const String &activePage);
 
 public:
+    // Escape text for HTML content and quoted attributes
+    static String htmlEscape(const String &text);
+
     // Initialize generator
     static bool init(bool usePsram = true, size_t bufferSize = 32768);
 
@@ -73,16 +77,16 @@ public:
     static String generateHomePage(const std::vector<SensorData> &sensors);
 
     // Generate configuration page
+    static void addWiFiForm(String &html, const String &ssid, const String &password, const String &timezone);
     static String generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip, const String &timezone);
 
     // Generate MQTT settings page
     static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
                                     const String &prefix, bool haEnabled, String &haPrefix);
 
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
-    // Generating network page (ethernet / LTE status and LTE settings)
-    static String generateNetworkPage(const ConfigManager &config);
-#endif
+    // Generating network page (uplink status, WiFi, ethernet and LTE settings)
+    static String generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
+                                      const String &timezone, bool apMode);
 
     // Generate sensor list page
     static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors);
