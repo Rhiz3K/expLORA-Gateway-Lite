@@ -60,7 +60,7 @@ String HTMLGenerator::htmlEscape(const String &text)
 }
 
 // Adding HTML header code
-void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMode)
+void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMode, bool navigation)
 {
     html += "<!DOCTYPE html><html><head>";
     html += "<meta charset='UTF-8'>";
@@ -73,8 +73,12 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     html += "</head><body>";
     html += "<header><h1>" BOARD_NAME "</h1><h2>" + title + "</h2></header>";
 
-    // Navigation: full in STA, minimal in AP (Config + Reboot)
-    if (!isAPMode)
+    // Navigation: full in STA, minimal in AP (Config + Reboot), none on the login page
+    if (!navigation)
+    {
+        html += "<div class='container'>";
+    }
+    else if (!isAPMode)
     {
         addNavigation(html, title);
     }
@@ -85,11 +89,74 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
 #if defined(HAS_ETHERNET) || defined(HAS_LTE)
         html += "<a href='/network' class='" + String(title == "Network" ? "active" : "") + "'>Network</a>";
 #endif
+        html += "<a href='/password' class='" + String(title == "Password" ? "active" : "") + "'>Password</a>";
         html += "<a href='/reboot' onclick=\"return confirm('Are you sure you want to reboot the device?');\">Reboot</a>";
+        html += "<a href='/logout'>Logout</a>";
         html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
         html += "</nav>";
         html += "<div class='container'>";
     }
+}
+
+String HTMLGenerator::generateLoginPage(bool hasPassword, const String &error, const String &next)
+{
+    String html;
+    html.reserve(3072);
+    addHtmlHeader(html, "Login", false, false);
+    html += "<div class='card'>";
+    html += "<h2>Login</h2>";
+    if (error.length() > 0)
+    {
+        html += "<p style='color:#c0392b;'><strong>" + htmlEscape(error) + "</strong></p>";
+    }
+    if (!hasPassword)
+    {
+        html += "<p>No admin password is set yet. Log in with an empty password and choose one on the next page.</p>";
+    }
+    html += "<form method='post' action='/login'>";
+    html += "<input type='hidden' name='next' value='" + htmlEscape(next) + "'>";
+    html += "<label for='password'>Password:</label>";
+    html += "<input type='password' id='password' name='password' autocomplete='current-password' autofocus>";
+    html += "<input type='submit' value='Log in'>";
+    html += "</form></div>";
+    addHtmlFooter(html);
+    return html;
+}
+
+String HTMLGenerator::generatePasswordPage(bool hasPassword, const String &error, bool apMode)
+{
+    String html;
+    html.reserve(3072);
+    // Until a password exists the user cannot go anywhere else
+    addHtmlHeader(html, "Password", apMode, hasPassword);
+    html += "<div class='card'>";
+    html += "<h2>" + String(hasPassword ? "Change Admin Password" : "Set Admin Password") + "</h2>";
+    if (error.length() > 0)
+    {
+        html += "<p style='color:#c0392b;'><strong>" + htmlEscape(error) + "</strong></p>";
+    }
+    if (!hasPassword)
+    {
+        html += "<p>The web interface is not protected yet. Choose a password (at least 8 characters) to continue.</p>";
+    }
+    else
+    {
+        html += "<p>Forgotten password: send <code>reset-password</code> over the USB serial console (115200 Bd).</p>";
+    }
+    html += "<form method='post' action='/password'>";
+    if (hasPassword)
+    {
+        html += "<label for='current'>Current password:</label>";
+        html += "<input type='password' id='current' name='current' autocomplete='current-password' required>";
+    }
+    html += "<label for='password'>New password:</label>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' minlength='8' maxlength='64' required>";
+    html += "<label for='confirm'>Confirm new password:</label>";
+    html += "<input type='password' id='confirm' name='confirm' autocomplete='new-password' minlength='8' maxlength='64' required>";
+    html += "<input type='submit' value='Save Password'>";
+    html += "</form></div>";
+    addHtmlFooter(html);
+    return html;
 }
 
 // Adding HTML footer code
@@ -273,7 +340,9 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
     html += "<a href='/firmware' class='" + String(activePage == "Firmware" ? "active" : "") + "'>Firmware</a>";
     html += "<a href='/logs' class='" + String(activePage == "Logs" ? "active" : "") + "'>Logs</a>";
     html += "<a href='/api' class='" + String(activePage == "API" ? "active" : "") + "'>API</a>";
+    html += "<a href='/password' class='" + String(activePage == "Password" ? "active" : "") + "'>Password</a>";
     html += "<a href='/reboot' onclick=\"return confirm('Are you sure you want to reboot the device?');\">Reboot</a>";
+    html += "<a href='/logout'>Logout</a>";
     html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
     html += "</nav>";
 

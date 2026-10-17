@@ -29,6 +29,7 @@
 #include "../Data/Logging.h"
 #include "../Storage/ConfigManager.h"
 #include "../Protocol/MQTTManager.h"
+#include "WebAuth.h"
 
 /**
  * Class for web portal management
@@ -78,6 +79,15 @@ private:
     unsigned long restartAt = 0;
 
     ConfigManager &configManager; // Reference to configuration
+    WebAuth auth;                 // Admin password and login sessions
+
+    // Every route except a few public ones needs a login (see setupRoutes)
+    void requireLogin(AsyncWebServerRequest *request, ArMiddlewareNext next);
+    void handleLogin(AsyncWebServerRequest *request);
+    void handleLoginPost(AsyncWebServerRequest *request);
+    void handleLogout(AsyncWebServerRequest *request);
+    void handlePassword(AsyncWebServerRequest *request);
+    void handlePasswordPost(AsyncWebServerRequest *request);
 
     // Setup routes for web server
     void setupRoutes();
@@ -162,4 +172,7 @@ public:
 
     // Set MQTTManager reference
     void setMqttManager(MQTTManager *manager) { mqttManager = manager; }
+
+    // Forgotten admin password: cleared from the serial console
+    void resetAdminPassword() { auth.resetPassword(); }
 };

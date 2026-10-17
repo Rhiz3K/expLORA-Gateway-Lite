@@ -87,6 +87,9 @@ public:
     String ethDns1;     // Primary DNS (empty = gateway)
     String ethDns2;     // Secondary DNS (optional)
 
+    // Web admin password, "pbkdf2$..." (see WebAuth); empty = not set yet
+    String adminPasswordHash;
+
     // Constructor
     ConfigManager(Logger &log, const char *file = CONFIG_FILE);
 
@@ -132,6 +135,9 @@ public:
     // Set ethernet addressing; returns an error message, empty on success
     String setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
                              const String &dns1, const String &dns2, bool saveConfig = true);
+
+    // Store the admin password hash (Preferences only)
+    bool setAdminPasswordHash(const String &hash);
 
     // Set logging level
     void setLogLevel(LogLevel level, bool saveConfig = true);

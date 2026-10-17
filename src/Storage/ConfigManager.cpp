@@ -267,6 +267,8 @@ bool ConfigManager::loadFromPreferences()
     lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
     ltePin = preferences.getString("ltePin", "");
 
+    adminPasswordHash = preferences.getString("adminPwd", "");
+
     ethStatic = preferences.getBool("ethStatic", false);
     ethIp = preferences.getString("ethIp", "");
     ethMask = preferences.getString("ethMask", "");
@@ -461,6 +463,21 @@ String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const 
         return "Saving configuration failed";
     }
     return "";
+}
+
+bool ConfigManager::setAdminPasswordHash(const String &hash)
+{
+    if (!preferencesInitialized)
+    {
+        return false;
+    }
+    adminPasswordHash = hash;
+    if (hash.length() == 0)
+    {
+        preferences.remove("adminPwd");
+        return true;
+    }
+    return preferences.putString("adminPwd", hash) == hash.length();
 }
 
 bool ConfigManager::setMqttConfig(const String &host, int port, const String &user,

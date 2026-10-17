@@ -100,6 +100,7 @@ class Config:
     serial_port: str = ""
     serial_baud: int = 115200
     wifi_interface: str = "en0"
+    admin_password: str = ""
     # [wifi]
     home_ssid: str = ""
     home_password: str = ""
@@ -135,6 +136,7 @@ def load_config(path: str) -> Config:
         cfg.serial_port    = parser.get("gateway", "serial_port", fallback="").strip()
         cfg.serial_baud    = parser.getint("gateway", "serial_baud", fallback=115200)
         cfg.wifi_interface = parser.get("gateway", "wifi_interface", fallback="en0").strip()
+        cfg.admin_password = parser.get("gateway", "admin_password", fallback="").strip()
     if parser.has_section("wifi"):
         cfg.home_ssid     = parser.get("wifi", "ssid", fallback="").strip()
         cfg.home_password = parser.get("wifi", "password", fallback="").strip()
@@ -518,6 +520,29 @@ def _http_alive(url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+def ensure_login(session: requests.Session, base: str, password: str) -> None:
+    """Log the session in to the web interface.
+
+    A gateway without an admin password (fresh flash, or updated from a
+    version without login) accepts an empty password and then insists on
+    setting one - the configured password is set in that case.
+    """
+    base = base.rstrip("/")
+    if not password or len(password) < 8:
+        raise RuntimeError("[gateway].admin_password (min. 8 characters) or --admin-password is required")
+    resp = session.post(f"{base}/login", data={"password": password}, allow_redirects=False, timeout=10)
+    if resp.status_code in (302, 303):
+        return
+    resp = session.post(f"{base}/login", data={"password": ""}, allow_redirects=False, timeout=10)
+    if resp.status_code not in (302, 303) or "/password" not in resp.headers.get("Location", ""):
+        raise RuntimeError(f"login failed (HTTP {resp.status_code}) - wrong admin password?")
+    info_("  gateway has no admin password yet - setting the configured one")
+    resp = session.post(f"{base}/password", data={"password": password, "confirm": password},
+                        allow_redirects=False, timeout=10)
+    if resp.status_code not in (302, 303):
+        raise RuntimeError(f"setting the admin password failed (HTTP {resp.status_code})")
+
+
 def provision_gateway(cfg: Config) -> str:
     """Walk the device through STA provisioning. Returns the discovered IP.
 
@@ -588,10 +613,14 @@ def provision_gateway(cfg: Config) -> str:
         # 5. POST credentials. Don't worry about response — device reboots
         # ~1.5 s later (handleClient deferred restart) so the response may
         # not finish cleanly.
+        info_("  logging in")
+        session = requests.Session()
+        ensure_login(session, "http://192.168.4.1", cfg.admin_password)
+
         info_("  POSTing /config (WiFi creds)")
         monitor.drain()
         try:
-            requests.post(
+            session.post(
                 "http://192.168.4.1/config",
                 data={
                     "ssid": cfg.home_ssid,
@@ -695,6 +724,7 @@ class Runner:
         self.verbose = verbose
         self.failures: List[str] = []
         self.session = requests.Session()
+        self.admin_password = ""
         # short timeout — device on local network should respond fast
         self.session.headers.update({"User-Agent": "explora-integration-test/1.0"})
 
@@ -1041,6 +1071,32 @@ def t_sensor_health_badge_after_packet(r: Runner, sn: str) -> str:
     return "Healthy badge present in HTML"
 
 
+# ----------------------------------------------------------------- login
+
+def t_login_required(r: Runner) -> str:
+    resp = requests.get(r.base + "/sensors", allow_redirects=False, timeout=5)
+    assert_status(resp, [302, 303])
+    location = resp.headers.get("Location", "")
+    if "/login" not in location:
+        raise TestFailed(f"redirect to {location!r}, expected /login")
+    resp = requests.post(r.base + "/sensors/add", data={"name": "x"}, allow_redirects=False, timeout=5)
+    assert_status(resp, [401])
+    return "OK"
+
+
+def t_api_public(r: Runner) -> str:
+    resp = requests.get(r.base + "/api?format=json", allow_redirects=False, timeout=5)
+    assert_status(resp, [200])
+    return "OK"
+
+
+def t_wrong_password_rejected(r: Runner) -> str:
+    resp = requests.post(r.base + "/login", data={"password": "definitely-wrong-password"},
+                         allow_redirects=False, timeout=10)
+    assert_status(resp, [401])
+    return "OK"
+
+
 # --------------------------------------------------------------- reboot
 
 def t_reboot_round_trip(r: Runner, current_version: str) -> str:
@@ -1091,6 +1147,8 @@ def t_reboot_round_trip(r: Runner, current_version: str) -> str:
                 body = resp.json()
                 returned = body.get("version")
                 if returned == current_version:
+                    # Sessions live in RAM - log in again for later tests
+                    ensure_login(r.session, r.base, r.admin_password)
                     return f"back after reboot, version={returned}"
                 else:
                     raise TestFailed(
@@ -1154,6 +1212,11 @@ def main():
         default=1,
         help="Sensor type code: 1=BME280, 2=SCD40, 3=METEO, 4=VEML7700, "
         "0x51=DIY_TEMP (default: 1)",
+    )
+    parser.add_argument(
+        "--admin-password",
+        default="",
+        help="Web admin password (set on the gateway if it has none yet)",
     )
     parser.add_argument(
         "--packet-timeout",
@@ -1252,6 +1315,7 @@ def main():
         return 2
 
     r = Runner(url, verbose=args.verbose)
+    r.admin_password = args.admin_password or (cfg.admin_password if cfg else "")
 
     # Sanity ping
     try:
@@ -1264,6 +1328,17 @@ def main():
         return 2
 
     print(f"\n{BOLD}Testing gateway at {url}  (firmware v{current_version}){RESET}")
+
+    section("Login")
+    r.run("pages require a login", lambda: t_login_required(r))
+    r.run("/api is public", lambda: t_api_public(r))
+    r.run("wrong password rejected", lambda: t_wrong_password_rejected(r))
+    try:
+        ensure_login(r.session, r.base, r.admin_password)
+        pass_("log in with the admin password")
+    except RuntimeError as e:
+        fail_("log in with the admin password", str(e))
+        return 1
 
     # ----------------------------------------------- Phase 1: setup (mutates)
     # Adding the sensor first means downstream smoke tests see the table

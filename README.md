@@ -96,18 +96,35 @@ Pin assignments live in `variants/<board>/board_config.h`.
    - The gateway will start in AP mode
    - Connect to the WiFi network named "expLORA-GW-XXXXXX"
 
-2. **Configure WiFi**:
+2. **Set the admin password**:
    - Open a browser and navigate to 192.168.4.1
+   - Log in with an empty password; the gateway then asks for a new admin
+     password (at least 8 characters) before anything else
+
+3. **Configure WiFi**:
    - Enter your home WiFi credentials
    - Save and reboot
 
-3. **Access the Web Interface**:
+4. **Access the Web Interface**:
    - Once connected to your network, find the gateway's IP from your router
    - Access the web interface by entering the IP in a browser
 
 With Ethernet connected (Pro), the gateway gets an address from DHCP right away;
 WiFi setup is optional. The access point stays up for 5 minutes after the
 gateway reaches the local network.
+
+## Login
+
+The web interface requires the admin password. A gateway updated from a
+version without login asks for a new password at the first login, the same way
+as a freshly flashed one. Sessions last until logout, 24 hours of inactivity or
+a restart; five wrong passwords lock the login for a minute.
+
+The sensor data API (`/api`) and `/firmware/version` stay public (read-only).
+
+**Forgotten password:** connect the gateway over USB and send `reset-password`
+on the serial console (115200 Bd). The password is cleared and has to be set
+again at the next login; sensors and settings are kept.
 
 ## Network (Pro)
 
@@ -181,7 +198,7 @@ The gateway will automatically generate discovery information for Home Assistant
 
 ## API Usage
 
-The gateway provides a REST API for programmatic access to sensor data:
+The gateway provides a read-only REST API for sensor data (no login needed):
 
 - **List all sensors**: `/api?format=json`
 - **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (where XXXXXX is the sensor's serial number in hex)

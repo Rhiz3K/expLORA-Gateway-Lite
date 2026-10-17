@@ -303,6 +303,26 @@ void loop()
         sensorManager->process(millis());
     }
 
+    // Serial console: "reset-password" clears a forgotten web admin password
+    static String serialLine;
+    while (Serial.available())
+    {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r')
+        {
+            serialLine.trim();
+            if (serialLine == "reset-password" && webPortal)
+            {
+                webPortal->resetAdminPassword();
+            }
+            serialLine = "";
+        }
+        else if (serialLine.length() < 32)
+        {
+            serialLine += c;
+        }
+    }
+
     // Periodically rotate per-sensor health buckets so a dead-silent sensor
     // (no packets at all) eventually drops out of the 24h "OK" tally instead
     // of clinging to whatever was in the last bucket at boot.

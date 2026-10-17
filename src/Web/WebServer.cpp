@@ -62,7 +62,7 @@ WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &
                      bool &config_mode, ConfigManager &config, String &tz)
     : server(HTTP_PORT), sensorManager(sensors), logger(log), isAPMode(false),
       wifiSSID(ssid), wifiPassword(password), configMode(config_mode),
-      timezone(tz), configManager(config), mqttManager(nullptr)
+      timezone(tz), configManager(config), auth(config, log), mqttManager(nullptr)
 {
 }
 
@@ -131,6 +131,14 @@ void WebPortal::setupRoutes()
 
     logger.info("Registering web server routes (once)");
 
+    server.addMiddleware([this](AsyncWebServerRequest *request, ArMiddlewareNext next)
+                         { requireLogin(request, next); });
+    server.on("/login", HTTP_GET, std::bind(&WebPortal::handleLogin, this, std::placeholders::_1));
+    server.on("/login", HTTP_POST, std::bind(&WebPortal::handleLoginPost, this, std::placeholders::_1));
+    server.on("/logout", HTTP_GET, std::bind(&WebPortal::handleLogout, this, std::placeholders::_1));
+    server.on("/password", HTTP_GET, std::bind(&WebPortal::handlePassword, this, std::placeholders::_1));
+    server.on("/password", HTTP_POST, std::bind(&WebPortal::handlePasswordPost, this, std::placeholders::_1));
+
     server.on("/", HTTP_GET, std::bind(&WebPortal::handleRoot, this, std::placeholders::_1));
     server.on("/config", HTTP_GET, std::bind(&WebPortal::handleConfig, this, std::placeholders::_1));
     server.on("/config", HTTP_POST, std::bind(&WebPortal::handleConfigPost, this, std::placeholders::_1));
@@ -185,6 +193,117 @@ void WebPortal::setupRoutes()
 
     routesRegistered = true;
     logger.info("Routes registered");
+}
+
+// Paths reachable without a login: the login page itself, the read-only
+// sensor data API and the version probe
+static bool isPublicPath(const String &url)
+{
+    return url == "/login" || url == "/api" || url == "/firmware/version";
+}
+
+void WebPortal::requireLogin(AsyncWebServerRequest *request, ArMiddlewareNext next)
+{
+    const String &url = request->url();
+    if (isPublicPath(url))
+    {
+        next();
+        return;
+    }
+    if (!auth.isAuthorized(request))
+    {
+        if (request->method() != HTTP_GET)
+        {
+            request->send(401, "text/plain", "Login required");
+            return;
+        }
+        // Absolute in AP mode: captive portal probes come with foreign host names
+        String target = isAPMode ? "http://" + uplink->getApIP().toString() + "/login" : String("/login");
+        if (!isAPMode && url != "/" && url != "/logout")
+        {
+            target += "?next=" + url;
+        }
+        request->redirect(target);
+        return;
+    }
+    // Fresh device or update from a version without login: set a password first
+    if (!auth.hasPassword() && url != "/password" && url != "/logout")
+    {
+        request->redirect("/password");
+        return;
+    }
+    next();
+}
+
+// Local path to return to after the login
+static String safeNextPath(const String &next)
+{
+    if (next.length() == 0 || next[0] != '/' || next.startsWith("//") || next.indexOf('\\') >= 0 ||
+        next.indexOf("://") >= 0)
+    {
+        return "/";
+    }
+    return next;
+}
+
+void WebPortal::handleLogin(AsyncWebServerRequest *request)
+{
+    String next = request->hasParam("next") ? request->getParam("next")->value() : String();
+    request->send(200, "text/html", HTMLGenerator::generateLoginPage(auth.hasPassword(), "", safeNextPath(next)));
+}
+
+void WebPortal::handleLoginPost(AsyncWebServerRequest *request)
+{
+    String password = request->hasParam("password", true) ? request->getParam("password", true)->value() : String();
+    String next = request->hasParam("next", true) ? request->getParam("next", true)->value() : String();
+    unsigned long retryAfter = 0;
+    String token = auth.login(password, retryAfter);
+    if (token.length() == 0)
+    {
+        String error = retryAfter > 0 ? "Too many failed attempts - try again in " + String(retryAfter) + " s"
+                                      : String("Wrong password");
+        request->send(401, "text/html", HTMLGenerator::generateLoginPage(auth.hasPassword(), error, safeNextPath(next)));
+        return;
+    }
+    AsyncWebServerResponse *response = request->beginResponse(302);
+    response->addHeader("Location", auth.hasPassword() ? safeNextPath(next) : String("/password"));
+    response->addHeader("Set-Cookie", WebAuth::cookieFor(token));
+    request->send(response);
+}
+
+void WebPortal::handleLogout(AsyncWebServerRequest *request)
+{
+    auth.logout(request);
+    AsyncWebServerResponse *response = request->beginResponse(302);
+    response->addHeader("Location", "/login");
+    response->addHeader("Set-Cookie", WebAuth::cookieFor(""));
+    request->send(response);
+}
+
+void WebPortal::handlePassword(AsyncWebServerRequest *request)
+{
+    request->send(200, "text/html", HTMLGenerator::generatePasswordPage(auth.hasPassword(), "", isAPMode));
+}
+
+void WebPortal::handlePasswordPost(AsyncWebServerRequest *request)
+{
+    auto param = [request](const char *name)
+    {
+        return request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
+    };
+    String error = auth.changePassword(param("current"), param("password"), param("confirm"));
+    if (error.length() > 0)
+    {
+        request->send(400, "text/html", HTMLGenerator::generatePasswordPage(auth.hasPassword(), error, isAPMode));
+        return;
+    }
+    // All sessions ended with the change - continue with a new one
+    unsigned long retryAfter;
+    String token = auth.login(param("password"), retryAfter);
+    AsyncWebServerResponse *response = request->beginResponse(302);
+    response->addHeader("Location", isAPMode ? "/config" : "/");
+    response->addHeader("Set-Cookie", WebAuth::cookieFor(token));
+    request->send(response);
 }
 
 // Called from the main loop. Drives deferred restarts so handlers can safely
@@ -1404,6 +1523,11 @@ void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
 // Upload chunk callback
 void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 {
+    // Upload data arrives before the middleware runs - check the login here
+    if (!auth.isAuthorized(request) || !auth.hasPassword())
+    {
+        return;
+    }
     if (guardAPOnly(request)) return;
     if (index == 0)
     {

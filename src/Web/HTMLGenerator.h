@@ -38,7 +38,7 @@ class HTMLGenerator
 private:
 
     // Add HTML opening code
-    static void addHtmlHeader(String &html, const String &title, bool isAPMode = false);
+    static void addHtmlHeader(String &html, const String &title, bool isAPMode = false, bool navigation = true);
 
     // Add HTML closing code
     static void addHtmlFooter(String &html, bool isAPMode = false);
@@ -66,6 +66,10 @@ public:
     // Generate MQTT settings page
     static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
                                     const String &prefix, bool haEnabled, String &haPrefix);
+
+    // Login and admin password pages
+    static String generateLoginPage(bool hasPassword, const String &error, const String &next);
+    static String generatePasswordPage(bool hasPassword, const String &error, bool apMode);
 
     // Generating network page (uplink status, WiFi, ethernet and LTE settings)
     static String generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
