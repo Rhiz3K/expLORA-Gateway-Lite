@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Web portal manager header file
  *

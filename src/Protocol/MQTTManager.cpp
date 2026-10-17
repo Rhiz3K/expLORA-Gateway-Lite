@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * MQTT communication manager implementation file
  *

@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * LoRa protocol handler implementation file
  *

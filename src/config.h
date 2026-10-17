@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Main configuration file for the expLORA Gateway
  *

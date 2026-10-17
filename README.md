@@ -1,10 +1,20 @@
-# expLORA Gateway Lite
+# expLORA Gateway
 
 ![expLORA Logo](https://pajenicko.cz/image/catalog/explora/explora-logo-sm.png)
 
 ## Overview
 
-expLORA Gateway Lite is a versatile IoT gateway designed for wireless sensor networks. Built on ESP32 with LoRa capabilities, it serves as a bridge between low-power sensor nodes and home automation systems or custom applications.
+expLORA Gateway is a versatile IoT gateway designed for wireless sensor networks. Built on ESP32 with LoRa capabilities, it serves as a bridge between low-power sensor nodes and home automation systems or custom applications.
+
+One firmware, two boards:
+
+| | Lite | Pro |
+|---|---|---|
+| MCU | ESP32-S3 | ESP32-WROOM-32E (16 MB flash, no PSRAM) |
+| LoRa | RFM95W (SX1276) | E22-900M22S (SX1262, TCXO) |
+| Network | WiFi | Ethernet (LAN8720A), WiFi, LTE (SIMCom A7682E, optional) |
+| Power | USB | PoE or USB |
+| PlatformIO env | `lite` | `pro` |
 
 The gateway receives data from various wireless sensors via LoRa, processes the information, and can forward it to:
 - Home Assistant via MQTT
@@ -29,11 +39,13 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - Dual-mode operation (AP and client)
   - Captive portal for easy initial setup
   - Automatic reconnection
+  - Pro: Ethernet, WiFi and LTE with automatic failover (see [Network](#network-pro))
 
 - **MQTT Integration**:
   - Home Assistant auto-discovery
   - Configurable broker settings
   - Real-time data publication
+  - Gateway diagnostics (uplink, IP address; Pro: power source, LTE signal and state)
 
 - **Data Correction**:
   - Calibration options for sensor readings
@@ -48,38 +60,35 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - JSON and CSV formats
   - Query parameters for filtering
 
-## Hardware Requirements
+## Hardware
 
-- ESP32 development board (with PSRAM recommended)
-- RFM95W LoRa module
-- Supporting components as per the wiring diagram
+- **Lite**: ESP32-S3 with an RFM95W LoRa module, see `hw/` for the schematic
+- **Pro**: EXPLORA GATEWAY PRO board with ESP32-WROOM-32E-N16, E22-900M22S LoRa
+  module, LAN8720A Ethernet PHY with PoE, and a slot for the A7682E LTE carrier
+
+Pin assignments live in `variants/<board>/board_config.h`.
 
 ## Installation
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/Pajenicko/expLORA-Gateway-Lite.git
-   cd expLORA-Gateway-Lite
+   git clone https://github.com/Pajenicko/expLORA-Gateway.git
+   cd expLORA-Gateway
    ```
 
-2. **Install dependencies**:
-   The project uses the following libraries:
-   - Arduino ESP32 core
-   - ArduinoJson
-   - ESPAsyncWebServer
-   - AsyncTCP
-   - PubSubClient (for MQTT)
-   - WiFi
-   - SPI
+2. **Build and flash** with [PlatformIO](https://platformio.org/) (Arduino core 3.x via pioarduino):
+   ```bash
+   pio run -e lite -t upload     # expLORA Gateway Lite
+   pio run -e pro -t upload      # expLORA Gateway Pro
+   ```
+   Libraries (ArduinoJson, ESPAsyncWebServer, AsyncTCP, PubSubClient, and RadioLib
+   for the Pro's SX1262) are installed automatically.
 
-3. **Configure your hardware**:
-   - Check `config.h` for pin definitions
-   - Adjust pins if necessary to match your wiring
+3. **Firmware updates** can also be installed from the web interface (Firmware page).
+   The gateway rejects an image built for the other board.
 
-4. **Build and flash**:
-   - Use PlatformIO (recommended) or Arduino IDE
-   - Select the appropriate ESP32 board
-   - Upload the firmware
+4. **Unit tests** run on the host: `pio test -e native`. An end-to-end test against
+   a real device is in `tests/integration`.
 
 ## Initial Setup
 
@@ -95,6 +104,29 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
 3. **Access the Web Interface**:
    - Once connected to your network, find the gateway's IP from your router
    - Access the web interface by entering the IP in a browser
+
+With Ethernet connected (Pro), the gateway gets an address from DHCP right away;
+WiFi setup is optional. The access point stays up for 5 minutes after the
+gateway reaches the local network.
+
+## Network (Pro)
+
+The Pro board can use three uplinks. The first one that has an IP address carries
+the traffic:
+
+1. **Ethernet** - DHCP, plug in a cable (PoE powers the board as well)
+2. **WiFi** - configured on the WiFi Setup page
+3. **LTE** - needs the A7682E carrier and a SIM card; enable it on the Network
+   page and enter the APN (and the SIM PIN, if the card has one)
+
+All configured uplinks stay connected, so switching takes only a moment when a
+cable is unplugged or WiFi drops. The LTE connection is used only when neither
+Ethernet nor WiFi is available. The access point and captive portal come back
+when the gateway loses its local network (Ethernet and WiFi), so it can always
+be reached for configuration.
+
+The Network page and `/diag/network` (JSON) show the state of each interface,
+the LTE operator and signal, and the power source (PoE or USB).
 
 ## Adding Sensors
 

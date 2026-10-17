@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * HTML content generator header file
  *

@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite — SensorHealth
+ * expLORA Gateway — SensorHealth
  *
  * Pure, header-only per-sensor health tracking. Records when each
  * sensor last delivered a valid packet, when it was last rejected and

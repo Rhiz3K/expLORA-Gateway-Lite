@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite — SensorParsers
+ * expLORA Gateway — SensorParsers
  *
  * Pure, header-only parsers that turn raw decrypted LoRa packet bytes
  * into per-sensor structs. No Arduino dependencies — designed to be

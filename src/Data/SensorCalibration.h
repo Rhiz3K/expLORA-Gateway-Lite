@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite — SensorCalibration
+ * expLORA Gateway — SensorCalibration
  *
  * Pure, header-only sensor calibration / correction helpers. Free of
  * Arduino dependencies so the logic can be exercised by host-side

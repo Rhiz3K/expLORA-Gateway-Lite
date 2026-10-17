@@ -1,6 +1,6 @@
 # expLORA Gateway integration tests
 
-End-to-end Python smoke test for a running expLORA Gateway Lite device.
+End-to-end Python smoke test for a running expLORA Gateway device (Lite or Pro).
 Complements the host-side `pio test -e native` unit tests (which only
 cover pure logic in isolation) by exercising the full RX path on real
 hardware: HTTP API, web UI, WiFi provisioning, LoRa decode, calibration.
@@ -42,7 +42,7 @@ device automatically:
 2. macOS: switches WiFi via `networksetup -setairportnetwork en0 <ssid>`
    Linux/Windows: prints `Connect to <ssid>` and waits for ENTER
 3. POSTs `[wifi].ssid` + `[wifi].password` to `http://192.168.4.1/config`
-4. Watches UART for `expLORA Gateway Lite starting up` (= reboot)
+4. Watches UART for `expLORA Gateway <board> starting up` (= reboot)
 5. Watches UART for `WiFi connected! IP: x.x.x.x` (= STA joined)
 6. Switches host WiFi back to home
 7. Runs the test suite against the discovered IP
