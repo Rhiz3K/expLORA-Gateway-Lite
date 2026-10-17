@@ -21,71 +21,48 @@
 
 #pragma once
 
-#include <Arduino.h>
-#include <SPI.h>
-#include "../config.h"
-#include "../Data/Logging.h"
-#include "SPI_Manager.h"
-#include "LoRaRadio.h"
 #include "board_config.h"
 
 #if defined(RADIO_SX1276)
 
+#include <Arduino.h>
+#include <RadioLib.h>
+#include "../config.h"
+#include "../Data/Logging.h"
+#include "SPI_Manager.h"
+#include "LoRaRadio.h"
+
 /**
- * SX1276 (RFM95W) LoRa radio driver
+ * SX1276 (RFM95W) LoRa radio driver (RadioLib)
  *
- * Handles initialization, configuration, and communication with RFM95W LoRa module.
- * Abstracts SPI communication; DIO0 signals RxDone.
+ * Receive only: the driver never calls transmit. DIO0 signals RxDone;
+ * packets with a CRC error are rejected.
  */
 class RadioSX1276 : public LoRaRadio
 {
 private:
-    int csPin;              // Chip select pin
-    int rstPin;             // Reset pin
-    int dio0Pin;            // DIO0 pin for interrupt
-    SPIManager *spiManager; // SPI communication manager
+    Logger &logger;
+    SPIManager *spiManager;
+    Module *module;
+    SX1276 *radio;
+    bool initialized;
 
-    Logger &logger; // Reference to logger
+    // Configure the chip and start continuous receive
+    bool configure();
 
-    // Setup pins and SPI
-    bool setupPins();
-    // Reset module
-    void resetModule();
+    // Log a RadioLib error code
+    void logError(const char *what, int16_t state);
 
 public:
-    // Constructor
-    RadioSX1276(Logger &log, SPIManager *spiMgr = nullptr, int cs = LORA_CS, int rst = LORA_RST, int dio0 = LORA_DIO0);
-
-    // Destructor
+    RadioSX1276(Logger &log, SPIManager *spiMgr);
     ~RadioSX1276() override;
 
-    // Initialize LoRa module
     bool init() override;
-
-    // Reset module
     bool reset() override;
-
-    // Write to register
-    void writeRegister(uint8_t reg, uint8_t value);
-
-    // Read from register
-    uint8_t readRegister(uint8_t reg);
-
-    // Receive packet
     bool receivePacket(uint8_t *buffer, uint8_t *length) override;
-
-    // Get RSSI
     int getRSSI() override;
-
-    // Return SNR of last packet
     float getSNR() override;
-
-    // Check if module is connected
     bool isConnected() override;
-
-    // Get chip version
-    uint8_t getVersion();
-
     const char *getChipName() const override { return "SX1276"; }
 };
 

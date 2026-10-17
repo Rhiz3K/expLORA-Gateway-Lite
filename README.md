@@ -81,8 +81,8 @@ Pin assignments live in `variants/<board>/board_config.h`.
    pio run -e lite -t upload     # expLORA Gateway Lite
    pio run -e pro -t upload      # expLORA Gateway Pro
    ```
-   Libraries (ArduinoJson, ESPAsyncWebServer, AsyncTCP, PubSubClient, and RadioLib
-   for the Pro's SX1262) are installed automatically.
+   Libraries (ArduinoJson, ESPAsyncWebServer, AsyncTCP, PubSubClient and RadioLib,
+   which drives both radios) are installed automatically.
 
 3. **Firmware updates** can also be installed from the web interface (Firmware page).
    The gateway rejects an image built for the other board.
