@@ -220,7 +220,7 @@ The gateway provides a read-only REST API for sensor data (no login needed):
 Example API response:
 ```json
 {
-  "version": "1.1.13",
+  "version": "1.2.0",
   "time": "2026-10-17 15:30:45",
   "status": "connected",
   "sensors": [

@@ -26,7 +26,7 @@
 #include <esp_mac.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.13"
+#define FIRMWARE_VERSION "1.2.0"
 
 // OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
 #include "board_config.h"
