@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Logging system implementation file
  *
@@ -115,12 +115,12 @@ LogLevel Logger::getLogLevel()
 // Get timestamp
 String Logger::getTimeStamp()
 {
-    static char timeBuffer[32];
+    char timeBuffer[32]; // per call: logged from several tasks
 
     if (timeInitialized)
     {
         struct tm timeinfo;
-        if (getLocalTime(&timeinfo))
+        if (getLocalTime(&timeinfo, 0))
         {
             strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
             return String(timeBuffer);
@@ -231,6 +231,17 @@ std::vector<LogEntry> Logger::getLogsSnapshot()
         snapshot.push_back(logBuffer[index]);
     }
     return snapshot;
+}
+
+bool Logger::copyNewest(size_t n, LogEntry &out)
+{
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (logBuffer == nullptr || n >= logCount)
+    {
+        return false;
+    }
+    out = logBuffer[(logIndex + logBufferSize - 1 - n) % logBufferSize];
+    return true;
 }
 
 // Clear all logs

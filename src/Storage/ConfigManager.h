@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Configuration manager header file
  *
@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <mutex>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -32,17 +33,19 @@
 /**
  * Class for device configuration management
  *
- * Handles saving and loading configuration from two sources:
- * 1. LittleFS - for regular configuration that is reset during firmware updates
- * 2. Preferences - for persistent configuration that survives firmware updates
+ * Configuration is kept in two stores, both written by save():
+ * 1. LittleFS (config.json) - WiFi, MQTT, log level, timezone
+ * 2. Preferences (NVS) - a copy of the above plus settings kept only there
+ *    (LTE, Ethernet, admin password); on load Preferences take precedence
  */
 class ConfigManager
 {
 private:
+    std::recursive_mutex configMutex;
     Logger &logger;              // Reference to logger
     Preferences preferences;     // For persistent configuration
     bool preferencesInitialized; // Preferences initialization flag
-    String adminCredential;      // Per-device HTTP administrator secret
+    String adminCredential;      // First-boot bootstrap password (RAM only)
     String apCredential;         // Separate WPA2 recovery AP secret
     bool adminCredentialGeneratedThisBoot = false;
     bool apCredentialGeneratedThisBoot = false;
@@ -81,6 +84,27 @@ public:
     String mqttHAPrefix; // MQTT Homeassistant topic prefix
     bool mqttHAEnabled;  // MQTT Homeassistant discovery enable
 
+    // LTE configuration (boards with HAS_LTE; stored in Preferences only)
+    bool lteEnabled; // Modem enabled
+    String lteApn;   // Access point name
+    String ltePin;   // SIM PIN (empty = none)
+    bool ltePinRejected; // The SIM refused ltePin - never sent again until it changes
+
+    // Ethernet configuration (boards with HAS_ETHERNET; stored in Preferences only)
+    bool ethStatic;     // Static address instead of DHCP
+    String ethIp;       // Static address
+    String ethMask;     // Subnet mask
+    String ethGateway;  // Default gateway
+    String ethDns1;     // Primary DNS (empty = gateway)
+    String ethDns2;     // Secondary DNS (optional)
+
+    // Web admin password, "pbkdf2$..." (see WebAuth); empty = not set yet
+    String adminPasswordHash;
+
+    // Held by save()/load() and the setters (web and loop task both write);
+    // readers in another task take it while copying values (MQTTManager)
+    std::recursive_mutex &mutex() { return configMutex; }
+
     // Constructor
     ConfigManager(Logger &log, const char *file = CONFIG_FILE);
 
@@ -114,6 +138,7 @@ public:
     const String &getApCredential() const;
     bool wasAdminCredentialGeneratedThisBoot() const;
     bool wasApCredentialGeneratedThisBoot() const;
+    void clearBootstrapAdminCredential() { adminCredential = ""; }
     bool rotateAdminCredential(String &newCredential);
     bool rotateApCredential(String &newCredential);
 
@@ -129,13 +154,24 @@ public:
                        const String &rootPrefix, const String &haPrefix, bool haEnable,
                        bool saveConfig = true);
 
+    // Set LTE configuration
+    bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);
+
+    // Set ethernet addressing; returns an error message, empty on success
+    String setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
+                             const String &dns1, const String &dns2, bool saveConfig = true);
+
+    // Remember that the SIM rejected the stored PIN (survives restarts, so a
+    // wrong PIN is not retried into a PUK lock)
+    void setLtePinRejected(bool rejected);
+
+    // Store the admin password hash (Preferences only)
+    bool setAdminPasswordHash(const String &hash);
+
     // Set logging level
     void setLogLevel(LogLevel level, bool saveConfig = true);
 
-    // Set timezone
-    bool setTimezone(const String &newTimezone, bool saveConfig = true);
 
-private:
-    // Helper function to validate MQTT topic format
-    bool isValidMqttTopic(const String &topic);
+    // MQTT topic prefix check (no wildcards, no leading/trailing slash)
+    static bool isValidMqttTopic(const String &topic);
 };

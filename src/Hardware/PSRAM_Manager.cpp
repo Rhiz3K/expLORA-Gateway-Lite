@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * PSRAM memory manager implementation file
  *
@@ -28,7 +28,7 @@ bool PSRAMManager::psramAvailable = false;
 // Initialization
 bool PSRAMManager::init()
 {
-    psramAvailable = esp_spiram_is_initialized();
+    psramAvailable = psramFound();
 
     if (psramAvailable)
     {

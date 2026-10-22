@@ -1,0 +1,179 @@
+/**
+ * expLORA Gateway
+ *
+ * Uplink - connectivity policy header file
+ *
+ * Copyright Pajenicko s.r.o., Igor Sverma (C) 2025
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <functional>
+#include "../config.h"
+#include "../Data/Logging.h"
+#include "../Storage/ConfigManager.h"
+#if defined(HAS_ETHERNET)
+#include <ETH.h>
+#endif
+#include "LteModem.h"
+
+/**
+ * Connectivity policy
+ *
+ * Decides which interfaces run and which one carries traffic; the interfaces
+ * themselves are the core's NetworkInterface objects (WiFi.STA, WiFi.AP, ...),
+ * so clients (MQTT, HTTP, NTP) just use NetworkClient and the default route.
+ *
+ * - ethernet (boards with HAS_ETHERNET): DHCP, preferred over WiFi through
+ *   the netif route priority, so the default route follows link state
+ * - station: connects with the configured credentials, retries every
+ *   WIFI_RECONNECT_INTERVAL while down
+ * - LTE (boards with HAS_LTE): PPP session kept up as a hot standby, carries
+ *   traffic only when neither ethernet nor station has an address
+ * - protected access point: up for AP_TIMEOUT after boot if local access is
+ *   already available; closed on reconnect, restored whenever local access is lost (immediately when there are no
+ *   WiFi credentials, otherwise after AP_RESTORE_DELAY)
+ * - captive portal (DNS + config UI) whenever the AP is up without local access
+ * - DNS: lwIP keeps one global server list that every interface overwrites
+ *   when it gets an address, so the servers of the active interface are
+ *   remembered per interface and re-applied
+ * - time: SNTP is (re)started when the device goes online, without blocking
+ */
+class Uplink
+{
+public:
+    enum class Type : uint8_t
+    {
+        None,
+        Ethernet,
+        WiFi,
+        LTE,
+    };
+
+    Uplink(ConfigManager &config, Logger &log);
+
+    // Start AP and/or station; waits up to WIFI_BOOT_CONNECT_TIMEOUT for the station
+    bool begin();
+
+    // Call from loop()
+    void process();
+
+    // Some uplink has an IP address
+    bool isOnline() const { return active != Type::None; }
+
+    // The gateway is reachable on a local network (ethernet or station has an IP)
+    bool hasLocalAccess() const;
+
+    // Interface carrying traffic and its address
+    Type getActive() const { return active; }
+    const char *getActiveName() const;
+
+    // Time: valid once synced; stale when the last sync is older than
+    // TIME_STALE_AFTER_S (the clock keeps running meanwhile)
+    bool isTimeValid() const;
+    time_t getLastTimeSync() const { return (time_t)lastTimeSync; }
+    bool isTimeStale() const;
+    // "2026-10-17 10:15:00 (synced 5 min ago)" or "not synchronized"
+    String getTimeStatus() const;
+    IPAddress getLocalIP() const;
+
+    // Access point
+    bool isApActive() const { return apActive; }
+    bool isCaptive() const { return captive; }
+    const String &getApName() const { return apName; }
+    IPAddress getApIP() const;
+    // Reapply a rotated AP password without changing an established station
+    // association. An inactive recovery AP remains inactive.
+    bool restartAccessPoint();
+    bool shutdownAccessPoint();
+
+    // Ethernet state (false on boards without ethernet)
+    bool ethernetLinkUp() const;
+    IPAddress getEthernetIP() const;
+
+#if defined(HAS_LTE)
+    const LteModem &getLte() const { return *lte; }
+#endif
+
+    // Called when the captive portal turns on or off
+    void setCaptiveCallback(std::function<void(bool)> callback) { captiveCallback = callback; }
+
+    // Called when the interface carrying traffic changes (open connections keep
+    // the old source address, so clients should reconnect)
+    void setActiveChangeCallback(std::function<void(Type)> callback) { activeChangeCallback = callback; }
+
+private:
+    ConfigManager &config;
+    Logger &logger;
+
+    String apName;
+    bool apActive = false;
+    bool bootstrapApWindow = true;
+    unsigned long lastApAttempt = 0;
+    bool captive = false;
+    Type active = Type::None;
+
+    bool localWasUp = false;
+    unsigned long localAccessSince = 0; // when local access came up
+    unsigned long localAccessLostAt = 0;
+    bool ethernetStarted = false;
+    bool ethernetWasUp = false;
+    bool stationWasConnected = false;
+    bool stationEverConnected = false;
+    bool reconnecting = false;
+    unsigned long reconnectStartedAt = 0;
+
+    static volatile bool timeSyncedFlag;
+    // Wall clock of the last successful SNTP sync; 32-bit so the SNTP task's
+    // write cannot be read torn by another task
+    static volatile uint32_t lastTimeSync;
+    bool timeSyncLogged = false;
+
+    std::function<void(bool)> captiveCallback;
+    std::function<void(Type)> activeChangeCallback;
+
+#if defined(HAS_LTE)
+    LteModem *lte = nullptr;
+#endif
+
+    // DNS servers per Type, captured on each GOT_IP event (event task)
+    static constexpr size_t TYPE_COUNT = 4;
+    IPAddress dnsServers[TYPE_COUNT][2];
+    portMUX_TYPE dnsMux = portMUX_INITIALIZER_UNLOCKED;
+    volatile bool dnsDirty = false;
+
+    void onGotIp(Type type, NetworkInterface &ifc);
+    void applyDns();
+    NetworkInterface *interfaceFor(Type type) const;
+
+    bool stationEnabled() const;
+    bool ethernetHasIP() const;
+    void startEthernet();
+    void processEthernet();
+    void processStation(unsigned long now);
+    void processLocalAccess(unsigned long now);
+    void processAp(unsigned long now);
+    bool startAp();
+    bool stopAp();
+    void selectActive();
+    void startTimeSync();
+    static void onTimeSync(struct timeval *tv);
+};
+
+// Global instance (created in main.cpp)
+extern Uplink *uplink;

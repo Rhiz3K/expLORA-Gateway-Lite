@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Main program file for the expLORA Gateway
  *
@@ -24,8 +24,8 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <time.h>
-#include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
+#include <esp_ota_ops.h>
 #include <ArduinoJson.h>
 
 // Configuration headers
@@ -38,9 +38,12 @@
 #include "Data/SensorManager.h"
 
 // Hardware
-#include "Hardware/LoRa_Module.h"
+#include "Hardware/LoRaRadio.h"
+#include "Network/Uplink.h"
 #include "Hardware/PSRAM_Manager.h"
+#include "Hardware/PowerSource.h"
 #include "Hardware/SPI_Manager.h"
+#include "Hardware/WatchdogPause.h"
 
 // Storage
 #include "Storage/ConfigManager.h"
@@ -53,55 +56,46 @@
 // Web interface
 #include "Web/WebServer.h"
 #include "Web/HTMLGenerator.h"
-#include "Security/SecurityPolicy.h"
 
 // Global object instances
 Logger logger;                // Logging system
 ConfigManager *configManager; // Configuration manager
 SPIManager *spiManager;       // SPI communication manager
-LoRaModule *loraModule;       // LoRa module
+Uplink *uplink;               // Connectivity policy
+LoRaRadio *loraModule;        // LoRa radio (chip selected in board_config.h)
 SensorManager *sensorManager; // Sensor manager
 LoRaProtocol *loraProtocol;   // LoRa protocol
 MQTTManager *mqttManager;     // MQTT Manager
 WebPortal *webPortal;         // Web interface
+PowerSource *powerSource;     // Supply source (PoE / USB) on boards that detect it
 
-// Timer for disabling AP mode
-unsigned long apStartTime = 0;
-bool temporaryAPMode = false;
+// Critical initialization must finish before loop() starts serving the device.
 bool systemReady = false;
-wl_status_t lifecycleLastWifiStatus = WL_NO_SHIELD;
-bool lifecycleWifiStatusInitialized = false;
 
-// NTP synchronization helper - returns true if time was successfully synchronized
-bool syncNTPTime(const String &timezone, unsigned long timeoutMs = NTP_SYNC_TIMEOUT_MS)
-{
-    configTime(0, 0, NTP_SERVER);
-    setenv("TZ", timezone.c_str(), 1);
-    tzset();
-
-    // Wait for actual NTP sync with timeout
-    struct tm timeinfo;
-    unsigned long startWait = millis();
-    const bool watchdogRegistered = esp_task_wdt_status(nullptr) == ESP_OK;
-    while (!getLocalTime(&timeinfo, 100))
-    {
-        if (watchdogRegistered)
-        {
-            esp_task_wdt_reset();
-        }
-        if (millis() - startWait > timeoutMs)
-        {
-            return false;
-        }
-        delay(100);
-    }
-    return true;
-}
+// Loop task stack: TLS handshakes (update check, URL OTA, HTTPS forwarding,
+// MQTT TLS) run in loop(); 8 kB left under 4 kB headroom (see /diag/heap)
+SET_LOOP_TASK_STACK_SIZE(10 * 1024);
 
 // File system initialization
 bool initFileSystem()
 {
-    if (!LittleFS.begin(true))
+    // Format only when mounting keeps failing (a blank partition on the first
+    // boot) - not on one transient error, which would wipe all settings
+    bool mounted = false;
+    for (int attempt = 0; attempt < 3 && !mounted; attempt++)
+    {
+        if (attempt > 0)
+        {
+            delay(500);
+        }
+        mounted = LittleFS.begin(false);
+    }
+    if (!mounted)
+    {
+        Serial.println("LittleFS mount failed 3 times - formatting (sensors and settings files are lost)");
+        mounted = LittleFS.begin(true);
+    }
+    if (!mounted)
     {
         Serial.println("ERROR: Failed to mount LittleFS");
         return false;
@@ -117,7 +111,7 @@ void setup()
     Serial.begin(115200);
     delay(1000); // Wait for stabilization
 
-    Serial.println("\n\nexpLORA Gateway Lite");
+    Serial.println("\n\n" BOARD_NAME);
     Serial.println("------------------------------------------------------------");
 
 // Explicit PSRAM initialization
@@ -129,18 +123,18 @@ void setup()
 #endif
 
     // Memory diagnostics
-    Serial.printf("Total heap: %d bytes\n", ESP.getHeapSize());
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Total heap: %lu bytes\n", static_cast<unsigned long>(ESP.getHeapSize()));
+    Serial.printf("Free heap: %lu bytes\n", static_cast<unsigned long>(ESP.getFreeHeap()));
 
 // PSRAM initialization
 #ifdef BOARD_HAS_PSRAM
     bool psramInitialized = false;
 
     // Try different PSRAM detection methods
-    if (esp_spiram_is_initialized())
+    if (psramFound())
     {
         psramInitialized = true;
-        Serial.println("PSRAM initialized via esp_spiram_is_initialized()");
+        Serial.println("PSRAM initialized via psramFound()");
     }
     else if (ESP.getPsramSize() > 0)
     {
@@ -150,8 +144,8 @@ void setup()
 
     if (psramInitialized)
     {
-        Serial.printf("Total PSRAM: %d bytes\n", ESP.getPsramSize());
-        Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+        Serial.printf("Total PSRAM: %lu bytes\n", static_cast<unsigned long>(ESP.getPsramSize()));
+        Serial.printf("Free PSRAM: %lu bytes\n", static_cast<unsigned long>(ESP.getFreePsram()));
     }
     else
     {
@@ -174,17 +168,9 @@ void setup()
     }
 
     // Basic log after initialization
-    logger.info("expLORA Gateway Lite starting up - Firmware v" + String(FIRMWARE_VERSION));
+    logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(FIRMWARE_VERSION));
 
-    // HTML generator initialization
-    if (!HTMLGenerator::init(true, WEB_BUFFER_SIZE))
-    {
-        logger.error("Failed to initialize HTML generator");
-        return;
-    }
-
-    // Enable the ESP32 radio entropy source before a first-boot credential may
-    // be generated. No STA association is started until WiFi.begin() below.
+    // Enable radio entropy before generating first-boot device credentials.
     if (!WiFi.mode(WIFI_STA))
     {
         logger.error("Failed to initialize WiFi entropy source");
@@ -196,7 +182,7 @@ void setup()
     if (!configManager->init())
     {
         WiFi.mode(WIFI_OFF);
-        Serial.println("ERROR: Secure NVS credential initialization failed. Repair or erase NVS over USB, then reboot.");
+        Serial.println("ERROR: Secure NVS credential initialization failed. Repair NVS over USB, then reboot.");
         logger.error("Failed to initialize configuration manager");
         return;
     }
@@ -204,28 +190,28 @@ void setup()
     // Setting logging level according to configuration
     logger.setLogLevel(configManager->logLevel);
 
-    // Physical ownership/bootstrap channel. Secrets are printed only when
-    // first generated. Existing credentials can be rotated from the
-    // authenticated Security page without erasing unrelated NVS settings.
-    const String uniqueSSID = makeApName();
+    // USB is the physical ownership channel. Newly generated secrets are
+    // shown once; migrated or existing passwords are never printed.
     Serial.println("\nSecure device access");
-    Serial.println("AP SSID: " + uniqueSSID);
-    Serial.println("Admin username: " + String(HTTP_ADMIN_USERNAME));
+    Serial.println("AP SSID: " + makeApName());
     if (configManager->wasApCredentialGeneratedThisBoot())
     {
         Serial.println("New AP credential: " + configManager->getApCredential());
     }
     if (configManager->wasAdminCredentialGeneratedThisBoot())
     {
-        Serial.println("New admin credential: " +
-                       configManager->getAdminCredential());
+        Serial.println("New admin credential: " + configManager->getAdminCredential());
     }
     if (!configManager->wasApCredentialGeneratedThisBoot() &&
         !configManager->wasAdminCredentialGeneratedThisBoot())
     {
         Serial.println("Credentials already provisioned; they are not repeated on every boot.");
     }
-    Serial.println("Keep both credentials private. Rotate them from the authenticated Security page.\n");
+    Serial.println("Keep both credentials private. Manage them from the authenticated web interface.\n");
+    configManager->clearBootstrapAdminCredential();
+
+    powerSource = new PowerSource(logger);
+    powerSource->begin();
 
     // SPI manager initialization
     spiManager = new SPIManager(logger);
@@ -240,6 +226,7 @@ void setup()
     if (!sensorManager->init())
     {
         logger.error("Failed to initialize sensor manager");
+        return;
     }
     else
     {
@@ -247,107 +234,35 @@ void setup()
                     String(sensorManager->getSensorCount()) + " sensors");
     }
 
+    // Network: ethernet, AP and/or WiFi station, time sync once online
+    uplink = new Uplink(*configManager, logger);
+    if (!uplink->begin())
+    {
+        logger.error("Protected AP startup failed; refusing open fallback");
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
     webPortal = new WebPortal(*sensorManager, logger,
                               configManager->wifiSSID, configManager->wifiPassword,
                               configManager->configMode, *configManager, configManager->timezone);
 
-    // WiFi initialization
-    logger.info("Configuring WiFi. ConfigMode: " + String(configManager->configMode ? "true" : "false") +
-                ", SSID length: " + String(configManager->wifiSSID.length()));
-
-    // Setting timer for temporary AP mode
-    apStartTime = millis();
-    temporaryAPMode = true;
-    wl_status_t setupWifiOutcome = WL_DISCONNECTED;
-
-    if (configManager->configMode || configManager->wifiSSID.length() == 0)
-    {
-        // We're in configuration mode or don't have credentials - AP mode only
-        logger.info("Starting in AP mode only");
-        if (!webPortal->startAccessPoint(false))
-        {
-            WiFi.mode(WIFI_OFF);
-            Serial.println("ERROR: Protected AP startup failed; refusing open fallback");
-            logger.error("Protected AP startup failed; setup cannot continue");
-            return;
-        }
-        logger.info("AP started with SSID: " + uniqueSSID + ", IP: " + WiFi.softAPIP().toString());
-
-        configManager->enableConfigMode(true);
-    }
-    else
-    {
-        // We have credentials - start AP+STA mode
-        logger.info("Starting in AP+STA mode (dual mode)");
-        if (!webPortal->startAccessPoint(true))
-        {
-            WiFi.mode(WIFI_OFF);
-            Serial.println("ERROR: Protected temporary AP startup failed; refusing open fallback");
-            logger.error("Protected temporary AP startup failed; setup cannot continue");
-            return;
-        }
-        logger.info("Temporary AP started with SSID: " + uniqueSSID +
-                    " (will be active for 5 minutes). IP: " + WiFi.softAPIP().toString());
-
-        // Configure STA part (client)
-        logger.info("Attempting to connect to configured WiFi network");
-        WiFi.begin(configManager->wifiSSID.c_str(), configManager->wifiPassword.c_str());
-
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20)
-        {
-            delay(500);
-            Serial.print(".");
-            attempts++;
-        }
-
-        if (WiFi.status() == WL_CONNECTED)
-        {
-            setupWifiOutcome = WL_CONNECTED;
-            logger.info("WiFi connected! IP: " + WiFi.localIP().toString());
-            configManager->enableConfigMode(false);
-
-            // Initialize NTP with sync verification
-            if (syncNTPTime(configManager->timezone))
-            {
-                logger.info("NTP time synchronized successfully");
-                logger.setTimeInitialized(true);
-            }
-            else
-            {
-                logger.warning("NTP sync failed - time not available");
-            }
-        }
-        else
-        {
-            logger.warning("Failed to connect to configured WiFi after " + String(attempts) +
-                           " attempts; keeping protected AP+STA active for automatic reconnect");
-            // Keep STA enabled. ESP32 auto-reconnect can still succeed later,
-            // at which point the normal connected transition shuts down AP.
-        }
-    }
-
-    // Snapshot the result of the initial connection attempt. If STA connects
-    // later while the remaining setup work runs, the first loop iteration
-    // observes the transition and explicitly shuts down the recovery AP.
-    lifecycleLastWifiStatus = setupWifiOutcome;
-    lifecycleWifiStatusInitialized = true;
-
     // LoRa module initialization
-    loraModule = new LoRaModule(logger, spiManager);
+    loraModule = createLoRaRadio(logger, spiManager);
     if (!loraModule->init())
     {
         logger.error("Failed to initialize LoRa module");
+        return;
     }
     else
     {
-        logger.info("LoRa module initialized successfully");
+        logger.info(String("LoRa module initialized successfully (") + loraModule->getChipName() + ")");
     }
 
     // LoRa protocol initialization
     loraProtocol = new LoRaProtocol(*loraModule, *sensorManager, logger);
 
-    // Initialize MQTT Manager if WiFi is connected
+    // Initialize MQTT Manager
     mqttManager = new MQTTManager(*sensorManager, *configManager, logger);
     if (!mqttManager->init())
     {
@@ -357,6 +272,7 @@ void setup()
     if (!webPortal->init())
     {
         logger.error("Failed to initialize web portal");
+        return;
     }
     else
     {
@@ -365,15 +281,30 @@ void setup()
 
     webPortal->setMqttManager(mqttManager);
 
+    // Captive portal follows local network access
+    uplink->setCaptiveCallback([](bool captive)
+                               { webPortal->setAPMode(captive); });
+
+    // MQTT session stays on the old interface's address - reconnect over the new one
+    uplink->setActiveChangeCallback([](Uplink::Type)
+                                    { mqttManager->disconnect(); });
+
     // Initialize task watchdog
-    esp_task_wdt_init(WDT_TIMEOUT, true); // Enable panic on timeout
-    esp_task_wdt_add(NULL);               // Add current task to watchdog
+    // The core already starts the TWDT (5 s, idle task on CPU0) - only change timeout, keep panic
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms = WDT_TIMEOUT * 1000,
+        .idle_core_mask = 1 << 0,
+        .trigger_panic = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE)
+    {
+        esp_task_wdt_init(&wdtConfig);
+    }
+    esp_task_wdt_add(NULL); // Add current task to watchdog
     logger.info("Task watchdog initialized with timeout of " + String(WDT_TIMEOUT) + " seconds");
 
-    // A freshly installed image remains rollback-eligible until all critical
-    // storage, radio, protocol, and management components initialize. Only
-    // now confirm it to the bootloader; a crash/reset before here restores the
-    // previous known-good slot.
+    // Keep the new slot pending until storage, radio, protocol and management
+    // have initialized. A reset before confirmation rolls back to the old slot.
     const esp_partition_t *runningPartition = esp_ota_get_running_partition();
     esp_ota_img_states_t imageState;
     if (runningPartition != nullptr &&
@@ -382,7 +313,7 @@ void setup()
     {
         if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK)
         {
-            logger.error("Could not confirm the pending OTA image; rebooting for rollback");
+            logger.error("Could not confirm pending OTA image; rebooting for rollback");
             delay(250);
             ESP.restart();
             return;
@@ -397,10 +328,7 @@ void setup()
 // Loop - main loop
 void loop()
 {
-    // setup() can fail closed before global components exist (notably when
-    // NVS cannot persist the per-device credential). Arduino still calls
-    // loop() after setup() returns, so keep the radio/server inert and avoid
-    // dereferencing partially initialized globals.
+    // setup() may fail closed before all components exist.
     if (!systemReady)
     {
         delay(1000);
@@ -409,92 +337,20 @@ void loop()
 
     esp_task_wdt_reset();
 
-    // Detect WiFi status transitions and adapt web server routes
-    wl_status_t currentWifiStatus = WiFi.status();
-    if (!lifecycleWifiStatusInitialized)
+    // setup() stopped early (filesystem / configuration failure, logged)
+    if (!uplink || !powerSource)
     {
-        lifecycleLastWifiStatus = currentWifiStatus;
-        lifecycleWifiStatusInitialized = true;
-    }
-    if (lifecycleLastWifiStatus != currentWifiStatus)
-    {
-        // On transition to connected, update portal mode (routes are always registered)
-        if (currentWifiStatus == WL_CONNECTED)
-        {
-            logger.info("WiFi connected (transition). Closing recovery AP.");
-            // A connection observed after the initial setup snapshot is a
-            // reconnect, not the intentional five-minute bootstrap window.
-            // Clear the window flag so a failed radio-disable operation is
-            // retried below until the AP mode bit is actually gone.
-            temporaryAPMode = false;
-            if (webPortal &&
-                SecurityPolicy::decideApLifecycleAction(
-                    SecurityPolicy::ApLifecycleEvent::StaReconnected, true) ==
-                    SecurityPolicy::ApLifecycleAction::ShutDown)
-            {
-                webPortal->shutdownAccessPoint();
-            }
-        }
-        // On transition away from connected, switch portal to AP mode so handlers reflect captive state
-        else if (lifecycleLastWifiStatus == WL_CONNECTED && currentWifiStatus != WL_CONNECTED)
-        {
-            logger.warning("WiFi disconnected (transition). Switching web portal to AP mode.");
-            if (webPortal &&
-                SecurityPolicy::decideApLifecycleAction(
-                    SecurityPolicy::ApLifecycleEvent::StaDisconnected, false) ==
-                    SecurityPolicy::ApLifecycleAction::EnsureRunning)
-            {
-                webPortal->setAPMode(true);
-                // No immediate restart to avoid flapping; routes will still serve config via handlers
-            }
-        }
-        lifecycleLastWifiStatus = currentWifiStatus;
+        delay(1000);
+        return;
     }
 
-    // Check timer for temporary AP mode
-    if (temporaryAPMode && !configManager->configMode && configManager->wifiSSID.length() > 0)
-    {
-        if (millis() - apStartTime > AP_TIMEOUT)
-        {
-            const bool staConnected = WiFi.status() == WL_CONNECTED;
-            const SecurityPolicy::ApLifecycleAction action =
-                SecurityPolicy::decideApLifecycleAction(
-                    SecurityPolicy::ApLifecycleEvent::TemporaryWindowExpired,
-                    staConnected);
-            if (action == SecurityPolicy::ApLifecycleAction::ShutDown)
-            {
-                logger.info("Temporary AP timeout reached. Shutting down AP radio.");
-                if (webPortal)
-                {
-                    webPortal->shutdownAccessPoint();
-                }
-            }
-            else
-            {
-                logger.info("Temporary AP timeout reached but WiFi client not connected. Keeping AP mode active.");
-            }
-            // If disconnected, the AP stays up, but a later STA transition
-            // still runs the same shutdown operation above.
-            temporaryAPMode = false;
-        }
-    }
-
-    // A radio-mode change can fail transiently. Once the temporary bootstrap
-    // window is over (or a reconnect closed it early), retry AP-only shutdown
-    // without touching an established STA association.
-    static unsigned long lastApShutdownRetry = 0;
-    if (!temporaryAPMode && WiFi.status() == WL_CONNECTED && webPortal &&
-        webPortal->isAccessPointActive() &&
-        millis() - lastApShutdownRetry > 5000)
-    {
-        lastApShutdownRetry = millis();
-        logger.warning("AP radio still active while STA is connected; retrying shutdown");
-        webPortal->shutdownAccessPoint();
-    }
+    // Connectivity: station reconnect, AP / captive portal, time sync
+    uplink->process();
+    powerSource->process();
 
     // Process LoRa packets
     // if (loraModule && loraProtocol) {
-    //    if (LoRaModule::hasInterrupt()) {
+    //    if (LoRaRadio::hasInterrupt()) {
     //        logger.debug("LoRa interrupt detected");
     //        loraProtocol->processReceivedPacket();
     //    }
@@ -512,85 +368,93 @@ void loop()
         webPortal->handleClient();
     }
 
-    // Process MQTT communication
-    if (mqttManager && WiFi.status() == WL_CONNECTED)
+    // Process MQTT communication (settings changes are applied even offline)
+    if (mqttManager)
     {
-        mqttManager->process();
+        mqttManager->process(); // pauses the watchdog itself around socket work
     }
 
     // Add a check for LoRa packet processing to publish to MQTT
-    if (loraModule && loraProtocol && LoRaModule::hasInterrupt())
+    if (loraModule && loraProtocol && LoRaRadio::hasInterrupt())
     {
         if (loraProtocol->processReceivedPacket())
         {
             // If we have a mqttManager and it's connected, publish the latest sensor data
-            if (mqttManager && WiFi.status() == WL_CONNECTED)
+            if (mqttManager && uplink->isOnline())
             {
+                WatchdogPause pause;
                 mqttManager->publishSensorData(loraProtocol->getLastProcessedSensorIndex());
             }
         }
     }
 
-    // Check WiFi connection and reconnect if needed.
-    // Non-blocking state machine: kick off WiFi.begin() once per
-    // WIFI_RECONNECT_INTERVAL window, then poll status across loop iterations
-    // up to RECONNECT_ATTEMPT_TIMEOUT_MS before giving up. Keeps web/DNS/MQTT/LoRa
-    // responsive throughout the reconnect window.
+    // Short delay for stability
+    delay(5);
+
+    // The web server refuses requests while the largest free block is below
+    // 8 kB; if fragmentation keeps it there for 15 minutes, restart rather than stay
+    // unmanageable until someone power-cycles the gateway
+    static unsigned long lowBlockSince = 0;
+    if (ESP.getMaxAllocHeap() < 8192)
     {
-        enum class ReconnectState { Idle, InProgress };
-        static ReconnectState reconnectState = ReconnectState::Idle;
-        static unsigned long reconnectStartedAt = 0;
-        constexpr unsigned long RECONNECT_ATTEMPT_TIMEOUT_MS = 5000; // matches old 10 * 500ms
-
-        if (!configManager->configMode && WiFi.status() != WL_CONNECTED)
+        if (lowBlockSince == 0)
         {
-            unsigned long now = millis();
-
-            if (reconnectState == ReconnectState::Idle)
-            {
-                if (now - configManager->lastWifiAttempt > WIFI_RECONNECT_INTERVAL)
-                {
-                    logger.info("Attempting to reconnect to WiFi...");
-                    configManager->lastWifiAttempt = now;
-                    WiFi.begin(configManager->wifiSSID.c_str(), configManager->wifiPassword.c_str());
-                    reconnectStartedAt = now;
-                    reconnectState = ReconnectState::InProgress;
-                }
-            }
-            else // ReconnectState::InProgress
-            {
-                if (WiFi.status() == WL_CONNECTED)
-                {
-                    logger.info("WiFi reconnected! IP: " + WiFi.localIP().toString());
-                    // NTP sync verification (note: this call may still block briefly)
-                    if (syncNTPTime(configManager->timezone))
-                    {
-                        logger.info("NTP time re-synchronized successfully");
-                        logger.setTimeInitialized(true);
-                    }
-                    else
-                    {
-                        logger.warning("NTP re-sync failed after WiFi reconnect");
-                    }
-                    reconnectState = ReconnectState::Idle;
-                }
-                else if (now - reconnectStartedAt > RECONNECT_ATTEMPT_TIMEOUT_MS)
-                {
-                    logger.warning("Failed to reconnect to WiFi");
-                    reconnectState = ReconnectState::Idle;
-                }
-                // else: keep waiting; loop continues to service web/MQTT/LoRa
-            }
+            lowBlockSince = millis() | 1;
+            logger.warning("Heap fragmented: largest free block " + String(ESP.getMaxAllocHeap()) + " B");
         }
-        else if (reconnectState == ReconnectState::InProgress)
+        else if (millis() - lowBlockSince > 900000)
         {
-            // Connected (or no longer trying) via some other path while we were waiting.
-            reconnectState = ReconnectState::Idle;
+            logger.error("Heap fragmented for 15 minutes - restarting");
+            if (sensorManager)
+            {
+                sensorManager->saveSensors(true); // keep the rain totals
+            }
+            delay(200);
+            ESP.restart();
+        }
+    }
+    else
+    {
+        lowBlockSince = 0;
+    }
+
+    // Radio health: a chip that stopped answering (brown-out, ESD) is
+    // re-initialized instead of silently receiving nothing
+    static unsigned long lastRadioCheck = 0;
+    if (loraModule && millis() - lastRadioCheck > 600000)
+    {
+        lastRadioCheck = millis();
+        if (!loraModule->isConnected())
+        {
+            logger.error("LoRa radio not responding - resetting it");
+            loraModule->reset();
         }
     }
 
-    // Short delay for stability
-    delay(5);
+    if (sensorManager)
+    {
+        sensorManager->process(millis());
+    }
+
+    // Physical serial recovery: generate and print a replacement admin password
+    static String serialLine;
+    while (Serial.available())
+    {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r')
+        {
+            serialLine.trim();
+            if (serialLine == "reset-password" && webPortal)
+            {
+                webPortal->resetAdminPassword();
+            }
+            serialLine = "";
+        }
+        else if (serialLine.length() < 32)
+        {
+            serialLine += c;
+        }
+    }
 
     // Periodically rotate per-sensor health buckets so a dead-silent sensor
     // (no packets at all) eventually drops out of the 24h "OK" tally instead
@@ -605,7 +469,7 @@ void loop()
         }
     }
 
-    // Memory diagnostics and time check every 10 minutes
+    // Memory diagnostics every 10 minutes
     static unsigned long lastMemCheck = 0;
     if (millis() - lastMemCheck > 600000)
     { // 10 minutes
@@ -615,36 +479,11 @@ void loop()
                     " bytes, Largest block: " + String(ESP.getMaxAllocHeap()) + " bytes");
 
 #ifdef BOARD_HAS_PSRAM
-        if (esp_spiram_is_initialized())
+        if (psramFound())
         {
             logger.debug("PSRAM status - Free: " + String(ESP.getFreePsram()) +
                          " bytes, Largest block: " + String(ESP.getMaxAllocPsram()) + " bytes");
         }
 #endif
-
-        // Periodic time check - re-sync if time was lost
-        struct tm timeinfo;
-        if (!getLocalTime(&timeinfo, 100))
-        {
-            logger.warning("System time invalid - attempting NTP re-sync");
-            if (WiFi.status() == WL_CONNECTED)
-            {
-                if (syncNTPTime(configManager->timezone))
-                {
-                    logger.info("NTP time recovered successfully");
-                    logger.setTimeInitialized(true);
-                }
-                else
-                {
-                    logger.error("NTP re-sync failed - time remains unavailable");
-                    logger.setTimeInitialized(false);
-                }
-            }
-            else
-            {
-                logger.warning("Cannot sync time - WiFi not connected");
-                logger.setTimeInitialized(false);
-            }
-        }
     }
 }

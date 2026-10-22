@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Web portal manager header file
  *
@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <mutex>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <DNSServer.h>
@@ -29,6 +30,7 @@
 #include "../Data/Logging.h"
 #include "../Storage/ConfigManager.h"
 #include "../Protocol/MQTTManager.h"
+#include "WebAuth.h"
 
 /**
  * Class for web portal management
@@ -39,16 +41,23 @@
 class WebPortal
 {
 private:
+    // Task handle for web server
+    // TaskHandle_t webServerTaskHandle = NULL;
+
     MQTTManager *mqttManager; // Reference to MQTT manager
+
+    // Static task function for the second core
+    static void webServerTask(void *parameter);
+
+    // Processing flag to avoid race conditions
+    volatile bool isProcessing = false;
 
     AsyncWebServer server;        // Asynchronous web server
     DNSServer dnsServer;          // DNS server for captive portal
     SensorManager &sensorManager; // Reference to sensor manager
     Logger &logger;               // Reference to logger
 
-    bool isAPMode;      // Captive portal/UI state, independent of AP hardware
-    bool apRadioActive; // Physical AP radio state
-    String apName; // AP name in AP mode
+    bool isAPMode; // AP mode (true) or client mode (false)
     bool routesRegistered = false; // Ensure routes are registered only once
     bool serverStarted = false;    // Track server begin/end state
 
@@ -74,28 +83,52 @@ private:
                    const String &message, int progress);
     void setOtaStatus(const String &status, const String &message, int progress);
     void cleanupFirmwareUpload(AsyncWebServerRequest *request, bool disconnected);
-    static void firmwareUpdateTask(void *parameter);
+    static void runFirmwareUpdate(void *parameter);
 
-    // Bring the AP up additively without disturbing an active STA. Idempotent.
-    bool ensureAPUp();
-
-    // Stop captive DNS and the physical AP while preserving STA association.
-    void shutdownAP();
+    // TLS work runs on the larger loop stack after the async response flush.
+    std::mutex otaWorkMutex;
+    void *pendingOtaContext = nullptr;
+    bool updateCheckRequested = false;
+    bool updateCheckRunning = false;
+    bool updateCheckDone = false;
+    int updateCheckStatus = 0;
+    String updateCheckResult;
+    unsigned long updateCheckAt = 0;
+    void runUpdateCheck();
+    void fetchFirmwareManifest(int &status, String &result);
 
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
-    bool restartRequested = false;
-    unsigned long restartAt = 0;
+    volatile bool restartRequested = false; // set by handlers (async task), read by the loop
+
+    volatile unsigned long restartAt = 0; // always written before restartRequested
 
     ConfigManager &configManager; // Reference to configuration
+    WebAuth auth;                 // Admin password and login sessions
+
+    // Every route except a few public ones needs a login (see setupRoutes)
+    void requireLogin(AsyncWebServerRequest *request, ArMiddlewareNext next);
+    void handleLogin(AsyncWebServerRequest *request);
+    void handleLoginPost(AsyncWebServerRequest *request);
+    void handleLogout(AsyncWebServerRequest *request);
+    void handlePassword(AsyncWebServerRequest *request);
+    void handlePasswordPost(AsyncWebServerRequest *request);
 
     // Setup routes for web server
     void setupRoutes();
-    // Central authentication and same-origin policy for management requests.
-    bool isRequestAuthorized(AsyncWebServerRequest *request, bool stateChanging) const;
+    bool isRequestAuthorized(AsyncWebServerRequest *request, bool stateChanging);
     bool authorizeRequest(AsyncWebServerRequest *request, bool stateChanging);
-    // Guard handlers: if AP mode, redirect to /config and return true
+    // First setup (AP, no WiFi configured, no uplink): redirect to /config, true
     bool guardAPOnly(AsyncWebServerRequest *request);
+
+    // Create content for individual pages
+    String createHomePage();
+    String createConfigPage();
+    String createSensorsPage();
+    String createSensorAddPage();
+    String createSensorEditPage(int index);
+    String createLogsPage();
+    String createAPIPage();
 
     // Process HTTP requests
     void handleRoot(AsyncWebServerRequest *request);
@@ -111,13 +144,18 @@ private:
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);
     void handleAPI(AsyncWebServerRequest *request);
+    void handleNetwork(AsyncWebServerRequest *request);
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+    void handleNetworkPost(AsyncWebServerRequest *request);
+#endif
+    void handleDiagNetwork(AsyncWebServerRequest *request);
     void handleMqtt(AsyncWebServerRequest *request);
     void handleMqttPost(AsyncWebServerRequest *request);
     void handleSecurity(AsyncWebServerRequest *request);
     void handleSecurityRotate(AsyncWebServerRequest *request);
+    void handleFirmwareStatus(AsyncWebServerRequest *request);
     void handleFirmwareVersion(AsyncWebServerRequest *request);
     void handleFirmwareCheck(AsyncWebServerRequest *request);
-    void handleFirmwareStatus(AsyncWebServerRequest *request);
     void handleFirmwareUpdate(AsyncWebServerRequest *request);
     void handleReboot(AsyncWebServerRequest *request);
     void handleNotFound(AsyncWebServerRequest *request);
@@ -127,6 +165,15 @@ private:
     void handleFirmwarePage(AsyncWebServerRequest *request);
     void handleFirmwareUploadComplete(AsyncWebServerRequest *request);
     void handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+
+
+    // Receive WebSocket messages
+    void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                          AwsEventType type, void *arg, uint8_t *data, size_t len);
+
+    // Send updates via WebSocket
+    void sendSensorUpdates();
+    void sendLogUpdates();
 
 public:
     // Constructor
@@ -144,24 +191,21 @@ public:
     // Process DNS requests (for captive portal)
     void processDNS();
 
-    // Start the WPA2 AP. If allowStation is true, preserve/use STA mode too.
-    bool startAccessPoint(bool allowStation);
-
     // Switch between AP and client modes
     void setAPMode(bool enable);
-
-    // Explicit physical AP shutdown used by timeout and reconnect paths.
+    bool startAccessPoint(bool allowStation);
     void shutdownAccessPoint();
+    bool isAccessPointActive() const;
 
     // Get current mode
     bool isInAPMode() const;
-
-    // Get physical AP state (separate from captive portal/UI state).
-    bool isAccessPointActive() const;
 
     // Restart web server
     void restart();
 
     // Set MQTTManager reference
     void setMqttManager(MQTTManager *manager) { mqttManager = manager; }
+
+    // Forgotten admin password: replaced from the serial console
+    void resetAdminPassword() { auth.resetPassword(); }
 };

@@ -1,6 +1,6 @@
 # expLORA Gateway integration tests
 
-End-to-end Python smoke test for a running expLORA Gateway Lite device.
+End-to-end Python smoke test for a running expLORA Gateway device (Lite or Pro).
 Complements the host-side `pio test -e native` unit tests (which only
 cover pure logic in isolation) by exercising the full RX path on real
 hardware: HTTP API, web UI, WiFi provisioning, LoRa decode, calibration.
@@ -26,12 +26,13 @@ home WiFi password, and sensor device key never get committed.
 
 | Section | Cases | What it covers |
 |---|---|---|
-| Authentication/read-only smoke | 15 | unauthenticated 401 challenge on `/config` and `POST /firmware`, authenticated firmware version/manifest/status, rejected bad-digest cleanup, API, UI, diagnostics, logs, and 404 handling |
-| POST validation/security | 7 | Empty SSID, short password, missing param, SSID > 32 chars, firmware digest rejection and cleanup, authenticated cross-origin POST rejection, and Origin/Host port validation |
+| Login | 4 | Login redirect, public read-only API, wrong-password rejection, and authenticated session |
+| Authentication/read-only smoke | 15 | login redirect on `/config`, unauthorized `POST /firmware`, firmware version/manifest/status, rejected bad-digest cleanup, API, UI, diagnostics, logs, and 404 handling |
+| POST validation/security | 7 | Empty SSID, short password, missing param, SSID > 32 chars, authenticated cross-origin POST rejection, invalid serial number, and unsupported sensor type |
 | Live sensor round-trip | 4 | Adds the sensor → waits up to 20 min for a real LoRa packet → checks decoded values are in physical ranges → confirms sensor appears in `/sensors` HTML |
 | Reboot recovery | 1 | authenticated `POST /reboot` → waits for device to drop off → waits up to 60 s for it to come back with the same version |
 
-27 tests total when fully configured (sensor SN set, reboot enabled).
+31 checks total when fully configured (sensor SN set, reboot enabled).
 
 ### Issue #23 storage/concurrency stress test
 
@@ -88,17 +89,17 @@ the previous MQTT settings in `finally`.
 
 ## Provisioning flow (first run, gateway with no STA config)
 
-When `[gateway].ip` is empty or unreachable, the script provisions the
-device automatically:
+When `[gateway].ip` is empty or unreachable, provisioning requires the explicit
+`--provision` flag because it changes the host's WiFi connection:
 
 1. Reads UART to discover the actual AP SSID (`expLORA-GW-XXXXXX`) and any
    newly generated AP/admin credentials.
 2. macOS: switches WiFi via
    `networksetup -setairportnetwork en0 <ssid> <ap-credential>`
    Linux/Windows: prints `Connect to <ssid>` and waits for ENTER
-3. Authenticates as `admin` and POSTs `[wifi].ssid` + `[wifi].password` to
+3. Logs in with the admin password and POSTs `[wifi].ssid` + `[wifi].password` to
    `http://192.168.4.1/config`
-4. Watches UART for `expLORA Gateway Lite starting up` (= reboot)
+4. Watches UART for `expLORA Gateway <board> starting up` (= reboot)
 5. Watches UART for `WiFi connected! IP: x.x.x.x` (= STA joined)
 6. Switches host WiFi back to home
 7. Runs the test suite against the discovered IP
@@ -116,7 +117,7 @@ required fields:
 [gateway]
 # Printed only when generated; persist them in this gitignored file.
 ap_credential =
-admin_credential =
+admin_password =
 
 [wifi]
 ssid = my-home-wifi
@@ -128,7 +129,7 @@ key = D43C2780
 type = 1
 ```
 
-If `[gateway].ip` is empty, the script will provision. For an already
+If `[gateway].ip` is empty, pass `--provision` to provision. For an already
 provisioned IP, set both credentials in the gitignored config. Existing values
 are deliberately not repeated over serial on each boot. If `[test_sensor].sn`
 is empty, the live-packet test is skipped.
@@ -164,7 +165,7 @@ python3 tests/integration/test_gateway.py --config tests/integration/config.ini 
 python3 tests/integration/test_gateway.py --config tests/integration/config.ini --rebuild
 
 # Truly fresh every run (re-provisions WiFi from scratch)
-python3 tests/integration/test_gateway.py --config tests/integration/config.ini --rebuild --erase
+python3 tests/integration/test_gateway.py --config tests/integration/config.ini --rebuild --erase --provision
 ```
 
 `--rebuild` and `--erase` imply `--flash`. The script locates the `pio`
@@ -203,9 +204,9 @@ python3 tests/integration/test_gateway.py \
   it gone.
 - **Flashes only when explicitly requested.** `--flash`, `--rebuild`, or
   `[flash].before_test` are opt-in. The normal suite never installs an image;
-  it does verify that a bad digest is rejected and the OTA lock is freed.
+  it does verify that an invalid image/digest is rejected and the OTA lock is freed.
 
-All management requests made by the suite use HTTP Basic authentication.
+All management requests made by the suite use an authenticated login cookie.
 Browser-style mutations are protected by the firmware's strict Origin/Host
 check; the Python client omits `Origin`, which is the documented policy for
 direct authenticated clients. Reboot, sensor deletion, and log clear are

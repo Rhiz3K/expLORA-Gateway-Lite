@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Sensor manager header file
  *
@@ -38,6 +38,7 @@ class SensorManager
 {
 private:
     SensorData sensors[MAX_SENSORS]; // Array of sensors - limited to MAX_SENSORS
+    bool pendingAdds[MAX_SENSORS] = {}; // Excluded from storage until fully configured
     size_t sensorCount;              // Current number of sensors
     mutable std::mutex sensorMutex;  // Mutex for safe multi-threaded access
     Logger &logger;                  // Reference to logger
@@ -46,8 +47,11 @@ private:
     // Filename for storing sensor configuration
     const char *sensorsFile;
 
-    // Forward an immutable snapshot without holding sensorMutex.
-    bool forwardSensorSnapshot(const SensorData &sensor);
+    // Daily rain totals changed since the last save (saved from process())
+    bool rainDirty = false;
+    unsigned long lastRainSave = 0;
+
+    bool saveSensorsLocked();
 
 public:
     // Constructor
@@ -59,8 +63,18 @@ public:
     // Sensor manager initialization
     bool init();
 
-    // Add a new sensor
+    // Add a new sensor; returns its index, -1 when full, -2 when the serial
+    // number is already used
     int addSensor(SensorType deviceType, uint32_t serialNumber, uint32_t deviceKey, const String &name);
+
+    // Remove only a new sensor whose complete configuration was never saved.
+    bool discardUnsavedSensor(int index);
+
+    // Copy of a configured sensor, taken under the lock; false if none
+    bool getSensorCopy(int index, SensorData &out) const;
+
+    // Deferred work (rain total saves), call from loop()
+    void process(unsigned long now);
 
     // Find sensor by serial number
     int findSensorBySN(uint32_t serialNumber);
@@ -105,8 +119,8 @@ public:
     // Load sensor configuration from file
     bool loadSensors();
 
-    // Forward sensor data to HTTP
-    bool forwardSensorData(int index);
+    // Forward sensor data to HTTP (blocking - never call with the lock held)
+    bool forwardSensorData(const SensorData &sensor);
 
     // Convert relative pressure to absolute pressure
     double relativeToAbsolutePressure(double p0_hpa, int altitude_m, double temp_c);

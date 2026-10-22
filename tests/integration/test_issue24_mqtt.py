@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from gateway_auth import ensure_login
 
 
 FIXTURE_SERIAL = "EFFE24"
@@ -222,7 +223,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--admin-username", default="admin")
-    parser.add_argument("--admin-credential", required=True)
+    parser.add_argument("--admin-password", "--admin-credential", dest="admin_credential", required=True)
     parser.add_argument(
         "--broker-host",
         required=True,
@@ -234,7 +235,7 @@ def main() -> int:
 
     base = args.url.rstrip("/")
     session = requests.Session()
-    session.auth = (args.admin_username, args.admin_credential)
+    ensure_login(session, base, args.admin_credential)
     session.headers.update({"User-Agent": "explora-issue24-mqtt-hw-test/1.0"})
 
     original_fields, original_checked = read_mqtt_form(session, base)
@@ -334,7 +335,8 @@ def main() -> int:
             fixture_index = find_fixture_index(session, base)
         if fixture_index is not None:
             deleted = post_form(
-                session, base, "/sensors/delete", {"index": str(fixture_index)}
+                session, base, "/sensors/delete",
+                {"index": str(fixture_index), "sn": FIXTURE_SERIAL},
             )
             if deleted.status_code not in (200, 302, 303):
                 raise TestFailure(

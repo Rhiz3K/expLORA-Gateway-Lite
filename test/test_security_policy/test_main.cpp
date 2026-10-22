@@ -73,6 +73,28 @@ static void test_manifest_url_has_separate_exact_policy(void)
         "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json?channel=dev"));
 }
 
+static void test_ota_policy_keeps_lite_and_pro_targets_separate(void)
+{
+    const std::string lite = "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json";
+    const std::string pro = "https://pajenicko.cz/webflash/explora-gw-pro-autoupdate.json";
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedManifestUrl(pro, pro));
+    TEST_ASSERT_TRUE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-pro/firmware.bin", pro));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedManifestUrl(lite, pro));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedManifestUrl(pro, lite));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-lite/firmware.bin", pro));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-pro/firmware.bin", lite));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-pro/../explora-gw-lite/firmware.bin", pro));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-pro/%2e%2e/firmware.bin", pro));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedManifestUrl(pro, "https://evil.example/manifest.json"));
+    TEST_ASSERT_FALSE(SecurityPolicy::isAllowedFirmwareUrl(
+        "https://pajenicko.cz/webflash/explora-gw-pro/firmware.bin", "https://evil.example/manifest.json"));
+}
+
 static void test_semantic_version_ordering(void)
 {
     TEST_ASSERT_TRUE(SecurityPolicy::isVersionNewer("1.1.14", "1.1.14-dev-secure"));
@@ -180,6 +202,7 @@ int main(int, char **)
     RUN_TEST(test_secret_update_preserves_replaces_and_clears);
     RUN_TEST(test_official_firmware_urls_are_allowed);
     RUN_TEST(test_manifest_url_has_separate_exact_policy);
+    RUN_TEST(test_ota_policy_keeps_lite_and_pro_targets_separate);
     RUN_TEST(test_semantic_version_ordering);
     RUN_TEST(test_firmware_url_rejects_scheme_host_userinfo_and_port_bypasses);
     RUN_TEST(test_firmware_url_rejects_deceptive_or_encoded_paths);

@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * HTML content generator implementation file
  *
@@ -22,123 +22,38 @@
 #include "HTMLGenerator.h"
 #include <esp_heap_caps.h>
 #include <algorithm>
-#include <cstring>
 #include <Arduino.h>
 #include <WiFi.h>
+#include "../Hardware/PowerSource.h"
+#include "../Network/Uplink.h"
 #include "../config.h"
 #include "../Security/SecurityPolicy.h"
 
-static String escapeHtml(const String &value)
+String HTMLGenerator::htmlEscape(const String &text)
 {
-    return String(SecurityPolicy::htmlEscape(value.c_str()).c_str());
-}
-
-static bool appendBounded(char *buffer, size_t capacity, size_t &contentLen,
-                          const String &text)
-{
-    if (buffer == nullptr || capacity == 0 || contentLen >= capacity)
-    {
-        return false;
-    }
-
-    const size_t available = capacity - contentLen - 1; // preserve trailing NUL
-    if (text.length() > available)
-    {
-        return false;
-    }
-
-    memcpy(buffer + contentLen, text.c_str(), text.length());
-    contentLen += text.length();
-    buffer[contentLen] = '\0';
-    return true;
-}
-
-// Initialization of static variables
-char *HTMLGenerator::htmlBuffer = nullptr;
-size_t HTMLGenerator::htmlBufferSize = WEB_BUFFER_SIZE;
-bool HTMLGenerator::usePSRAM = false;
-std::mutex HTMLGenerator::htmlBufferMutex;
-
-// Generator initialization
-bool HTMLGenerator::init(bool usePsram, size_t bufferSize)
-{
-    // If buffer is already initialized, free it first
-    if (htmlBuffer != nullptr)
-    {
-        deinit();
-    }
-
-    htmlBufferSize = bufferSize;
-
-#ifdef BOARD_HAS_PSRAM
-    usePSRAM = true;
-    htmlBuffer = (char *)heap_caps_malloc(htmlBufferSize, MALLOC_CAP_SPIRAM);
-
-    if (htmlBuffer != nullptr)
-    {
-        Serial.printf("HTMLGenerator: Allocated %u bytes in PSRAM for HTML content\n", htmlBufferSize);
-    }
-    else
-    {
-        // Fallback to regular RAM
-        usePSRAM = false;
-        htmlBuffer = new char[htmlBufferSize];
-        Serial.printf("HTMLGenerator: Failed to allocate PSRAM, using %u bytes in RAM\n", htmlBufferSize);
-    }
-#else
-    usePSRAM = false;
-    htmlBuffer = new char[htmlBufferSize];
-    Serial.printf("HTMLGenerator: Using %u bytes in RAM for HTML content\n", htmlBufferSize);
-#endif
-
-    // Check if memory allocation was successful
-    if (htmlBuffer == nullptr)
-    {
-        Serial.println("HTMLGenerator: Failed to allocate memory for HTML buffer");
-        return false;
-    }
-
-    return true;
-}
-
-// Resource release
-void HTMLGenerator::deinit()
-{
-    if (htmlBuffer != nullptr)
-    {
-#ifdef BOARD_HAS_PSRAM
-        if (usePSRAM)
-        {
-            heap_caps_free(htmlBuffer);
-        }
-        else
-        {
-#endif
-            delete[] htmlBuffer;
-#ifdef BOARD_HAS_PSRAM
-        }
-#endif
-        htmlBuffer = nullptr;
-    }
+    return String(SecurityPolicy::htmlEscape(text.c_str()).c_str());
 }
 
 // Adding HTML header code
-void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMode)
+void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMode, bool navigation)
 {
     html += "<!DOCTYPE html><html><head>";
     html += "<meta charset='UTF-8'>";
-    html += "<title>" + escapeHtml(title) + " - expLORA Gateway Lite</title>";
+    html += "<title>" + title + " - " BOARD_NAME "</title>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
 
     // Add CSS styles
     addStyles(html);
 
     html += "</head><body>";
-    html += "<header><h1>expLORA Gateway Lite</h1><h2>" + escapeHtml(title) + "</h2></header>";
+    html += "<header><h1>" BOARD_NAME "</h1><h2>" + title + "</h2></header>";
 
-    // Recovery AP keeps the authenticated security and OTA controls
-    // available, so a broken STA configuration can still be repaired safely.
-    if (!isAPMode)
+    // Navigation: full in STA, minimal in AP (Config + Reboot), none on the login page
+    if (!navigation)
+    {
+        html += "<div class='container'>";
+    }
+    else if (!isAPMode)
     {
         addNavigation(html, title);
     }
@@ -146,13 +61,79 @@ void HTMLGenerator::addHtmlHeader(String &html, const String &title, bool isAPMo
     {
         html += "<nav>";
         html += "<a href='/config' class='" + String(title == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+        html += "<a href='/network' class='" + String(title == "Network" ? "active" : "") + "'>Network</a>";
+#endif
         html += "<a href='/firmware' class='" + String(title == "Firmware" ? "active" : "") + "'>Firmware</a>";
         html += "<a href='/security' class='" + String(title == "Security" ? "active" : "") + "'>Security</a>";
+        html += "<a href='/password' class='" + String(title == "Password" ? "active" : "") + "'>Password</a>";
         html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
+        html += "<a href='/logout'>Logout</a>";
         html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
         html += "</nav>";
         html += "<div class='container'>";
     }
+}
+
+String HTMLGenerator::generateLoginPage(bool hasPassword, const String &error, const String &next)
+{
+    String html;
+    html.reserve(3072);
+    addHtmlHeader(html, "Login", false, false);
+    html += "<div class='card'>";
+    html += "<h2>Login</h2>";
+    if (error.length() > 0)
+    {
+        html += "<p style='color:#c0392b;'><strong>" + htmlEscape(error) + "</strong></p>";
+    }
+    if (!hasPassword)
+    {
+        html += "<p>No administrator password is available. Send <code>reset-password</code> over the USB serial console (115200 Bd) and use the new password printed there.</p>";
+    }
+    html += "<form method='post' action='/login'>";
+    html += "<input type='hidden' name='next' value='" + htmlEscape(next) + "'>";
+    html += "<label for='password'>Password:</label>";
+    html += "<input type='password' id='password' name='password' autocomplete='current-password' autofocus>";
+    html += "<input type='submit' value='Log in'>";
+    html += "</form></div>";
+    addHtmlFooter(html, true); // no update button before login
+    return html;
+}
+
+String HTMLGenerator::generatePasswordPage(bool hasPassword, const String &error, bool apMode)
+{
+    String html;
+    html.reserve(3072);
+    // Until a password exists the user cannot go anywhere else
+    addHtmlHeader(html, "Password", apMode, hasPassword);
+    html += "<div class='card'>";
+    html += "<h2>" + String(hasPassword ? "Change Admin Password" : "Set Admin Password") + "</h2>";
+    if (error.length() > 0)
+    {
+        html += "<p style='color:#c0392b;'><strong>" + htmlEscape(error) + "</strong></p>";
+    }
+    if (!hasPassword)
+    {
+        html += "<p>The web interface is not protected yet. Choose a password (at least 8 characters) to continue.</p>";
+    }
+    else
+    {
+        html += "<p>Forgotten password: send <code>reset-password</code> over the USB serial console (115200 Bd).</p>";
+    }
+    html += "<form method='post' action='/password'>";
+    if (hasPassword)
+    {
+        html += "<label for='current'>Current password:</label>";
+        html += "<input type='password' id='current' name='current' autocomplete='current-password' required>";
+    }
+    html += "<label for='password'>New password:</label>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' minlength='8' maxlength='64' required>";
+    html += "<label for='confirm'>Confirm new password:</label>";
+    html += "<input type='password' id='confirm' name='confirm' autocomplete='new-password' minlength='8' maxlength='64' required>";
+    html += "<input type='submit' value='Save Password'>";
+    html += "</form></div>";
+    addHtmlFooter(html, true); // no update button before login
+    return html;
 }
 
 // Adding HTML footer code
@@ -160,7 +141,7 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 {
     html += "</div>"; // container opened by addHtmlHeader/addNavigation
     html += "<footer>";
-    html += "<p>expLORA Gateway Lite v" + String(FIRMWARE_VERSION) + " &copy; 2026</p>";
+    html += "<p>" BOARD_NAME " v" + String(FIRMWARE_VERSION) + " &copy; 2026</p>";
     if (!isAPMode)
     {
         html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn' style='font-size:11px;padding:5px 10px;'>Check for update</button></p>";
@@ -186,12 +167,14 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 
     html += "  function parseJsonSafe(text){ try{ return JSON.parse(text); }catch(e){ return null; } }";
 
-    html += "  window.checkUpdate = function(){";
+    html += "  window.checkUpdate = function(tries){";
+    html += "    tries=tries||0;";
     html += "    fetch('/firmware/check')";
     html += "      .then(function(response){";
     html += "        return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
     html += "      })";
     html += "      .then(function(res){";
+    html += "        if(res.status===202){if(tries<60){setTimeout(function(){window.checkUpdate(tries+1);},1000);return;}throw new Error('No answer from the update server');}";
     html += "        if(!res.ok){ throw new Error((res.data && (res.data.error||res.data.message)) || ('HTTP '+res.status)); }";
     html += "        var d=res.data; if(!d){ throw new Error('Bad JSON: '+res.raw); }";
     html += "        if(d.installable){";
@@ -264,9 +247,7 @@ void HTMLGenerator::addStyles(String &html)
     html += "nav a:hover { background: #0066cc; }";
     html += "nav a.active { background: #0066cc; }";
     html += "nav .icon { display: none; }";
-    html += "nav .nav-action { float:left; display:block; margin:0; }";
-    html += "nav .nav-action button { background:#333; border-radius:0; margin:0; padding:14px 16px; line-height:1.6; }";
-    html += "nav .nav-action button:hover { background:#0066cc; }";
+    html += "nav .nav-action { float:left; display:block; margin:0; } nav .nav-action button { background:#333;border-radius:0;margin:0;padding:14px 16px;line-height:1.6; }";
 
     // Cards
     html += ".container { padding: 20px; }";
@@ -342,14 +323,16 @@ void HTMLGenerator::addNavigation(String &html, const String &activePage)
 {
     html += "<nav>";
     html += "<a href='/' class='" + String(activePage == "Home" ? "active" : "") + "'>Home</a>";
-    html += "<a href='/config' class='" + String(activePage == "Configuration" ? "active" : "") + "'>WiFi Setup</a>";
+    html += "<a href='/network' class='" + String(activePage == "Network" ? "active" : "") + "'>Network</a>";
     html += "<a href='/sensors' class='" + String(activePage == "Sensors" ? "active" : "") + "'>Sensors</a>";
     html += "<a href='/mqtt' class='" + String(activePage == "MQTT" ? "active" : "") + "'>MQTT</a>";
     html += "<a href='/firmware' class='" + String(activePage == "Firmware" ? "active" : "") + "'>Firmware</a>";
-    html += "<a href='/security' class='" + String(activePage == "Security" ? "active" : "") + "'>Security</a>";
     html += "<a href='/logs' class='" + String(activePage == "Logs" ? "active" : "") + "'>Logs</a>";
     html += "<a href='/api' class='" + String(activePage == "API" ? "active" : "") + "'>API</a>";
+    html += "<a href='/security' class='" + String(activePage == "Security" ? "active" : "") + "'>Security</a>";
+    html += "<a href='/password' class='" + String(activePage == "Password" ? "active" : "") + "'>Password</a>";
     html += "<form class='nav-action' method='post' action='/reboot' onsubmit=\"return confirm('Are you sure you want to reboot the device?');\"><button type='submit'>Reboot</button></form>";
+    html += "<a href='/logout'>Logout</a>";
     html += "<a href='javascript:void(0);' class='icon' onclick='toggleMenu()'>&#9776;</a>";
     html += "</nav>";
 
@@ -363,31 +346,45 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     html.reserve(4096);
 
     // Add header with reduced content
-    addHtmlHeader(html, "Home", WiFi.status() != WL_CONNECTED);
+    addHtmlHeader(html, "Home", uplink->isCaptive());
 
     // Status card
     html += "<div class='card'>";
     html += "<h2>System Status</h2>";
 
-    html += "<p><strong>Mode:</strong> " + String(WiFi.status() == WL_CONNECTED ? "Client" : "Access Point") + "</p>";
+    html += "<p><strong>Mode:</strong> " + String(uplink->isOnline() ? "Client" : "Access Point") + "</p>";
 
-    if (WiFi.status() == WL_CONNECTED)
+#if defined(HAS_ETHERNET)
+    if (uplink->ethernetLinkUp())
     {
-        html += "<p><strong>WiFi:</strong> Connected to " + escapeHtml(WiFi.SSID()) + "</p>";
-        html += "<p><strong>IP:</strong> " + escapeHtml(WiFi.localIP().toString()) + "</p>";
+        html += "<p><strong>Ethernet:</strong> Connected" +
+                String(uplink->getEthernetIP() ? ", " + uplink->getEthernetIP().toString() : String()) + "</p>";
+    }
+    else
+    {
+        html += "<p><strong>Ethernet:</strong> Disconnected</p>";
+    }
+#endif
+    if (WiFi.STA.connected())
+    {
+        html += "<p><strong>WiFi:</strong> Connected to " + htmlEscape(WiFi.SSID()) + "</p>";
     }
     else
     {
         html += "<p><strong>WiFi:</strong> Disconnected</p>";
-        if (WiFi.getMode() == WIFI_AP)
-        {
-            html += "<p><strong>AP IP:</strong> " + escapeHtml(WiFi.softAPIP().toString()) + "</p>";
-        }
+    }
+    if (uplink->isOnline())
+    {
+        html += "<p><strong>IP:</strong> " + uplink->getLocalIP().toString() + " (" + uplink->getActiveName() + ")</p>";
+    }
+    if (uplink->isApActive())
+    {
+        html += "<p><strong>AP IP:</strong> " + uplink->getApIP().toString() + "</p>";
     }
 
     // Current time
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
+    if (getLocalTime(&timeinfo, 0))
     {
         char timeStr[64];
         strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -430,12 +427,12 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
             if (sensor.configured)
             {
                 html += "<tr>";
-                html += "<td>" + escapeHtml(sensor.name) + "</td>";
-                html += "<td>" + escapeHtml(sensorTypeToString(sensor.deviceType)) + "</td>";
-                html += "<td>" + escapeHtml(sensor.getLastSeenString()) + "</td>";
+                html += "<td>" + htmlEscape(sensor.name) + "</td>";
+                html += "<td>" + sensorTypeToString(sensor.deviceType) + "</td>";
+                html += "<td>" + sensor.getLastSeenString() + "</td>";
 
                 // Add sensor data - use the getDataString() method
-                html += "<td>" + escapeHtml(sensor.getDataString()) + "</td>";
+                html += "<td>" + sensor.getDataString() + "</td>";
 
                 html += "</tr>";
 
@@ -455,12 +452,42 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
     html += "<script>startAutoRefresh(60000);</script>"; // 60 seconds instead of 30
 
     // Add footer (hide update button in AP mode)
-    addHtmlFooter(html, WiFi.status() != WL_CONNECTED);
+    addHtmlFooter(html, uplink->isCaptive());
 
     return html;
 }
 
+
 // Generating configuration page
+// WiFi settings form, used by the AP setup page and the network page
+void HTMLGenerator::addWiFiForm(String &html, const String &ssid, bool hasPassword, const String &timezone)
+{
+    html += "<div class='card'>";
+    html += "<h2>WiFi Settings</h2>";
+    html += "<form method='post' action='/config'>";
+    html += "<label for='ssid'>SSID:</label>";
+    html += "<input type='text' id='ssid' name='ssid' value='" + htmlEscape(ssid) + "' required>";
+    // Stored secrets never go into the page; empty = keep the stored one
+    html += "<label for='password'>Password:</label>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
+            String(hasPassword ? "Leave blank to keep the stored password" : "Blank configures an open network") + "'>";
+    if (hasPassword) html += "<label><input type='checkbox' name='clearPassword' value='1'> Clear the stored password (open WiFi network)</label>";
+    html += "<label for='timezone'>Timezone:</label>";
+    html += "<select id='timezone' name='timezone'>";
+
+    static const char *const zones[][2] = TIMEZONE_OPTIONS;
+    for (const auto &zone : zones)
+    {
+        html += "<option value='" + String(zone[0]) + "'" + String(timezone == zone[0] ? " selected" : "") + ">" +
+                zone[1] + "</option>";
+    }
+    html += "</select>";
+
+    html += "<input type='submit' value='Save and Restart'>";
+    html += "</form>";
+    html += "</div>";
+}
+
 String HTMLGenerator::generateConfigPage(const String &ssid, bool hasPassword, bool configMode, const String &ip, const String &timezone)
 {
     String html;
@@ -475,69 +502,25 @@ String HTMLGenerator::generateConfigPage(const String &ssid, bool hasPassword, b
     if (configMode)
     {
         html += "<p><strong>Mode:</strong> Access Point</p>";
-        html += "<p><strong>AP Name:</strong> " + escapeHtml(WiFi.softAPSSID()) + "</p>";
-        html += "<p><strong>AP IP:</strong> " + escapeHtml(WiFi.softAPIP().toString()) + "</p>";
+        html += "<p><strong>AP Name:</strong> " + uplink->getApName() + "</p>";
+        html += "<p><strong>AP IP:</strong> " + uplink->getApIP().toString() + "</p>";
     }
     else
     {
         html += "<p><strong>Mode:</strong> Client</p>";
-        html += "<p><strong>SSID:</strong> " + escapeHtml(ssid) + "</p>";
-        html += "<p><strong>Status:</strong> " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "</p>";
-        if (WiFi.status() == WL_CONNECTED)
+        html += "<p><strong>SSID:</strong> " + htmlEscape(ssid) + "</p>";
+        html += "<p><strong>Status:</strong> " + String(WiFi.STA.connected() ? "Connected" : "Disconnected") + "</p>";
+        if (WiFi.STA.hasIP())
         {
-            html += "<p><strong>IP:</strong> " + escapeHtml(WiFi.localIP().toString()) + "</p>";
+            html += "<p><strong>IP:</strong> " + WiFi.STA.localIP().toString() + "</p>";
         }
     }
     html += "</div>";
 
-    // WiFi configuration form
-    html += "<div class='card'>";
-    html += "<h2>WiFi Settings</h2>";
-    html += "<form method='post' action='/config'>";
-    html += "<label for='ssid'>SSID:</label>";
-    html += "<input type='text' id='ssid' name='ssid' value='" + escapeHtml(ssid) + "' required>";
-    html += "<label for='password'>Password:</label>";
-    html += "<input type='password' id='password' name='password' value='' autocomplete='new-password' placeholder='";
-    html += hasPassword ? "Leave blank to keep the stored password'>" : "Blank configures an open network'>";
-    if (hasPassword)
-    {
-        html += "<label><input type='checkbox' name='clearPassword' value='1'> Clear the stored password (open WiFi network)</label>";
-    }
-    html += "<label for='timezone'>Timezone:</label>";
-    html += "<select id='timezone' name='timezone'>";
-
-    html += "<option value='GMT0'";
-    if (timezone == "GMT0")
-        html += " selected";
-    html += ">GMT/UTC (00:00)</option>";
-
-    html += "<option value='WET0WEST,M3.5.0/1,M10.5.0'";
-    if (timezone == "WET0WEST,M3.5.0/1,M10.5.0")
-        html += " selected";
-    html += ">Western European (WET/WEST)</option>";
-
-    html += "<option value='CET-1CEST,M3.5.0,M10.5.0/3'";
-    if (timezone == "CET-1CEST,M3.5.0,M10.5.0/3")
-        html += " selected";
-    html += ">Central European (CET/CEST)</option>";
-
-    html += "<option value='EET-2EEST,M3.5.0/3,M10.5.0/4'";
-    if (timezone == "EET-2EEST,M3.5.0/3,M10.5.0/4")
-        html += " selected";
-    html += ">Eastern European (EET/EEST)</option>";
-
-    html += "<option value='MSK-3'";
-    if (timezone == "MSK-3")
-        html += " selected";
-    html += ">Moscow Time (MSK)</option>";
-    html += "</select>";
-
-    html += "<input type='submit' value='Save and Restart'>";
-    html += "</form>";
-    html += "</div>";
+    addWiFiForm(html, ssid, hasPassword, timezone);
 
     // Add footer
-    addHtmlFooter(html, configMode);
+    addHtmlFooter(html);
 
     return html;
 }
@@ -567,13 +550,12 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     html += "<div class='form-group'>";
     html += "<label for='tls'>Enable TLS (public CA verification):</label>";
     html += "<input type='checkbox' id='tls' name='tls' value='0'" + String(tls ? " checked" : "") + ">";
-    html += "<small>The broker certificate and hostname must validate against the built-in public CA store.</small>";
     html += "</div>";
 
     // MQTT Broker Host
     html += "<div class='form-group'>";
     html += "<label for='host'>MQTT Broker Host:</label>";
-    html += "<input type='text' id='host' name='host' value='" + escapeHtml(host) + "' required>";
+    html += "<input type='text' id='host' name='host' value='" + htmlEscape(host) + "' required>";
     html += "</div>";
 
     // MQTT Port
@@ -585,42 +567,186 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     // Username
     html += "<div class='form-group'>";
     html += "<label for='user'>Username (optional):</label>";
-    html += "<input type='text' id='user' name='user' value='" + escapeHtml(user) + "'>";
+    html += "<input type='text' id='user' name='user' value='" + htmlEscape(user) + "'>";
     html += "</div>";
 
     // Password
     html += "<div class='form-group'>";
     html += "<label for='password'>Password (optional):</label>";
-    html += "<input type='password' id='password' name='password' value='' autocomplete='new-password' placeholder='";
-    html += hasPassword ? "Leave blank to keep the stored password'>" : "No password configured'>";
+    html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
+            String(hasPassword ? "(unchanged)" : "") + "'>";
     if (hasPassword)
     {
-        html += "<label><input type='checkbox' name='clearPassword' value='1'> Clear the stored MQTT password</label>";
+        html += "<label><input type='checkbox' name='clearPassword' value='1'> Remove the stored password</label>";
     }
     html += "</div>";
 
     // Root prefix
     html += "<div class='form-group'>";
     html += "<label for='prefix'>Root topic:</label>";
-    html += "<input type='text' id='prefix' name='prefix' value='" + escapeHtml(prefix) + "'>";
+    html += "<input type='text' id='prefix' name='prefix' value='" + htmlEscape(prefix) + "'>";
     html += "</div>";
 
     // Home assistant discovery checkbox
     html += "<div class='form-group'>";
-    html += "<label for='haEnabled'>Enable HA Discovery:</label>";
+    html += "<label for='tls'>Enable HA Discovery:</label>";
     html += "<input type='checkbox' id='haEnabled' name='haEnabled' value='0'" + String(haEnabled ? " checked" : "") + ">";
     html += "</div>";
 
     // HA Prefix
     html += "<div class='form-group'>";
     html += "<label for='haPrefix'>HA discovery topic:</label>";
-    html += "<input type='text' id='haPrefix' name='haPrefix' value='" + escapeHtml(haPrefix) + "'>";
+    html += "<input type='text' id='haPrefix' name='haPrefix' value='" + htmlEscape(haPrefix) + "'>";
     html += "</div>";
 
     html += "<input type='submit' value='Save MQTT Settings'>";
     html += "</form></div>";
 
     // Add footer
+    addHtmlFooter(html);
+    return html;
+}
+
+String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const String &ssid, bool hasPassword,
+                                         const String &timezone, bool apMode)
+{
+    String html;
+    html.reserve(6144);
+
+    addHtmlHeader(html, "Network", apMode);
+
+    html += "<div class='card'>";
+    html += "<h2>Status</h2>";
+    html += "<p><strong>Active uplink:</strong> " + String(uplink->getActiveName());
+    if (uplink->isOnline())
+    {
+        html += ", " + uplink->getLocalIP().toString();
+    }
+    html += "</p>";
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+    html += "<p>Priority: Ethernet, WiFi, LTE - the first one with an address carries traffic.</p>";
+#endif
+#if defined(HAS_PWR_SRC)
+    html += "<p><strong>Power source:</strong> " + String(powerSource->getName()) + "</p>";
+#endif
+    html += "<p><strong>Time:</strong> " + htmlEscape(uplink->getTimeStatus()) + "</p>";
+#if defined(HAS_ETHERNET)
+    html += "<p><strong>Ethernet:</strong> ";
+    if (uplink->getEthernetIP())
+    {
+        html += "Connected, " + uplink->getEthernetIP().toString();
+    }
+    else
+    {
+        html += uplink->ethernetLinkUp() ? (config.ethStatic ? "Link up" : "Link up, waiting for DHCP") : "Disconnected";
+    }
+    html += String(config.ethStatic ? " (static)" : " (DHCP)") + "</p>";
+#endif
+    html += "<p><strong>WiFi:</strong> ";
+    if (ssid.length() == 0)
+    {
+        html += "Not configured";
+    }
+    else
+    {
+        html += (WiFi.STA.hasIP() ? "Connected, " + WiFi.STA.localIP().toString() : String("Disconnected")) +
+                " (" + htmlEscape(ssid) + ")";
+    }
+    html += "</p>";
+#if defined(HAS_LTE)
+    const LteModem &lte = uplink->getLte();
+    html += "<p><strong>LTE:</strong> " + String(lte.getStateName());
+    if (lte.hasIP())
+    {
+        html += ", " + lte.localIP().toString();
+    }
+    html += "</p>";
+    if (lte.getOperator().length() > 0)
+    {
+        html += "<p><strong>Operator:</strong> " + htmlEscape(lte.getOperator()) + ", APN " + htmlEscape(lte.getApn()) + "</p>";
+    }
+    if (lte.getRssiDbm() != 0)
+    {
+        html += "<p><strong>Signal:</strong> " + String(lte.getRssiDbm()) + " dBm (CSQ " + String(lte.getSignalQuality()) + ")</p>";
+    }
+    if (lte.getModuleName().length() > 0)
+    {
+        html += "<p><strong>Modem:</strong> " + htmlEscape(lte.getModuleName()) + ", IMEI " + htmlEscape(lte.getImei()) + "</p>";
+    }
+    if (lte.getLastError().length() > 0)
+    {
+        html += "<p><strong>Last error:</strong> " + htmlEscape(lte.getLastError()) + "</p>";
+    }
+#endif
+    html += "</div>";
+
+    addWiFiForm(html, ssid, hasPassword, timezone);
+
+#if defined(HAS_ETHERNET)
+    {
+        auto field = [&html](const char *id, const char *label, const String &value, bool required)
+        {
+            html += "<div class='form-group eth-static'>";
+            html += "<label for='" + String(id) + "'>" + label + ":</label>";
+            html += "<input type='text' id='" + String(id) + "' name='" + id + "' maxlength='15' inputmode='decimal'";
+            html += " pattern='^(\\d{1,3}\\.){3}\\d{1,3}$' value='" + htmlEscape(value) + "'";
+            html += String(required ? " data-required='1'" : "") + ">";
+            html += "</div>";
+        };
+        html += "<div class='card'>";
+        html += "<h2>Ethernet Settings</h2>";
+        html += "<p>Changes take effect after a restart. With a static address, check it before saving - a wrong one makes the gateway reachable only over WiFi or its access point.</p>";
+        html += "<form method='post' action='/network'>";
+        html += "<input type='hidden' name='section' value='ethernet'>";
+        html += "<div class='form-group'>";
+        html += "<label for='ethMode'>Addressing:</label>";
+        html += "<select id='ethMode' name='ethMode'>";
+        html += "<option value='dhcp'" + String(config.ethStatic ? "" : " selected") + ">DHCP (automatic)</option>";
+        html += "<option value='static'" + String(config.ethStatic ? " selected" : "") + ">Static</option>";
+        html += "</select></div>";
+        field("ip", "IP address", config.ethIp, true);
+        field("mask", "Subnet mask", config.ethMask.length() ? config.ethMask : String("255.255.255.0"), true);
+        field("gateway", "Gateway", config.ethGateway, true);
+        field("dns1", "Primary DNS (empty = gateway)", config.ethDns1, false);
+        field("dns2", "Secondary DNS (optional)", config.ethDns2, false);
+        html += "<input type='submit' value='Save and Restart'>";
+        html += "</form></div>";
+        html += "<script>(function(){var m=document.getElementById('ethMode');"
+                "function u(){var s=m.value==='static';"
+                "document.querySelectorAll('.eth-static').forEach(function(g){g.style.display=s?'':'none';"
+                "var i=g.querySelector('input');i.required=s&&i.dataset.required==='1';i.disabled=!s;});}"
+                "m.addEventListener('change',u);u();})();</script>";
+    }
+#endif
+
+#if defined(HAS_LTE)
+    html += "<div class='card'>";
+    html += "<h2>LTE Settings</h2>";
+    html += "<p>The LTE connection is kept ready and used only when neither Ethernet nor WiFi is available. Changes take effect after a restart.</p>";
+    html += "<p>Leave LTE disabled when no modem is fitted.</p>";
+    html += "<form method='post' action='/network'>";
+    html += "<input type='hidden' name='section' value='lte'>";
+    html += "<div class='form-group'>";
+    html += "<label for='lteEnabled'>Enable LTE:</label>";
+    html += "<input type='checkbox' id='lteEnabled' name='lteEnabled' value='1'" + String(config.lteEnabled ? " checked" : "") + ">";
+    html += "</div>";
+    html += "<div class='form-group'>";
+    html += "<label for='apn'>APN (empty = automatic):</label>";
+    html += "<input type='text' id='apn' name='apn' maxlength='63' value='" + htmlEscape(config.lteApn) + "'>";
+    html += "</div>";
+    html += "<div class='form-group'>";
+    html += "<label for='pin'>SIM PIN (optional):</label>";
+    html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]{4,8}' autocomplete='off' placeholder='" +
+            String(config.ltePin.length() > 0 ? "(unchanged)" : "") + "'>";
+    if (config.ltePin.length() > 0)
+    {
+        html += "<label><input type='checkbox' name='clearPin' value='1'> Remove the stored PIN</label>";
+    }
+    html += "</div>";
+    html += "<input type='submit' value='Save and Restart'>";
+    html += "</form></div>";
+#endif
+
     addHtmlFooter(html);
     return html;
 }
@@ -696,8 +822,8 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             uint32_t rejected  = SensorHealth::rejectedLast24h(h);
 
             html += "<tr>";
-            html += "<td>" + escapeHtml(s.name) + "</td>";
-            html += "<td>" + escapeHtml(sensorTypeToString(s.deviceType)) + "</td>";
+            html += "<td>" + htmlEscape(s.name) + "</td>";
+            html += "<td>" + sensorTypeToString(s.deviceType) + "</td>";
             html += "<td>" + formatSN(s.serialNumber) + "</td>";
 
             // Status: badge + optional last reject reason on the line below
@@ -707,7 +833,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             {
                 html += "<br><small style='color:#c0392b;'>";
                 html += "last reject: ";
-                html += escapeHtml(String(h.lastRejectReason));
+                html += htmlEscape(String(h.lastRejectReason));
                 html += " (";
                 html += formatRelativeMillis(nowMillis, h.lastRejectAtMillis, true);
                 html += ")</small>";
@@ -717,7 +843,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             // Last seen: prefer relative form derived from our millis snapshot;
             // the wall-clock form (getLastSeenString) is kept as a tooltip so
             // users can still see the exact timestamp if NTP is synced.
-            html += "<td title='" + escapeHtml(s.getLastSeenString()) + "'>";
+            html += "<td title='" + s.getLastSeenString() + "'>";
             html += formatRelativeMillis(nowMillis, h.lastOkAtMillis, h.hasLastOk);
             html += "</td>";
 
@@ -747,6 +873,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             html += "<a class='btn' href='/sensors/edit?index=" + String(idx) + "'>Edit</a> ";
             html += "<form method='post' action='/sensors/delete' style='display:inline;margin:0' onsubmit='return confirm(\"Are you sure you want to delete this sensor?\")'>";
             html += "<input type='hidden' name='index' value='" + String(idx) + "'>";
+            html += "<input type='hidden' name='sn' value='" + formatSN(s.serialNumber) + "'>";
             html += "<button type='submit' class='btn btn-delete'>Delete</button></form>";
             html += "</td></tr>";
         }
@@ -762,13 +889,14 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
 String HTMLGenerator::generateFirmwarePage() {
     String html;
     html.reserve(6144);
-    const bool apMode = WiFi.status() != WL_CONNECTED;
+    const bool apMode = uplink->isCaptive();
     addHtmlHeader(html, "Firmware", apMode);
 
     // card: Online update
     html += "<div class='card'>";
     html += "<h2>Online Update</h2>";
     html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong></p>";
+    html += "<p>Board: <strong>" BOARD_NAME "</strong>. Install only an image built for this board.</p>";
     html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn'>Check for update</button></p>";
     html += "<p><small>The gateway accepts only a newer release from the official HTTPS origin and verifies its SHA-256 digest before installation.</small></p>";
     html += "</div>";
@@ -778,7 +906,7 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "<h2>Manual Upload</h2>";
     html += "<form id='uploadForm' enctype='multipart/form-data'>";
     html += "  <label for='fwVersion'>Firmware version:</label>";
-    html += "  <input type='text' id='fwVersion' placeholder='1.2.0' pattern='[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.-]+)?' required>";
+    html += "  <input type='text' id='fwVersion' placeholder='1.2.0' pattern='[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?' required>";
     html += "  <label for='fwFile'>Firmware image (.bin):</label>";
     html += "  <input type='file' name='bin' id='fwFile' accept='.bin,application/octet-stream' required>";
     html += "  <label for='fwDigest'>Image digest (.sha256):</label>";
@@ -827,55 +955,6 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "</script>";
 
     addHtmlFooter(html, apMode);
-    return html;
-}
-
-String HTMLGenerator::generateSecurityPage(const String &apName)
-{
-    String html;
-    html.reserve(4096);
-    addHtmlHeader(html, "Security", WiFi.status() != WL_CONNECTED);
-
-    html += "<div class='card'>";
-    html += "<h2>Device access</h2>";
-    html += "<p>The recovery access point <strong>" + escapeHtml(apName) +
-            "</strong> and the web administrator use separate per-device credentials.</p>";
-    html += "<p>Rotated credentials are displayed exactly once. Save them before leaving this page.</p>";
-    html += "</div>";
-
-    html += "<div class='card'><h2>Administrator credential</h2>";
-    html += "<p>Used with username <strong>" + String(HTTP_ADMIN_USERNAME) +
-            "</strong> for every management and firmware endpoint.</p>";
-    html += "<button class='btn rotateCredential' data-kind='admin'>Rotate administrator credential</button></div>";
-
-    html += "<div class='card'><h2>Recovery AP credential</h2>";
-    html += "<p>Used only for WPA2 access to <strong>" + escapeHtml(apName) + "</strong>.</p>";
-    html += "<p>Rotating it reboots the gateway so the AP can restart with the new credential.</p>";
-    html += "<button class='btn rotateCredential' data-kind='ap'>Rotate recovery AP credential</button></div>";
-
-    html += "<div id='credentialResult' class='card' style='display:none'>";
-    html += "<h2>New credential — save it now</h2>";
-    html += "<p><code id='newCredential' style='font-size:1.15em;word-break:break-all'></code></p>";
-    html += "<p id='credentialNote'></p></div>";
-
-    html += "<script>(function(){";
-    html += "function parse(t){try{return JSON.parse(t);}catch(e){return null;}}";
-    html += "Array.prototype.forEach.call(document.querySelectorAll('.rotateCredential'),function(button){";
-    html += "button.addEventListener('click',function(){";
-    html += "var kind=button.getAttribute('data-kind');";
-    html += "if(!confirm('Rotate the '+kind+' credential now?'))return;";
-    html += "button.disabled=true;";
-    html += "fetch('/security/rotate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'kind='+encodeURIComponent(kind)})";
-    html += ".then(function(r){return r.text().then(function(t){return {ok:r.ok,status:r.status,data:parse(t)};});})";
-    html += ".then(function(r){if(!r.ok||!r.data)throw new Error((r.data&&r.data.error)||('HTTP '+r.status));";
-    html += "document.getElementById('newCredential').textContent=r.data.credential;";
-    html += "document.getElementById('credentialNote').textContent=r.data.rebooting?'The gateway will reboot. Reconnect using the new AP credential.':'Your current browser session may continue briefly, but future requests require the new administrator credential.';";
-    html += "document.getElementById('credentialResult').style.display='block';";
-    html += "button.disabled=false;})";
-    html += ".catch(function(e){button.disabled=false;alert('Rotation failed: '+e.message);});";
-    html += "});});})();</script>";
-
-    addHtmlFooter(html, WiFi.status() != WL_CONNECTED);
     return html;
 }
 
@@ -1089,8 +1168,8 @@ String HTMLGenerator::generateSensorAddPage()
     html += "    console.log('Selected device type:', type);";
 
     // Define which devices have which capabilities
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1119,8 +1198,8 @@ String HTMLGenerator::generateSensorAddPage()
     html += "    console.log('Selected device type:', type);"; // Debugging
 
     // Device type definitions for individual placeholders
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1166,10 +1245,12 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Hidden index
     html += "<input type='hidden' name='index' value='" + String(index) + "'>";
+    // The slot may be reused by another sensor before this form is sent
+    html += "<input type='hidden' name='sn' value='" + formatSN(sensor.serialNumber) + "'>";
 
     // Sensor name
     html += "<label for='name'>Sensor Name:</label>";
-    html += "<input type='text' id='name' name='name' value='" + escapeHtml(sensor.name) + "' required>";
+    html += "<input type='text' id='name' name='name' value='" + htmlEscape(sensor.name) + "' required>";
 
     // Sensor type
     html += "<label for='deviceType'>Device Type:</label>";
@@ -1242,8 +1323,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 
     // Device key
     html += "<label for='deviceKey'>Device Key:</label>";
-    html += "<input type='password' id='deviceKey' name='deviceKey' value='' autocomplete='new-password' placeholder='Leave blank to keep the stored key'>";
-    html += "<small>Enter exactly 8 hexadecimal characters only when replacing the key.</small>";
+    html += "<input type='password' id='deviceKey' name='deviceKey' autocomplete='new-password' placeholder='(unchanged)'>";
 
     // New code with a single field
     html += "<label for='customUrl'>Custom URL with Placeholders (Optional):</label>";
@@ -1275,7 +1355,7 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "<div class='placeholder-item'>Device Type <code>*TYPE*</code></div>";
     html += "</div>"; // end of grid
     html += "</div>"; // end of urlHelp
-    html += "<input type='text' id='customUrl' name='customUrl' placeholder='https://example.com/api?temp=*TEMP*&hum=*HUM*' value='" + escapeHtml(sensor.customUrl) + "'>";
+    html += "<input type='text' id='customUrl' name='customUrl' placeholder='https://example.com/api?temp=*TEMP*&hum=*HUM*' value='" + htmlEscape(sensor.customUrl) + "'>";
 
     html += "<h3 style='margin-top: 20px;'>Sensor Reading Corrections</h3>";
     html += "<p>Adjust sensor readings by adding offsets or applying multipliers. Leave at 0 for no correction.</p>";
@@ -1396,8 +1476,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "    console.log('Selected device type:', type);";
 
     // Define which devices have which capabilities
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1427,8 +1507,8 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
     html += "    console.log('Selected device type:', type);"; // Debugging
 
     // Device type definitions for individual placeholders
-    html += "    var tempDevices = [1, 2, 3, 81];"; // BME280, SCD40, METEO, DIY_TEMP
-    html += "    var humDevices = [1, 2, 3];";      // BME280, SCD40, METEO
+    html += "    var tempDevices = [1, 2, 3, 5, 81];"; // BME280, SCD40, METEO, SHT40, DIY_TEMP
+    html += "    var humDevices = [1, 2, 3, 5];";   // BME280, SCD40, METEO, SHT40
     html += "    var pressureDevices = [1, 3];";    // BME280, METEO
     html += "    var co2Devices = [2];";            // SCD40
     html += "    var luxDevices = [4];";            // VEML7700
@@ -1463,11 +1543,10 @@ String HTMLGenerator::generateSensorEditPage(const SensorData &sensor, int index
 }
 
 // Generating logs page
-String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLevel currentLevel)
+String HTMLGenerator::generateLogsPageHead(LogLevel currentLevel)
 {
     String html;
-    html.reserve(WEB_BUFFER_SIZE + 8192);
-    const size_t logCount = logs.size();
+    html.reserve(3072);
 
     // Adding header
     addHtmlHeader(html, "Logs");
@@ -1492,8 +1571,7 @@ String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLev
     // Buttons for working with logs
     html += "<div style='margin-top: 20px;'>";
     html += "<a href='/logs' class='btn'>Refresh</a> ";
-    html += "<form method='post' action='/logs/clear' style='display:inline;margin:0' onsubmit='return confirm(\"Are you sure you want to clear all logs?\")'>";
-    html += "<button type='submit' class='btn btn-delete'>Clear Logs</button></form>";
+    html += "<form method='post' action='/logs/clear' onsubmit='return confirm(\"Are you sure you want to clear all logs?\")'><button type='submit' class='btn btn-delete'>Clear Logs</button></form>";
     html += "</div>";
     html += "</div>";
 
@@ -1502,58 +1580,36 @@ String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLev
     html += "<h2>System Logs</h2>";
     html += "<div class='log-container'>";
 
-    // The async web server can render several /logs responses at once. Keep
-    // the shared bounded buffer private to one renderer while it is filled
-    // and copied into the request-local String.
-    std::lock_guard<std::mutex> bufferLock(htmlBufferMutex);
-    if (htmlBuffer != nullptr)
+    return html;
+}
+
+// One log line of the logs page
+String HTMLGenerator::generateLogEntry(const LogEntry &entry)
+{
+    const char *logClass = "log-info";
+    switch (entry.level)
     {
-        memset(htmlBuffer, 0, htmlBufferSize);
-        size_t maxLen = htmlBufferSize;
-        generateLogTable(htmlBuffer, maxLen, logs);
-        html += htmlBuffer;
+    case LogLevel::ERROR:
+        logClass = "log-error";
+        break;
+    case LogLevel::WARNING:
+        logClass = "log-warning";
+        break;
+    case LogLevel::DEBUG:
+        logClass = "log-debug";
+        break;
+    case LogLevel::VERBOSE:
+        logClass = "log-verbose";
+        break;
+    default:
+        break;
     }
-    else
-    {
-        // Fallback if buffer is not available
-        if (logCount > 0)
-        {
-            for (size_t i = 0; i < logCount; i++)
-            {
-                String logClass = "log-";
+    return "<div class='log-entry " + String(logClass) + "'>" + htmlEscape(entry.getFormattedLog()) + "</div>";
+}
 
-                switch (logs[i].level)
-                {
-                case LogLevel::ERROR:
-                    logClass += "error";
-                    break;
-                case LogLevel::WARNING:
-                    logClass += "warning";
-                    break;
-                case LogLevel::INFO:
-                    logClass += "info";
-                    break;
-                case LogLevel::DEBUG:
-                    logClass += "debug";
-                    break;
-                case LogLevel::VERBOSE:
-                    logClass += "verbose";
-                    break;
-                default:
-                    logClass += "info";
-                    break;
-                }
-
-                html += "<div class='log-entry " + logClass + "'>" +
-                        escapeHtml(logs[i].getFormattedLog()) + "</div>";
-            }
-        }
-        else
-        {
-            html += "<div class='log-entry'>No logs to display</div>";
-        }
-    }
-
+String HTMLGenerator::generateLogsPageTail()
+{
+    String html;
     html += "</div>"; // log-container
     html += "</div>"; // card
 
@@ -1565,69 +1621,18 @@ String HTMLGenerator::generateLogsPage(const std::vector<LogEntry> &logs, LogLev
 
     return html;
 }
-// Generating log table
-// In HTMLGenerator.cpp
-void HTMLGenerator::generateLogTable(char *buffer, size_t &maxLen, const std::vector<LogEntry> &logs)
-{
-    size_t contentLen = 0;
-    const size_t logCount = logs.size();
-
-    if (logCount > 0)
-    {
-        // Loop through from newest to oldest
-        for (size_t i = 0; i < logCount; i++)
-        {
-            const char *logClass = "";
-            switch (logs[i].level)
-            {
-            case LogLevel::ERROR:
-                logClass = "log-error";
-                break;
-            case LogLevel::WARNING:
-                logClass = "log-warning";
-                break;
-            case LogLevel::INFO:
-                logClass = "log-info";
-                break;
-            case LogLevel::DEBUG:
-                logClass = "log-debug";
-                break;
-            case LogLevel::VERBOSE:
-                logClass = "log-verbose";
-                break;
-            default:
-                logClass = "log-info";
-                break;
-            }
-
-            const String escapedLog = escapeHtml(logs[i].getFormattedLog());
-            const String entry =
-                "<div class='log-entry " + String(logClass) + "'>" +
-                escapedLog + "</div>";
-            if (!appendBounded(buffer, maxLen, contentLen, entry))
-            {
-                appendBounded(
-                    buffer, maxLen, contentLen,
-                    "<div class='log-entry log-warning'>Log output truncated due to "
-                    "buffer size limitations</div>");
-                break;
-            }
-        }
-    }
-    else
-    {
-        appendBounded(
-            buffer, maxLen, contentLen,
-            "<div class='log-entry'>No logs to display</div>");
-    }
-}
-
 // Generating JSON for API
-String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
+DynamicJsonDocument HTMLGenerator::buildAPIJson(const std::vector<SensorData> &sensors)
 {
     // Estimating JSON document size
+    // Up to ~20 members per sensor (METEO) plus their copied strings
+    size_t textSize = 0;
+    for (const auto &sensor : sensors)
+    {
+        textSize += sensor.name.length() + 64;
+    }
     const size_t capacity = JSON_OBJECT_SIZE(5) + JSON_ARRAY_SIZE(sensors.size()) +
-                            sensors.size() * JSON_OBJECT_SIZE(15) + 1024; // Extra space for safety
+                            sensors.size() * JSON_OBJECT_SIZE(24) + textSize + 512;
 
     DynamicJsonDocument doc(capacity);
 
@@ -1636,7 +1641,7 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
 
     // Current time
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
+    if (getLocalTime(&timeinfo, 0))
     {
         char timeStr[64];
         strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -1647,7 +1652,7 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
         doc["time"] = "Time not set";
     }
 
-    doc["status"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
+    doc["status"] = uplink->isOnline() ? "connected" : "disconnected";
 
     // Sensors array
     JsonArray sensorsArray = doc.createNestedArray("sensors");
@@ -1661,10 +1666,12 @@ String HTMLGenerator::generateAPIJson(const std::vector<SensorData> &sensors)
         }
     }
 
-    // Serialization to string
-    String result;
-    serializeJson(doc, result);
-    return result;
+    if (doc.overflowed())
+    {
+        doc.clear();
+        doc["error"] = "response too large";
+    }
+    return doc;
 }
 
 // Generating API page
@@ -1693,7 +1700,7 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     html += "<pre style='background: #f5f5f5; padding: 10px; overflow-x: auto;'>";
     html += "{\n";
     html += "  \"version\": \"" + String(FIRMWARE_VERSION) + "\",\n";
-    html += "  \"time\": \"2023-08-01 12:34:56\",\n";
+    html += "  \"time\": \"2026-10-17 12:34:56\",\n";
     html += "  \"status\": \"connected\",\n";
     html += "  \"sensors\": [\n";
 
@@ -1702,9 +1709,9 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     {
         const auto &sensor = sensors[0];
         html += "    {\n";
-        html += "      \"name\": \"" + escapeHtml(sensor.name) + "\",\n";
-        html += "      \"type\": " + String(static_cast<uint8_t>(sensor.deviceType)) + ",\n";
-        html += "      \"typeName\": \"" + escapeHtml(String(sensor.getTypeInfo().name)) + "\",\n";
+        html += "      \"name\": \"" + htmlEscape(sensor.name) + "\",\n";
+        html += "      \"deviceType\": " + String(static_cast<uint8_t>(sensor.deviceType)) + ",\n";
+        html += "      \"typeName\": \"" + String(sensor.getTypeInfo().name) + "\",\n";
         html += "      \"serialNumber\": \"" + formatSN(sensor.serialNumber) + "\",\n";
         html += "      \"lastSeen\": " + (sensor.lastSeen > 0 ? String((millis() - sensor.lastSeen) / 1000) : "-1") + ",\n";
 
@@ -1741,7 +1748,7 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     {
         html += "    {\n";
         html += "      \"name\": \"Example Sensor\",\n";
-        html += "      \"type\": 1,\n";
+        html += "      \"deviceType\": 1,\n";
         html += "      \"typeName\": \"CLIMA\",\n";
         html += "      \"serialNumber\": \"123456\",\n";
         html += "      \"lastSeen\": 300,\n";
@@ -1762,7 +1769,55 @@ String HTMLGenerator::generateAPIPage(const std::vector<SensorData> &sensors)
     html += "</div>";
 
     // Adding footer
-    addHtmlFooter(html);
+    addHtmlFooter(html, true); // public page: no update button
 
+    return html;
+}
+
+String HTMLGenerator::generateSecurityPage(const String &apName)
+{
+    String html;
+    html.reserve(4096);
+    addHtmlHeader(html, "Security", uplink->isCaptive());
+
+    html += "<div class='card'>";
+    html += "<h2>Device access</h2>";
+    html += "<p>The recovery access point <strong>" + htmlEscape(apName) +
+            "</strong> and the web administrator use separate per-device credentials.</p>";
+    html += "<p>Rotated credentials are displayed exactly once. Save them before leaving this page.</p>";
+    html += "</div>";
+
+    html += "<div class='card'><h2>Administrator credential</h2>";
+    html += "<p>Used on the login page for management and firmware updates.</p>";
+    html += "<button class='btn rotateCredential' data-kind='admin'>Rotate administrator credential</button></div>";
+
+    html += "<div class='card'><h2>Recovery AP credential</h2>";
+    html += "<p>Used only for WPA2 access to <strong>" + htmlEscape(apName) + "</strong>.</p>";
+    html += "<p>Rotating it reboots the gateway so the AP can restart with the new credential.</p>";
+    html += "<button class='btn rotateCredential' data-kind='ap'>Rotate recovery AP credential</button></div>";
+
+    html += "<div id='credentialResult' class='card' style='display:none'>";
+    html += "<h2>New credential — save it now</h2>";
+    html += "<p><code id='newCredential' style='font-size:1.15em;word-break:break-all'></code></p>";
+    html += "<p id='credentialNote'></p></div>";
+
+    html += "<script>(function(){";
+    html += "function parse(t){try{return JSON.parse(t);}catch(e){return null;}}";
+    html += "Array.prototype.forEach.call(document.querySelectorAll('.rotateCredential'),function(button){";
+    html += "button.addEventListener('click',function(){";
+    html += "var kind=button.getAttribute('data-kind');";
+    html += "if(!confirm('Rotate the '+kind+' credential now?'))return;";
+    html += "button.disabled=true;";
+    html += "fetch('/security/rotate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'kind='+encodeURIComponent(kind)})";
+    html += ".then(function(r){return r.text().then(function(t){return {ok:r.ok,status:r.status,data:parse(t)};});})";
+    html += ".then(function(r){if(!r.ok||!r.data)throw new Error((r.data&&r.data.error)||('HTTP '+r.status));";
+    html += "document.getElementById('newCredential').textContent=r.data.credential;";
+    html += "document.getElementById('credentialNote').textContent=r.data.rebooting?'The gateway will reboot. Reconnect using the new AP credential.':'All browser sessions have ended. Log in again with the new administrator password.';";
+    html += "document.getElementById('credentialResult').style.display='block';";
+    html += "button.disabled=false;})";
+    html += ".catch(function(e){button.disabled=false;alert('Rotation failed: '+e.message);});";
+    html += "});});})();</script>";
+
+    addHtmlFooter(html, uplink->isCaptive());
     return html;
 }

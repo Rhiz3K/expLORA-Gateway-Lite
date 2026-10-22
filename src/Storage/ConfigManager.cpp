@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Configuration manager implementation file
  *
@@ -26,11 +26,7 @@
 #include <ArduinoJson.h>
 #include <esp_system.h>
 #include "../Security/SecurityPolicy.h"
-
-// External NTP sync function from main.cpp
-extern bool syncNTPTime(const String &timezone,
-                        unsigned long timeoutMs = NTP_SYNC_TIMEOUT_MS);
-
+#include "../Web/WebAuth.h"
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)
     : logger(log), preferencesInitialized(false), configFile(file)
@@ -109,44 +105,45 @@ bool ConfigManager::ensureDeviceCredentials()
 
     adminCredentialGeneratedThisBoot = false;
     apCredentialGeneratedThisBoot = false;
+    adminCredential = "";
+    adminPasswordHash = preferences.getString("adminPwd", "");
 
-    if (preferences.isKey(adminKey))
+    if (adminPasswordHash.length() == 0)
     {
-        adminCredential = preferences.getString(adminKey, "");
-    }
-    else if (preferences.isKey(legacyKey))
-    {
-        // Preserve the already-issued HTTP password during migration. A new,
-        // distinct AP credential is generated below.
-        adminCredential = preferences.getString(legacyKey, "");
-        if (!SecurityPolicy::isAccessCredentialFormat(adminCredential.c_str()) ||
-            !persistCredential(adminKey, adminCredential))
+        // Preserve the password already issued by PR versions. Fresh devices
+        // get a random password, exposed once over the physical USB console.
+        const char *oldKey = preferences.isKey(adminKey) ? adminKey : legacyKey;
+        const bool migrating = preferences.isKey(oldKey);
+        String password = migrating ? preferences.getString(oldKey, "") : generateCredential();
+        if (!SecurityPolicy::isAccessCredentialFormat(password.c_str()))
         {
-            logger.error("Failed to migrate legacy administrator credential");
-            adminCredential = "";
+            logger.error("Stored administrator credential is invalid");
             return false;
         }
-        preferences.remove(legacyKey);
-        logger.info("Migrated legacy credential to administrator-only credential");
-    }
-    else
-    {
-        adminCredential = generateCredential();
-        if (!persistCredential(adminKey, adminCredential))
+        String hash = WebAuth::makePasswordHash(password);
+        if (hash.length() == 0 || !setAdminPasswordHash(hash))
         {
-            logger.error("Failed to persist generated administrator credential");
-            adminCredential = "";
+            logger.error("Failed to persist administrator password hash");
             return false;
         }
-        adminCredentialGeneratedThisBoot = true;
-        logger.info("Generated and persisted a new administrator credential");
+        if (!migrating)
+        {
+            adminCredential = password;
+            adminCredentialGeneratedThisBoot = true;
+        }
+        logger.info(migrating ? "Migrated administrator credential to password hash"
+                              : "Generated and persisted a new administrator password hash");
     }
 
-    if (!SecurityPolicy::isAccessCredentialFormat(adminCredential.c_str()))
+    // Delete obsolete plaintext only after a verified hash write. Retrying on
+    // the next boot makes an interrupted migration safe.
+    for (const char *key : {adminKey, legacyKey})
     {
-        logger.error("Stored administrator credential is invalid");
-        adminCredential = "";
-        return false;
+        if (preferences.isKey(key) && !preferences.remove(key))
+        {
+            logger.error("Failed to remove obsolete plaintext administrator credential");
+            return false;
+        }
     }
 
     if (preferences.isKey(apKey))
@@ -158,7 +155,7 @@ bool ConfigManager::ensureDeviceCredentials()
         do
         {
             apCredential = generateCredential();
-        } while (apCredential == adminCredential);
+        } while (WebAuth::matchesPasswordHash(apCredential, adminPasswordHash));
 
         if (!persistCredential(apKey, apCredential))
         {
@@ -171,7 +168,7 @@ bool ConfigManager::ensureDeviceCredentials()
     }
 
     if (!SecurityPolicy::isAccessCredentialFormat(apCredential.c_str()) ||
-        apCredential == adminCredential)
+        WebAuth::matchesPasswordHash(apCredential, adminPasswordHash))
     {
         logger.error("Stored AP credential is invalid or not distinct");
         apCredential = "";
@@ -184,6 +181,7 @@ bool ConfigManager::ensureDeviceCredentials()
 // Load configuration from both sources
 bool ConfigManager::load()
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = loadFromFS();
     bool prefSuccess = loadFromPreferences();
 
@@ -203,6 +201,7 @@ bool ConfigManager::load()
 // Save configuration to both sources
 bool ConfigManager::save()
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = saveToFS();
     bool prefSuccess = saveToPreferences();
 
@@ -230,6 +229,13 @@ bool ConfigManager::save()
 // Loading from LittleFS
 bool ConfigManager::loadFromFS()
 {
+    // Power lost between removing the old file and renaming the new one
+    String tmpFile = String(configFile) + ".tmp";
+    if (!LittleFS.exists(configFile) && LittleFS.exists(tmpFile))
+    {
+        LittleFS.rename(tmpFile, configFile);
+    }
+
     // Check if file exists
     if (!LittleFS.exists(configFile))
     {
@@ -245,8 +251,9 @@ bool ConfigManager::loadFromFS()
         return false;
     }
 
+    // (never logged: it holds the WiFi and MQTT passwords)
     // Create JSON document
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(1024);
     DeserializationError error = deserializeJson(doc, file);
     file.close();
 
@@ -288,18 +295,10 @@ bool ConfigManager::loadFromFS()
 }
 
 // Saving to LittleFS
+// Written to a temporary file and renamed, like sensors.json
 bool ConfigManager::saveToFS()
 {
-    // Open file for writing
-    File file = LittleFS.open(configFile, "w");
-    if (!file)
-    {
-        logger.error("Failed to open config file for writing: " + String(configFile));
-        return false;
-    }
-
-    // Create JSON document
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(1024);
     doc["ssid"] = wifiSSID;
     doc["password"] = wifiPassword;
     doc["configMode"] = configMode;
@@ -314,16 +313,34 @@ bool ConfigManager::saveToFS()
     doc["mqttPrefix"] = mqttPrefix;
     doc["mqttHAEnabled"] = mqttHAEnabled;
     doc["mqttHAPrefix"] = mqttHAPrefix;
-
-    // Serialize to file
-    if (serializeJson(doc, file) == 0)
+    if (doc.overflowed())
     {
-        logger.error("Failed to write config to file");
-        file.close();
+        logger.error("Configuration does not fit the JSON document - not saved");
         return false;
     }
 
+    String tmpFile = String(configFile) + ".tmp";
+    File file = LittleFS.open(tmpFile, "w");
+    if (!file)
+    {
+        logger.error("Failed to open " + tmpFile + " for writing");
+        return false;
+    }
+    size_t expected = measureJson(doc);
+    size_t written = serializeJson(doc, file);
     file.close();
+    if (written == 0 || written != expected)
+    {
+        logger.error("Failed to write config to file");
+        LittleFS.remove(tmpFile);
+        return false;
+    }
+    LittleFS.remove(configFile);
+    if (!LittleFS.rename(tmpFile, configFile))
+    {
+        logger.error("Failed to replace " + String(configFile));
+        return false;
+    }
     return true;
 }
 
@@ -367,11 +384,41 @@ bool ConfigManager::loadFromPreferences()
     {
         mqttPassword = preferences.getString("mqttPassword", MQTT_DEFAULT_PASS);
     }
-    mqttEnabled = preferences.getBool("mqttEnabled", MQTT_DEFAULT_ENABLED);
-    mqttTls = preferences.getBool("mqttTls", MQTT_DEFAULT_TLS);
-    mqttPrefix = preferences.getString("mqttPrefix", MQTT_DEFAULT_PREFIX);
-    mqttHAEnabled = preferences.getBool("mqttHAEnabled", HA_DISCOVERY_DEFAULT_ENABLED);
-    mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
+    // Only stored keys override config.json (erased NVS must not reset them)
+    if (preferences.isKey("mqttEnabled"))
+    {
+        mqttEnabled = preferences.getBool("mqttEnabled", MQTT_DEFAULT_ENABLED);
+    }
+    if (preferences.isKey("mqttTls"))
+    {
+        mqttTls = preferences.getBool("mqttTls", MQTT_DEFAULT_TLS);
+    }
+    if (preferences.isKey("mqttPrefix"))
+    {
+        mqttPrefix = preferences.getString("mqttPrefix", MQTT_DEFAULT_PREFIX);
+    }
+    if (preferences.isKey("mqttHAEnabled"))
+    {
+        mqttHAEnabled = preferences.getBool("mqttHAEnabled", HA_DISCOVERY_DEFAULT_ENABLED);
+    }
+    if (preferences.isKey("mqttHAPrefix"))
+    {
+        mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
+    }
+
+    lteEnabled = preferences.getBool("lteEnabled", LTE_DEFAULT_ENABLED);
+    lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
+    ltePin = preferences.getString("ltePin", "");
+    ltePinRejected = preferences.getBool("ltePinBad", false);
+
+    adminPasswordHash = preferences.getString("adminPwd", "");
+
+    ethStatic = preferences.getBool("ethStatic", false);
+    ethIp = preferences.getString("ethIp", "");
+    ethMask = preferences.getString("ethMask", "");
+    ethGateway = preferences.getString("ethGateway", "");
+    ethDns1 = preferences.getString("ethDns1", "");
+    ethDns2 = preferences.getString("ethDns2", "");
 
     // Other values should be loaded from LittleFS, but if needed,
     // we can load them from Preferences as a backup solution
@@ -421,6 +468,17 @@ bool ConfigManager::saveToPreferences()
     success = preferences.putBool("mqttHAEnabled", mqttHAEnabled) == sizeof(uint8_t) && success;
     putStringChecked("mqttHAPrefix", mqttHAPrefix);
 
+    preferences.putBool("lteEnabled", lteEnabled);
+    preferences.putString("lteApn", lteApn);
+    preferences.putString("ltePin", ltePin);
+
+    preferences.putBool("ethStatic", ethStatic);
+    preferences.putString("ethIp", ethIp);
+    preferences.putString("ethMask", ethMask);
+    preferences.putString("ethGateway", ethGateway);
+    preferences.putString("ethDns1", ethDns1);
+    preferences.putString("ethDns2", ethDns2);
+
     // Save WiFi configuration (as backup)
     putStringChecked("ssid", wifiSSID);
     putStringChecked("password", wifiPassword);
@@ -430,17 +488,203 @@ bool ConfigManager::saveToPreferences()
 }
 
 // Add a new method to set MQTT configuration
+bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // PIN: empty or 4-8 digits
+    bool pinOk = pin.length() == 0 || (pin.length() >= 4 && pin.length() <= 8);
+    for (size_t i = 0; pinOk && i < pin.length(); i++)
+    {
+        pinOk = isDigit(pin[i]);
+    }
+    if (!pinOk)
+    {
+        logger.error("Invalid SIM PIN - 4 to 8 digits");
+        return false;
+    }
+    // APN: letters, digits, '.', '-' and '_' (it goes into an AT command)
+    if (apn.length() > 63)
+    {
+        logger.error("APN too long");
+        return false;
+    }
+    for (size_t i = 0; i < apn.length(); i++)
+    {
+        char c = apn[i];
+        if (!isAlphaNumeric(c) && c != '.' && c != '-' && c != '_')
+        {
+            logger.error("Invalid APN character");
+            return false;
+        }
+    }
+
+    if (pin != ltePin)
+    {
+        setLtePinRejected(false);
+    }
+    lteEnabled = enabled;
+    lteApn = apn;
+    ltePin = pin;
+
+    if (saveConfig)
+    {
+        return save();
+    }
+    return true;
+}
+
+// Contiguous netmask, at least /1 and at most /30
+static bool isValidNetmask(const IPAddress &mask)
+{
+    uint32_t m = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) | ((uint32_t)mask[2] << 8) | mask[3];
+    uint32_t inverted = ~m;
+    return m != 0 && (inverted & (inverted + 1)) == 0 && inverted >= 3;
+}
+
+// Dotted IPv4 only (fromString() also accepts IPv6); empty input gives ""
+static bool parseIPv4(const String &text, String &normalized)
+{
+    IPAddress addr;
+    normalized = "";
+    if (text.length() == 0)
+    {
+        return true;
+    }
+    if (!addr.fromString(text) || addr.type() != IPv4 || addr == IPAddress())
+    {
+        return false;
+    }
+    normalized = addr.toString();
+    return true;
+}
+
+String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
+                                        const String &dns1, const String &dns2, bool saveConfig)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    String nIp, nMask, nGateway, nDns1, nDns2;
+    bool ipOk = parseIPv4(ip, nIp);
+    bool maskOk = parseIPv4(mask, nMask);
+    bool gatewayOk = parseIPv4(gateway, nGateway);
+    bool dns1Ok = parseIPv4(dns1, nDns1);
+    bool dns2Ok = parseIPv4(dns2, nDns2);
+
+    if (useStatic)
+    {
+        IPAddress a, m, g;
+        if (!ipOk || nIp.length() == 0)
+        {
+            return "Invalid IP address";
+        }
+        m.fromString(nMask);
+        if (!maskOk || nMask.length() == 0 || !isValidNetmask(m))
+        {
+            return "Invalid subnet mask";
+        }
+        if (!gatewayOk || nGateway.length() == 0)
+        {
+            return "Invalid gateway";
+        }
+        a.fromString(nIp);
+        g.fromString(nGateway);
+        for (int i = 0; i < 4; i++)
+        {
+            if ((a[i] & m[i]) != (g[i] & m[i]))
+            {
+                return "Gateway is not in the same subnet as the IP address";
+            }
+        }
+        if (a == g)
+        {
+            return "IP address and gateway must differ";
+        }
+        if (!dns1Ok)
+        {
+            return "Invalid primary DNS";
+        }
+        if (!dns2Ok)
+        {
+            return "Invalid secondary DNS";
+        }
+    }
+
+    ethStatic = useStatic;
+    // With DHCP the form fields are disabled and not sent; keep the stored
+    // addresses so switching back is easy, but never store invalid text
+    if (useStatic || ip.length() > 0)
+    {
+        ethIp = ipOk ? nIp : "";
+        ethMask = maskOk ? nMask : "";
+        ethGateway = gatewayOk ? nGateway : "";
+        ethDns1 = dns1Ok ? nDns1 : "";
+        ethDns2 = dns2Ok ? nDns2 : "";
+    }
+
+    if (saveConfig && !save())
+    {
+        return "Saving configuration failed";
+    }
+    return "";
+}
+
+void ConfigManager::setLtePinRejected(bool rejected)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    ltePinRejected = rejected;
+    if (preferencesInitialized)
+    {
+        preferences.putBool("ltePinBad", rejected);
+    }
+}
+
+bool ConfigManager::setAdminPasswordHash(const String &hash)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    if (!preferencesInitialized)
+    {
+        return false;
+    }
+    if (hash.length() == 0)
+    {
+        if (preferences.isKey("adminPwd") && !preferences.remove("adminPwd"))
+        {
+            return false;
+        }
+        adminPasswordHash = "";
+        return true;
+    }
+    // RAM follows only a successful write (a fresh device must not end up
+    // with a password in RAM that is gone after a restart)
+    if (preferences.putString("adminPwd", hash) != hash.length() ||
+        preferences.getString("adminPwd", "") != hash)
+    {
+        return false;
+    }
+    adminPasswordHash = hash;
+    return true;
+}
+
 bool ConfigManager::setMqttConfig(const String &host, int port, const String &user,
                                   const String &password, bool enabled, bool tls,
                                   const String &rootPrefix, const String &haPrefix, bool haEnable,
                                   bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Validate MQTT topic format (basic validation)
-    if (!isValidMqttTopic(rootPrefix) || !isValidMqttTopic(haPrefix))
+    // A prefix stored by an older version (e.g. with '/') may be kept as it is
+    bool rootOk = isValidMqttTopic(rootPrefix) || rootPrefix == mqttPrefix;
+    bool haOk = isValidMqttTopic(haPrefix) || haPrefix == mqttHAPrefix;
+    if (!rootOk || !haOk)
     {
         logger.error("Invalid MQTT topic format");
         return false;
     }
+
+    // Kept to roll back: RAM must not show settings that are not saved
+    String oldHost = mqttHost, oldUser = mqttUser, oldPassword = mqttPassword;
+    String oldPrefix = mqttPrefix, oldHAPrefix = mqttHAPrefix;
+    int oldPort = mqttPort;
+    bool oldEnabled = mqttEnabled, oldTls = mqttTls, oldHAEnabled = mqttHAEnabled;
 
     mqttHost = host;
     mqttPort = port;
@@ -452,25 +696,20 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
     mqttHAPrefix = haPrefix;
     mqttHAEnabled = haEnable;
 
-    return saveConfig ? save() : true;
-}
-
-// Add a new method to set the timezone
-bool ConfigManager::setTimezone(const String &newTimezone, bool saveConfig)
-{
-    timezone = newTimezone;
-
-    // Configure the time with new timezone using verified sync
-    if (!syncNTPTime(timezone))
+    if (saveConfig && !save())
     {
-        logger.warning("NTP sync failed during timezone change");
+        mqttHost = oldHost;
+        mqttPort = oldPort;
+        mqttUser = oldUser;
+        mqttPassword = oldPassword;
+        mqttEnabled = oldEnabled;
+        mqttTls = oldTls;
+        mqttPrefix = oldPrefix;
+        mqttHAPrefix = oldHAPrefix;
+        mqttHAEnabled = oldHAEnabled;
+        saveToPreferences(); // save() may have written the new values there
+        return false;
     }
-
-    if (saveConfig)
-    {
-        return save();
-    }
-
     return true;
 }
 
@@ -478,15 +717,16 @@ bool ConfigManager::setTimezone(const String &newTimezone, bool saveConfig)
 bool ConfigManager::isValidMqttTopic(const String &topic)
 {
     // Basic MQTT topic validation
-    if (topic.length() == 0 || topic.length() > 127)
+    // Short: topics and discovery payloads must fit the 1024 B MQTT buffer
+    if (topic.length() == 0 || topic.length() > 32)
         return false;
     
     // Check for invalid characters
     if (topic.indexOf('#') != -1 || topic.indexOf('+') != -1)
         return false;
 
-    // Check for leading or trailing slashes
-    if (topic[0] == '/' || topic[topic.length()-1] == '/') 
+    // One level only: the prefix is also part of discovery node and unique ids
+    if (topic.indexOf('/') != -1)
         return false;
 
     return true;
@@ -509,6 +749,16 @@ void ConfigManager::resetToDefaults()
     mqttTls = MQTT_DEFAULT_TLS;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
+    lteEnabled = LTE_DEFAULT_ENABLED;
+    lteApn = LTE_DEFAULT_APN;
+    ltePin = "";
+    ltePinRejected = false;
+    ethStatic = false;
+    ethIp = "";
+    ethMask = "";
+    ethGateway = "";
+    ethDns1 = "";
+    ethDns2 = "";
     mqttHAPrefix = HA_DISCOVERY_DEFAULT_PREFIX;
 }
 
@@ -522,7 +772,7 @@ String ConfigManager::getFirmwareVersion() const
 String ConfigManager::getMacAddress() const
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    getStationMac(mac);
 
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -535,7 +785,7 @@ String ConfigManager::getMacAddress() const
 String ConfigManager::getDeviceName() const
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    getStationMac(mac);
 
     String deviceName = "expLORA-GW-";
     for (int i = 0; i < 6; i++)
@@ -572,26 +822,29 @@ bool ConfigManager::wasApCredentialGeneratedThisBoot() const
 
 bool ConfigManager::rotateAdminCredential(String &newCredential)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     do
     {
         newCredential = generateCredential();
     } while (newCredential == apCredential);
 
-    if (!persistCredential("adminCred", newCredential))
+    String hash = WebAuth::makePasswordHash(newCredential);
+    if (hash.length() == 0 || !setAdminPasswordHash(hash))
     {
         newCredential = "";
         return false;
     }
-    adminCredential = newCredential;
+    adminCredential = "";
     return true;
 }
 
 bool ConfigManager::rotateApCredential(String &newCredential)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     do
     {
         newCredential = generateCredential();
-    } while (newCredential == adminCredential);
+    } while (WebAuth::matchesPasswordHash(newCredential, adminPasswordHash));
 
     if (!persistCredential("apCred", newCredential))
     {
@@ -605,9 +858,11 @@ bool ConfigManager::rotateApCredential(String &newCredential)
 // Set WiFi configuration
 bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     wifiSSID = ssid;
     wifiPassword = password;
     configMode = false;
+    lastWifiAttempt = 0;
 
     if (saveConfig)
     {
@@ -620,6 +875,12 @@ bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bo
 // Switch to configuration mode (AP)
 void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // Called on every boot - only write flash when it changes
+    if (configMode == enable)
+    {
+        return;
+    }
     configMode = enable;
 
     if (saveConfig)
@@ -631,6 +892,7 @@ void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 // Set logging level
 void ConfigManager::setLogLevel(LogLevel level, bool saveConfig)
 {
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
     logLevel = level;
 
     // Update level in logger

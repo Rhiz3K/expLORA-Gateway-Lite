@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * MQTT communication manager header file
  *
@@ -21,11 +21,13 @@
 
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
-#include <vector>
 #include "Data/SensorManager.h"
 #include "Data/Logging.h"
 #include "Storage/ConfigManager.h"
@@ -53,6 +55,12 @@ private:
     // MQTT flag representing if client is ready
     bool mqttClientReady = false;
 
+    // Gateway's own entities (uplink, power source, LTE signal)
+    String gatewayId;                   // Device identifier, same as the AP name
+    String lastGatewayState;            // Last published state, to publish on change
+    unsigned long lastGatewayCheck = 0;
+    unsigned long lastGatewayPublish = 0;
+
     // Connect to MQTT broker
     bool connect();
 
@@ -62,13 +70,37 @@ private:
     // Create configuration JSON for Home Assistant discovery
     String buildDiscoveryJson(const SensorData &sensor, const String &valueType, const String &stateTopic);
 
-    // Publish retained Home Assistant discovery entities for one snapshot.
-    void publishDiscoverySnapshot(const SensorData &sensor);
-    void publishDiscoveryValue(const SensorData &sensor, const String &valueType,
-                               const String &stateTopic);
-
     // Helper function to capitalize first letter
     String capitalizeFirst(const String &input);
+
+    // Discovery config of one sensor
+    void publishSensorDiscovery(const SensorData &sensor);
+    bool publishRetained(const String &topic, const String &payload);
+    volatile bool haRestarted = false; // "online" on <haPrefix>/status
+
+    // Work queued by other tasks (web handlers), done in process()
+    struct PendingOp
+    {
+        enum Type : uint8_t
+        {
+            Discovery,
+            Removal,
+        } type;
+        uint32_t serialNumber;
+    };
+    std::mutex pendingMutex;
+    std::vector<PendingOp> pending;
+    bool reinitRequested = false;
+    void processPending();
+
+    String statusTopic;
+
+    // Gateway entities: discovery and state
+    String gatewayTopic(const char *key) const;
+    void publishGatewayEntity(const char *key, const char *name, const char *deviceClass,
+                              const char *unit, const char *icon);
+    void publishGatewayDiscovery();
+    void publishGatewayState(bool force);
 
 public:
     // Constructor
@@ -86,14 +118,39 @@ public:
     // Publish sensor data
     void publishSensorData(int sensorIndex);
 
-    // Publish discovery for specific sensor
-    void publishDiscoveryForSensor(int sensorIndex);
-
     // Remove discovery for deleted sensor
     void removeDiscoveryForSensor(uint32_t serialNumber);
 
+    // Thread-safe requests (any task), carried out by process()
+    void requestSensorDiscovery(uint32_t serialNumber);
+    void requestSensorRemoval(uint32_t serialNumber);
+    // Copy of the MQTT configuration taken by init() (loop task), so the
+    // strings in use - PubSubClient keeps the host pointer - never change
+    // under it when the web task saves new settings
+    struct Settings
+    {
+        String host;
+        int port;
+        String user;
+        String password;
+        bool enabled;
+        bool tls;
+        String prefix;
+        String haPrefix;
+        bool haEnabled;
+    };
+
+    // Reconnect with the saved configuration (called after the web form saved it)
+    void requestReinit();
+
+private:
+    Settings cfg;
+
+public:
+
     // Check connection
     bool isConnected();
+    bool usesTls() const { return cfg.tls; }
 
     // Disconnect from MQTT broker
     void disconnect();

@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Logging system header file
  *
@@ -150,6 +150,9 @@ public:
     // Return newest-first caller-owned entries. The copy is made while
     // logMutex is held, so asynchronous renderers never observe live Strings.
     static std::vector<LogEntry> getLogsSnapshot();
+    // Copy of the n-th newest entry (0 = newest) under the log lock; false
+    // past the end
+    static bool copyNewest(size_t n, LogEntry &out);
 
     // Clear all logs
     static void clearLogs();
@@ -164,4 +167,5 @@ public:
     static void setTimeInitialized(bool initialized);
 
     static bool isTimeInitialized() { return timeInitialized; }
+
 };

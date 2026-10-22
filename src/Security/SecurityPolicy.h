@@ -137,11 +137,19 @@ inline bool hasUnsafeUrlCharacter(const std::string &value)
  * path encoding. Query strings are allowed; fragments are not sent to a
  * server and are rejected to keep policy decisions unambiguous.
  */
-inline bool isAllowedFirmwareUrl(const std::string &url)
+inline bool isAllowedFirmwareUrl(
+    const std::string &url,
+    const std::string &manifestUrl = "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json")
 {
     static const std::string scheme = "https://";
     static const std::string requiredHost = "pajenicko.cz";
-    static const std::string requiredPathPrefix = "/webflash/explora-gw-lite/";
+    const std::string requiredPathPrefix =
+        manifestUrl == "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+            ? "/webflash/explora-gw-lite/"
+            : manifestUrl == "https://pajenicko.cz/webflash/explora-gw-pro-autoupdate.json"
+                  ? "/webflash/explora-gw-pro/" : "";
+
+    if (requiredPathPrefix.empty()) return false;
 
     if (url.compare(0, scheme.size(), scheme) != 0 || hasUnsafeUrlCharacter(url) ||
         url.find('#') != std::string::npos)
@@ -217,12 +225,17 @@ inline bool isAllowedFirmwareUrl(const std::string &url)
  * Keep the policies separate so widening the manifest rule can never widen
  * the artifact download surface.
  */
-inline bool isAllowedManifestUrl(const std::string &url)
+inline bool isAllowedManifestUrl(
+    const std::string &url,
+    const std::string &expectedManifest = "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json")
 {
-    static const std::string allowed =
-        "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json";
+    if (expectedManifest != "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json" &&
+        expectedManifest != "https://pajenicko.cz/webflash/explora-gw-pro-autoupdate.json")
+    {
+        return false;
+    }
     return !hasUnsafeUrlCharacter(url) && url.find('#') == std::string::npos &&
-           asciiLower(url) == allowed;
+           asciiLower(url) == expectedManifest;
 }
 
 struct SemanticVersion

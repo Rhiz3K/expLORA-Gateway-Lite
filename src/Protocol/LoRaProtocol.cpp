@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * LoRa protocol handler implementation file
  *
@@ -24,7 +24,7 @@
 #include "SensorParsers.h"
 
 // Constructor
-LoRaProtocol::LoRaProtocol(LoRaModule &module, SensorManager &manager, Logger &log)
+LoRaProtocol::LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log)
     : loraModule(module), sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
 {
 }
@@ -56,19 +56,27 @@ bool LoRaProtocol::processReceivedPacket()
         return false;
     }
 
-    // Log received packet in hexadecimal format
-    String hexData = "Received data (HEX): ";
-    for (uint8_t i = 0; i < length; i++)
+    // Hex dumps only at DEBUG (each is a heap String per packet)
+    const bool dump = Logger::getLogLevel() >= LogLevel::DEBUG;
+    String hexData;
+    if (dump)
     {
-        if (packetBuffer[i] < 0x10)
-            hexData += "0";
-        hexData += String(packetBuffer[i], HEX) + " ";
+        hexData = "Received data (HEX): ";
+        for (uint8_t i = 0; i < length; i++)
+        {
+            if (packetBuffer[i] < 0x10)
+                hexData += "0";
+            hexData += String(packetBuffer[i], HEX) + " ";
+        }
+        logger.debug(hexData);
     }
-    logger.debug(hexData);
 
     // Get RSSI for diagnostics
     int rssi = loraModule.getRSSI();
-    logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(loraModule.getSNR()) + " dB");
+    if (dump)
+    {
+        logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(loraModule.getSNR()) + " dB");
+    }
 
     // Attempt to decrypt packet
     int sensorIndex = tryDecryptWithAllKeys(packetBuffer, length, decryptedBuffer);
@@ -80,15 +88,17 @@ bool LoRaProtocol::processReceivedPacket()
         return false;
     }
 
-    // Log decrypted data
-    hexData = "Decrypted data (HEX): ";
-    for (uint8_t i = 0; i < length; i++)
+    if (dump)
     {
-        if (decryptedBuffer[i] < 0x10)
-            hexData += "0";
-        hexData += String(decryptedBuffer[i], HEX) + " ";
+        hexData = "Decrypted data (HEX): ";
+        for (uint8_t i = 0; i < length; i++)
+        {
+            if (decryptedBuffer[i] < 0x10)
+                hexData += "0";
+            hexData += String(decryptedBuffer[i], HEX) + " ";
+        }
+        logger.debug(hexData);
     }
-    logger.debug(hexData);
 
     // Check checksum
     unsigned long nowMillis = millis();
@@ -108,8 +118,18 @@ bool LoRaProtocol::processReceivedPacket()
         return false;
     }
 
-    // Get sensor type from decrypted data
+    // Get sensor type from decrypted data; it must be the configured one
+    // (a packet is never parsed as another sensor type than set up)
     SensorType deviceType = static_cast<SensorType>(decryptedBuffer[1]);
+    SensorData configured;
+    uint32_t packetSN = ((uint32_t)decryptedBuffer[2] << 16) | ((uint32_t)decryptedBuffer[3] << 8) | decryptedBuffer[4];
+    if (!sensorManager.getSensorCopy(sensorIndex, configured) || configured.deviceType != deviceType ||
+        configured.serialNumber != packetSN) // slot reused meanwhile
+    {
+        logger.warning("Packet type 0x" + String(decryptedBuffer[1], HEX) + " does not match the configured sensor type");
+        sensorManager.recordSensorRejection(sensorIndex, nowMillis, "wrong device type");
+        return false;
+    }
 
     lastProcessedSensorIndex = sensorIndex;
 
@@ -146,6 +166,9 @@ bool LoRaProtocol::processPacketByType(SensorType type, uint8_t *data, uint8_t l
     case SensorType::DIY_TEMP: 
         return processDIYTempPacket(data, len, sensorIndex, rssi);
 
+    case SensorType::SHT40:
+        return processSHT40Packet(data, len, sensorIndex, rssi);
+
     default:
         logger.warning("Unknown device type: 0x" + String(static_cast<uint8_t>(type), HEX));
         return false;
@@ -164,23 +187,44 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
         return false;
     }
 
-    SensorData sensor;
-    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, payload.pressure,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        sensorManager.getSensorSnapshot(sensorIndex, sensor);
         logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
                     String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
+    }
+
+    return result;
+}
+
+// Process packet from SHT40 sensor
+bool LoRaProtocol::processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
+{
+    SensorParsers::CommonHeader header;
+    SensorParsers::SHT40Data    payload;
+    if (!SensorParsers::parseCommonHeader(data, len, header) ||
+        !SensorParsers::parseSHT40(data, len, payload))
+    {
+        logger.warning("Packet too short for SHT40");
+        return false;
+    }
+
+    bool result = sensorManager.updateSensorData(sensorIndex,
+                                                 payload.temperature, payload.humidity, 0.0f,
+                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
+
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
+    {
+        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
+                    String(sensor.humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
     }
 
     return result;
@@ -197,17 +241,13 @@ bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIn
         return false;
     }
 
-    SensorData sensor;
-    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor)) {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, 0.0f, 0.0f,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi);
 
-    if (result) {
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor)) {
         logger.info(sensor.name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
                   String(header.batteryVoltage, 2) + "V");
     }
@@ -227,20 +267,14 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
         return false;
     }
 
-    SensorData sensor;
-    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, 0.0f,
                                                  payload.ppm, 0.0f, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        sensorManager.getSensorSnapshot(sensorIndex, sensor);
         logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
                     String(sensor.humidity, 2) + "%, CO2: " + String(sensor.ppm, 0) + " ppm, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
@@ -261,17 +295,12 @@ bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorI
         return false;
     }
 
-    SensorData sensor;
-    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex, 0.0f, 0.0f, 0.0f, 0.0f,
                                                  payload.lux, header.batteryVoltage, rssi);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
         logger.info(sensor.name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
@@ -299,22 +328,16 @@ bool LoRaProtocol::processMeteoPacket(uint8_t *data, uint8_t len, int sensorInde
                  "m/s at " + String(payload.windDirection) + "°, rain=" + String(payload.rainAmount) +
                  "mm, rate=" + String(payload.rainRate) + "mm/h");
 
-    SensorData sensor;
-    if (!sensorManager.getSensorSnapshot(sensorIndex, sensor))
-    {
-        logger.error("Error accessing sensor data at index " + String(sensorIndex));
-        return false;
-    }
-
     bool result = sensorManager.updateSensorData(sensorIndex,
                                                  payload.temperature, payload.humidity, payload.pressure,
                                                  0.0f, 0.0f, header.batteryVoltage, rssi,
                                                  payload.windSpeed, payload.windDirection,
                                                  payload.rainAmount, payload.rainRate);
 
-    if (result)
+    // Copy: the web task may edit the sensor concurrently
+    SensorData sensor;
+    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
     {
-        sensorManager.getSensorSnapshot(sensorIndex, sensor);
         logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
                     String(sensor.humidity, 2) + "%, Press: " + String(sensor.pressure, 2) + " hPa, Wind: " +
                     String(sensor.windSpeed, 1) + " m/s at " + String(sensor.windDirection) + "°, Rain: " +
@@ -334,17 +357,19 @@ void LoRaProtocol::decryptData(uint8_t *data, uint8_t data_len, uint32_t key)
 // Try decryption with all known keys
 int LoRaProtocol::tryDecryptWithAllKeys(uint8_t *encData, uint8_t len, uint8_t *decData)
 {
-    // Get list of all active sensors
-    std::vector<SensorData> activeSensors = sensorManager.getActiveSensors();
+    // Locked copies with their real index
+    std::vector<ActiveSensorEntry> entries = sensorManager.getActiveSensorEntries();
 
     // Go through all sensors and try to decrypt
-    for (size_t i = 0; i < activeSensors.size(); i++)
+    for (size_t i = 0; i < entries.size(); i++)
     {
+        const SensorData &sensor = entries[i].data;
+
         // Copy encrypted data
         memcpy(decData, encData, len);
 
         // Try to decrypt with this sensor's key
-        decryptData(decData, len, activeSensors[i].deviceKey);
+        decryptData(decData, len, sensor.deviceKey);
 
         // Verify checksum
         if (validateChecksum(decData, len))
@@ -352,30 +377,17 @@ int LoRaProtocol::tryDecryptWithAllKeys(uint8_t *encData, uint8_t len, uint8_t *
             // Verify that serial number in decrypted data matches the sensor
             uint32_t packetSN = ((uint32_t)decData[2] << 16) | ((uint32_t)decData[3] << 8) | decData[4];
 
-            if (packetSN == activeSensors[i].serialNumber)
+            if (packetSN == sensor.serialNumber)
             {
-                // We found a match, return sensor index
                 logger.debug("Packet successfully decrypted with key from sensor " +
-                             activeSensors[i].name + " (SN: " + formatSN(activeSensors[i].serialNumber) + ")");
-
-                // Return sensor index in global array
-                return sensorManager.findSensorBySN(activeSensors[i].serialNumber);
+                             sensor.name + " (SN: " + formatSN(sensor.serialNumber) + ")");
+                return (int)entries[i].index;
             }
         }
     }
 
-    // If we didn't find a match, try to decrypt with any key for unknown sensor detection
-    if (!activeSensors.empty())
-    {
-        // Use key from first sensor
-        memcpy(decData, encData, len);
-        decryptData(decData, len, activeSensors[0].deviceKey);
-    }
-    else
-    {
-        // We don't have any keys, just copy data
-        memcpy(decData, encData, len);
-    }
+    // Unknown sensor: leave the raw bytes for the debug log
+    memcpy(decData, encData, len);
 
     return -1; // No sensor found
 }
@@ -415,7 +427,7 @@ bool LoRaProtocol::isValidPacket(uint8_t *buf, uint8_t len, String &reasonOut)
         }
         if (len == 23 && numValues == 6)
         {
-            logger.info("Detected extended METEO packet with 7 values (including rain rate)");
+            logger.debug("Extended METEO packet (includes rain rate)");
         }
     }
     else

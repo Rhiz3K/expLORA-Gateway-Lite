@@ -4,12 +4,14 @@
 #include "../Security/OtaTrust.h"
 #include "../Security/SecurityPolicy.h"
 #include "../config.h"
+#include "../Hardware/WatchdogPause.h"
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
+#include <esp_app_format.h>
 #include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
 #include <cstdlib>
@@ -19,6 +21,27 @@ namespace
 {
 constexpr size_t MAX_MANIFEST_BYTES = 8192;
 constexpr uint32_t OTA_STALL_TIMEOUT_MS = 15000;
+constexpr uint32_t OTA_DOWNLOAD_TIMEOUT_MS = 900000;
+
+const char *firmwareImageError(const uint8_t *data, size_t length)
+{
+    if (length < sizeof(esp_image_header_t)) return "Firmware image too short";
+    esp_image_header_t header;
+    memcpy(&header, data, sizeof(header));
+    if (header.magic != ESP_IMAGE_HEADER_MAGIC) return "Not an ESP32 firmware image";
+    if (header.chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID)
+        return "Firmware is for a different board (" BOARD_NAME " expected)";
+    return nullptr;
+}
+
+String httpsBlocker()
+{
+    if (time(nullptr) < 1700000000)
+        return "The clock is not synchronized yet (needed to check certificates)";
+    if (ESP.getFreeHeap() < 48000 || ESP.getMaxAllocHeap() < 24000)
+        return "Not enough free memory for HTTPS";
+    return "";
+}
 
 struct FirmwareUploadState
 {
@@ -27,6 +50,9 @@ struct FirmwareUploadState
     const char *errorMessage;
     char expectedSha256[65];
     size_t written;
+    size_t flashed;
+    uint8_t header[sizeof(esp_image_header_t)];
+    size_t headerLength;
     bool ownsOta;
     bool updateBegun;
     bool shaInitialized;
@@ -121,17 +147,63 @@ String requestHeader(AsyncWebServerRequest *request, const char *name)
 
 void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
 {
-    logger.debug("HTTP request: GET /firmware/check");
     if (!authorizeRequest(request, false)) return;
+    int status = 202;
+    String body = "{\"status\":\"checking\"}";
+    {
+        std::lock_guard<std::mutex> guard(otaWorkMutex);
+        if (updateCheckDone && millis() - updateCheckAt < 60000)
+        {
+            status = updateCheckStatus;
+            body = updateCheckResult;
+            updateCheckDone = false;
+        }
+        else if (!updateCheckRunning)
+        {
+            updateCheckRequested = true;
+            updateCheckRunning = true;
+        }
+    }
+    request->send(status, "application/json", body);
+}
 
-    if (!SecurityPolicy::isAllowedManifestUrl(FIRMWARE_UPDATE_URL))
+void WebPortal::runUpdateCheck()
+{
+    int status = 500;
+    String body;
+    fetchFirmwareManifest(status, body);
+    std::lock_guard<std::mutex> guard(otaWorkMutex);
+    updateCheckStatus = status;
+    updateCheckResult = body;
+    updateCheckDone = true;
+    updateCheckRunning = false;
+    updateCheckAt = millis();
+}
+
+void WebPortal::fetchFirmwareManifest(int &status, String &result)
+{
+    logger.debug("Fetching official firmware manifest");
+    if (!SecurityPolicy::isAllowedManifestUrl(FIRMWARE_UPDATE_URL, FIRMWARE_UPDATE_URL))
     {
         logger.error("Built-in firmware manifest URL violates OTA policy");
-        request->send(500, "application/json",
-                      "{\"error\":\"Invalid built-in firmware manifest URL\"}");
+        status = 500;
+        result = "{\"error\":\"Invalid built-in firmware manifest URL\"}";
         return;
     }
 
+    String blocker = httpsBlocker();
+    if (blocker.length() > 0 && time(nullptr) >= 1700000000 && mqttManager && mqttManager->isConnected() && mqttManager->usesTls())
+    {
+        mqttManager->disconnect();
+        blocker = httpsBlocker();
+    }
+    if (blocker.length() > 0)
+    {
+        status = 503;
+        result = "{\"error\":\"" + blocker + "\"}";
+        return;
+    }
+    WatchdogPause pause;
     WiFiClientSecure tlsClient;
     configureOtaTls(tlsClient);
     HTTPClient http;
@@ -140,8 +212,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     if (!http.begin(tlsClient, FIRMWARE_UPDATE_URL))
     {
-        request->send(500, "application/json",
-                      "{\"error\":\"Firmware check TLS initialization failed\"}");
+        status = 500;
+        result = "{\"error\":\"Firmware check TLS initialization failed\"}";
         return;
     }
     http.addHeader("User-Agent", "expLORA-Gateway/" + String(FIRMWARE_VERSION));
@@ -152,8 +224,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     {
         logger.error("Firmware manifest rejected: HTTP " + String(httpCode));
         http.end();
-        request->send(502, "application/json",
-                      "{\"error\":\"Official firmware manifest is unavailable or invalid\"}");
+        status = 502;
+        result = "{\"error\":\"Official firmware manifest is unavailable or invalid\"}";
         return;
     }
 
@@ -163,8 +235,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     if (manifestBytes <= 0 || manifestStream.limitExceeded() ||
         manifestStream.payload().length() > MAX_MANIFEST_BYTES)
     {
-        request->send(502, "application/json",
-                      "{\"error\":\"Official firmware manifest size is invalid\"}");
+        status = 502;
+        result = "{\"error\":\"Official firmware manifest size is invalid\"}";
         return;
     }
 
@@ -173,8 +245,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
         deserializeJson(incoming, manifestStream.payload());
     if (parseError)
     {
-        request->send(502, "application/json",
-                      "{\"error\":\"Official firmware manifest is not valid JSON\"}");
+        status = 502;
+        result = "{\"error\":\"Official firmware manifest is not valid JSON\"}";
         return;
     }
 
@@ -193,7 +265,7 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
         installable = false;
         reason = "No newer semantic firmware version is available";
     }
-    else if (!SecurityPolicy::isAllowedFirmwareUrl(url.c_str()))
+    else if (!SecurityPolicy::isAllowedFirmwareUrl(url.c_str(), FIRMWARE_UPDATE_URL))
     {
         installable = false;
         reason = "Manifest firmware URL is outside the official HTTPS origin";
@@ -218,7 +290,8 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
     serializeJson(responseDocument, response);
     logger.info("Firmware check completed; installable=" +
                 String(installable ? "true" : "false"));
-    request->send(200, "application/json", response);
+    status = 200;
+    result = response;
 }
 
 void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
@@ -254,7 +327,7 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     context->expectedSha256.toLowerCase();
 
     String verificationError;
-    if (!SecurityPolicy::isAllowedFirmwareUrl(context->url.c_str()))
+    if (!SecurityPolicy::isAllowedFirmwareUrl(context->url.c_str(), FIRMWARE_UPDATE_URL))
     {
         verificationError = "Firmware URL is outside the official HTTPS origin";
     }
@@ -288,26 +361,20 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
         return;
     }
 
-    BaseType_t created = xTaskCreate(
-        firmwareUpdateTask, "FirmwareOTA", 12288, context, 2, nullptr);
-    if (created != pdPASS)
     {
-        finishOta(context, "failed", "Could not create firmware update task", 0);
-        delete context;
-        request->send(503, "application/json",
-                      "{\"error\":\"Could not start firmware update task\"}");
-        return;
+        std::lock_guard<std::mutex> guard(otaWorkMutex);
+        pendingOtaContext = context;
     }
 
     request->send(202, "application/json",
                   "{\"status\":\"accepted\",\"message\":\"Firmware download started\"}");
 }
 
-void WebPortal::firmwareUpdateTask(void *parameter)
+void WebPortal::runFirmwareUpdate(void *parameter)
 {
     OtaTaskContext *context = static_cast<OtaTaskContext *>(parameter);
     WebPortal *portal = context->portal;
-    const bool wdtRegistered = esp_task_wdt_add(nullptr) == ESP_OK;
+    WatchdogPause pause;
     bool updateBegun = false;
     String failure;
 
@@ -321,12 +388,15 @@ void WebPortal::firmwareUpdateTask(void *parameter)
 
     do
     {
+        if (portal->mqttManager) portal->mqttManager->disconnect();
+        failure = httpsBlocker();
+        if (!failure.isEmpty()) break;
         if (!http.begin(tlsClient, context->url))
         {
             failure = "TLS initialization failed";
             break;
         }
-        http.addHeader("User-Agent", "explora-gw-lite/" +
+        http.addHeader("User-Agent", "expLORA-Gateway/" +
                                      String(FIRMWARE_VERSION));
         const int httpCode = http.GET();
         if (httpCode != HTTP_CODE_OK)
@@ -343,10 +413,10 @@ void WebPortal::firmwareUpdateTask(void *parameter)
             failure = "No OTA partition is available";
             break;
         }
-        if (contentLength > 0 &&
+        if (contentLength <= static_cast<int>(sizeof(esp_image_header_t)) ||
             static_cast<size_t>(contentLength) > ota->size)
         {
-            failure = "Firmware is too large for the OTA slot";
+            failure = "Invalid firmware size or OTA slot exceeded (Content-Length required)";
             break;
         }
 
@@ -362,7 +432,7 @@ void WebPortal::firmwareUpdateTask(void *parameter)
 
         mbedtls_sha256_context shaContext;
         mbedtls_sha256_init(&shaContext);
-        if (mbedtls_sha256_starts_ret(&shaContext, 0) != 0)
+        if (mbedtls_sha256_starts(&shaContext, 0) != 0)
         {
             mbedtls_sha256_free(&shaContext);
             failure = "Could not initialize firmware hashing";
@@ -373,15 +443,24 @@ void WebPortal::firmwareUpdateTask(void *parameter)
         uint8_t buffer[2048];
         size_t totalWritten = 0;
         int remaining = contentLength;
-        uint32_t lastDataAt = millis();
+        const uint32_t downloadStarted = millis();
+        uint32_t lastDataAt = downloadStarted;
+        uint8_t imageHeader[sizeof(esp_image_header_t)];
+        size_t imageHeaderLength = 0;
+        size_t received = 0;
         int lastProgress = -1;
 
         while (failure.isEmpty())
         {
+            if (millis() - downloadStarted > OTA_DOWNLOAD_TIMEOUT_MS)
+            {
+                failure = "Firmware download took over 15 minutes";
+                break;
+            }
             int available = stream->available();
             if (available > 0)
             {
-                available = min(available, static_cast<int>(sizeof(buffer)));
+                available = min(available, min(remaining, static_cast<int>(sizeof(buffer))));
                 const int read = stream->readBytes(
                     reinterpret_cast<char *>(buffer), available);
                 if (read > 0)
@@ -391,15 +470,31 @@ void WebPortal::firmwareUpdateTask(void *parameter)
                         failure = "Firmware stream exceeds the OTA slot";
                         break;
                     }
-                    if (Update.write(buffer, static_cast<size_t>(read)) !=
-                        static_cast<size_t>(read))
+                    mbedtls_sha256_update(&shaContext, buffer, static_cast<size_t>(read));
+                    received += static_cast<size_t>(read);
+                    size_t offset = 0;
+                    if (imageHeaderLength < sizeof(imageHeader))
                     {
-                        failure = "Firmware flash write failed";
-                        break;
+                        size_t take = std::min(static_cast<size_t>(read), sizeof(imageHeader) - imageHeaderLength);
+                        memcpy(imageHeader + imageHeaderLength, buffer, take);
+                        imageHeaderLength += take;
+                        offset = take;
+                        if (imageHeaderLength == sizeof(imageHeader))
+                        {
+                            const char *imageError = firmwareImageError(imageHeader, imageHeaderLength);
+                            if (imageError) { failure = imageError; break; }
+                            if (Update.write(imageHeader, sizeof(imageHeader)) != sizeof(imageHeader))
+                            { failure = "Firmware header flash write failed"; break; }
+                            totalWritten = sizeof(imageHeader);
+                        }
                     }
-                    mbedtls_sha256_update_ret(
-                        &shaContext, buffer, static_cast<size_t>(read));
-                    totalWritten += static_cast<size_t>(read);
+                    if (imageHeaderLength == sizeof(imageHeader) && static_cast<size_t>(read) > offset)
+                    {
+                        size_t count = static_cast<size_t>(read) - offset;
+                        if (Update.write(buffer + offset, count) != count)
+                        { failure = "Firmware flash write failed"; break; }
+                        totalWritten += count;
+                    }
                     lastDataAt = millis();
                     if (remaining > 0)
                     {
@@ -408,7 +503,7 @@ void WebPortal::firmwareUpdateTask(void *parameter)
                     if (contentLength > 0)
                     {
                         const int progress = static_cast<int>(
-                            (totalWritten * 100ULL) /
+                            (received * 100ULL) /
                             static_cast<size_t>(contentLength));
                         if (progress >= lastProgress + 5)
                         {
@@ -425,10 +520,6 @@ void WebPortal::firmwareUpdateTask(void *parameter)
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
 
-            if (wdtRegistered)
-            {
-                esp_task_wdt_reset();
-            }
             if (contentLength > 0 && remaining <= 0)
             {
                 break;
@@ -445,7 +536,7 @@ void WebPortal::firmwareUpdateTask(void *parameter)
         }
 
         uint8_t actualDigest[32];
-        mbedtls_sha256_finish_ret(&shaContext, actualDigest);
+        mbedtls_sha256_finish(&shaContext, actualDigest);
         mbedtls_sha256_free(&shaContext);
 
         if (!failure.isEmpty())
@@ -486,32 +577,22 @@ void WebPortal::firmwareUpdateTask(void *parameter)
         }
         portal->logger.error("URL OTA failed: " + failure);
         portal->logger.info(
-            "URL OTA task minimum free stack: " +
+            "URL OTA loop minimum free stack: " +
             String(uxTaskGetStackHighWaterMark(nullptr)) + " bytes");
         portal->finishOta(context, "failed", failure, 0);
-        if (wdtRegistered)
-        {
-            esp_task_wdt_delete(nullptr);
-        }
         delete context;
-        vTaskDelete(nullptr);
         return;
     }
 
     portal->logger.info(
-        "URL OTA task minimum free stack: " +
+        "URL OTA loop minimum free stack: " +
         String(uxTaskGetStackHighWaterMark(nullptr)) + " bytes");
     portal->logger.info("URL OTA installed; rebooting");
     portal->setOtaStatus("rebooting",
                          "Firmware installed; gateway is rebooting", 100);
-    if (wdtRegistered)
-    {
-        esp_task_wdt_delete(nullptr);
-    }
     delete context;
     vTaskDelay(pdMS_TO_TICKS(1500));
     ESP.restart();
-    vTaskDelete(nullptr);
 }
 
 void WebPortal::handleFirmwarePage(AsyncWebServerRequest *request)
@@ -550,7 +631,7 @@ void WebPortal::cleanupFirmwareUpload(AsyncWebServerRequest *request,
                   0);
         state->ownsOta = false;
     }
-    else if (state->installed && disconnected)
+    else if (state->installed)
     {
         // Update.end() has already selected the verified image. If the client
         // disappears before the completion callback can schedule a restart,
@@ -628,7 +709,22 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
     {
         if (state != nullptr)
         {
-            cleanupFirmwareUpload(request, false);
+            state->error = true;
+            state->httpStatus = 400;
+            state->errorMessage = "Only one firmware file per upload";
+            if (state->updateBegun) { Update.abort(); state->updateBegun = false; }
+            if (state->installed)
+            {
+                esp_ota_set_boot_partition(esp_ota_get_running_partition());
+                state->installed = false;
+                restartRequested = false;
+            }
+            if (state->ownsOta)
+            {
+                finishOta(request, "failed", state->errorMessage, 0);
+                state->ownsOta = false;
+            }
+            return;
         }
         state = static_cast<FirmwareUploadState *>(
             calloc(1, sizeof(FirmwareUploadState)));
@@ -696,7 +792,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
         {
             state->updateBegun = true;
             state->shaInitialized =
-                mbedtls_sha256_starts_ret(&state->shaContext, 0) == 0;
+                mbedtls_sha256_starts(&state->shaContext, 0) == 0;
             if (!state->shaInitialized)
             {
                 state->error = true;
@@ -755,13 +851,30 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
     }
     if (len > 0)
     {
-        if (Update.write(data, len) != len)
-        {
-            failUpload(500, "Firmware flash write failed");
-            return;
-        }
-        mbedtls_sha256_update_ret(&state->shaContext, data, len);
+        mbedtls_sha256_update(&state->shaContext, data, len);
         state->written += len;
+        size_t offset = 0;
+        if (state->headerLength < sizeof(state->header))
+        {
+            size_t take = std::min(len, sizeof(state->header) - state->headerLength);
+            memcpy(state->header + state->headerLength, data, take);
+            state->headerLength += take;
+            offset = take;
+            if (state->headerLength == sizeof(state->header))
+            {
+                const char *imageError = firmwareImageError(state->header, state->headerLength);
+                if (imageError) { failUpload(400, imageError); return; }
+                if (Update.write(state->header, sizeof(state->header)) != sizeof(state->header))
+                { failUpload(500, "Firmware header flash write failed"); return; }
+                state->flashed = sizeof(state->header);
+            }
+        }
+        if (state->headerLength == sizeof(state->header) && len > offset)
+        {
+            if (Update.write(data + offset, len - offset) != len - offset)
+            { failUpload(500, "Firmware flash write failed"); return; }
+            state->flashed += len - offset;
+        }
         const int progress = static_cast<int>(
             (state->written * 100ULL) / ota->size);
         setOtaStatus("uploading", "Receiving firmware upload",
@@ -774,10 +887,10 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request,
     }
 
     uint8_t digest[32];
-    mbedtls_sha256_finish_ret(&state->shaContext, digest);
+    mbedtls_sha256_finish(&state->shaContext, digest);
     mbedtls_sha256_free(&state->shaContext);
     state->shaInitialized = false;
-    if (state->written == 0)
+    if (state->written == 0 || state->headerLength != sizeof(state->header) || state->flashed != state->written)
     {
         failUpload(400, "Firmware image is empty");
         return;

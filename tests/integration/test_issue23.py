@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from gateway_auth import ensure_login
 
 
 MAX_SENSORS = 20
@@ -154,7 +155,8 @@ def delete_serials(
     ]
     for index in sorted(targets, reverse=True):
         response = post_form(
-            session, base, "/sensors/delete", {"index": str(index)}
+            session, base, "/sensors/delete",
+            {"index": str(index), "sn": forms[index]["serialNumber"].upper().zfill(6)},
         )
         require_status(response, (200, 302, 303), f"delete temporary index {index}")
 
@@ -225,7 +227,7 @@ def current_log_level(session: requests.Session, base: str) -> str:
 
 
 def log_snapshot_race(
-    base: str, username: str, credential: str, session: requests.Session
+    base: str, session: requests.Session
 ) -> None:
     previous_level = current_log_level(session, base)
     require_status(
@@ -239,14 +241,14 @@ def log_snapshot_race(
         if sequence % 4 == 0:
             response = requests.post(
                 base + "/logs/clear",
-                auth=(username, credential),
+                cookies=session.cookies,
                 headers={"Origin": base},
                 allow_redirects=False,
                 timeout=8,
             )
         else:
             response = requests.get(
-                base + "/logs", auth=(username, credential), timeout=8
+                base + "/logs", cookies=session.cookies, timeout=8
             )
         allowed = (200, 302, 303) if sequence % 4 == 0 else (200, 503)
         require_status(response, allowed, f"log race request {sequence}")
@@ -404,7 +406,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--admin-username", default="admin")
-    parser.add_argument("--admin-credential", required=True)
+    parser.add_argument("--admin-password", "--admin-credential", dest="admin_credential", required=True)
     parser.add_argument("--packet-timeout", type=int, default=300)
     parser.add_argument(
         "--detect-forward-via-api",
@@ -418,13 +420,13 @@ def main() -> int:
 
     base = args.url.rstrip("/")
     session = requests.Session()
-    session.auth = (args.admin_username, args.admin_credential)
+    ensure_login(session, base, args.admin_credential)
     session.headers.update({"User-Agent": "explora-issue23-hw-test/1.0"})
 
     version_response = session.get(base + "/firmware/version", timeout=5)
     require_status(version_response, (200,), "firmware version")
     version = str(version_response.json().get("version", ""))
-    if not any(marker in version for marker in ("storage", "correctness")):
+    if not any(marker in version for marker in ("storage", "correctness", "security")):
         raise TestFailure(
             f"expected storage/correctness test firmware, got {version!r}"
         )
@@ -451,6 +453,7 @@ def main() -> int:
 
         print("[2/5] Rebooting and verifying all 20 large records")
         reboot_and_wait(session, base, version)
+        ensure_login(session, base, args.admin_credential)
         persisted = configured_forms(session, base)
         persisted_serials = {
             normal_serial(form["serialNumber"]) for form in persisted.values()
@@ -462,9 +465,7 @@ def main() -> int:
             raise TestFailure("sensor set changed across the full-capacity reboot")
 
         print("[3/5] Racing log snapshots against log clearing")
-        log_snapshot_race(
-            base, args.admin_username, args.admin_credential, session
-        )
+        log_snapshot_race(base, session)
 
         print("[4/5] Verifying API responsiveness during slow custom HTTP forwarding")
         latency = forwarding_does_not_hold_sensor_lock(

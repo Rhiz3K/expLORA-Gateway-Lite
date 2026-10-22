@@ -6,7 +6,7 @@ app0,       app,  ota_0,   0x10000,  0x1F0000,
 app1,       app,  ota_1,   0x200000, 0x1F0000,
 # Coredump zůstává
 coredump,   data, coredump,0x3F0000, 0x10000,
-# (Volitelné) SPIFFS přesunut mezi app1 a littlefs
+# Filesystem: LittleFS.begin() mounts the partition labelled "spiffs"
 spiffs,     data, spiffs,  0x400000, 0x150000,
-# LittleFS ZACHOVÁN na stejné adrese i velikosti (data zůstanou)
+# Unused (the firmware does not mount it); kept so the layout stays as shipped
 littlefs,   data, spiffs,  0x550000, 0x0B0000

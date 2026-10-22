@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * LoRa protocol handler header file
  *
@@ -22,7 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include "../Hardware/LoRa_Module.h"
+#include "../Hardware/LoRaRadio.h"
 #include "../Data/SensorManager.h"
 #include "../Data/Logging.h"
 
@@ -35,7 +35,7 @@
 class LoRaProtocol
 {
 private:
-    LoRaModule &loraModule;       // Reference to LoRa module
+    LoRaRadio &loraModule;       // Reference to LoRa module
     SensorManager &sensorManager; // Reference to sensor manager
     Logger &logger;               // Reference to logger
 
@@ -52,6 +52,7 @@ private:
     bool processVEML7700Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
     bool processMeteoPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
     bool processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
+    bool processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
 
     int lastProcessedSensorIndex; // Index of last processed sensor
 
@@ -71,7 +72,7 @@ private:
 
 public:
     // Constructor
-    LoRaProtocol(LoRaModule &module, SensorManager &manager, Logger &log);
+    LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log);
 
     // Destructor
     ~LoRaProtocol();

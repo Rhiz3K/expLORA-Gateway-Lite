@@ -14,6 +14,7 @@ import re
 from typing import Optional
 
 import requests
+from gateway_auth import ensure_login
 
 
 FIXTURE_SERIAL = "EFFF24"
@@ -73,16 +74,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--admin-username", default="admin")
-    parser.add_argument("--admin-credential", required=True)
+    parser.add_argument("--admin-password", "--admin-credential", dest="admin_credential", required=True)
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
     session = requests.Session()
-    session.auth = (args.admin_username, args.admin_credential)
+    ensure_login(session, base, args.admin_credential)
     session.headers.update({"User-Agent": "explora-issue24-hw-test/1.0"})
 
     version = session.get(base + "/firmware/version", timeout=5).json()["version"]
-    if "correctness" not in str(version):
+    if not any(marker in str(version) for marker in ("correctness", "security")):
         raise TestFailure(f"expected correctness firmware, got {version!r}")
 
     baseline = serials(session, base)
@@ -228,7 +229,7 @@ def main() -> int:
                 session,
                 base,
                 "/sensors/delete",
-                {"index": str(fixture_index)},
+                {"index": str(fixture_index), "sn": FIXTURE_SERIAL},
             )
             if deleted.status_code not in (200, 302, 303):
                 raise TestFailure(

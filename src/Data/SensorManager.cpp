@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Sensor manager implementation file
  *
@@ -26,6 +26,10 @@
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include "../Security/OtaTrust.h"
+#include <WiFiClientSecure.h>
+#include <memory>
+#include "../Network/Uplink.h"
+#include "../Hardware/WatchdogPause.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -75,28 +79,15 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
         return -1;
     }
 
-    // Check if sensor already exists
-    int existingIndex = findSensorBySN(serialNumber);
-    if (existingIndex >= 0)
+    // A second sensor with the same serial number would never receive data
+    // (and silently replacing the key of the first one is worse)
+    if (findSensorBySN(serialNumber) >= 0)
     {
-        const SensorData previous = sensors[existingIndex];
-        // Update existing sensor
-        sensors[existingIndex].deviceType = deviceType;
-        sensors[existingIndex].deviceKey = deviceKey;
-        sensors[existingIndex].name = name;
-        sensors[existingIndex].configured = true;
-
-        logger.info("Updated existing sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-        if (!saveSensors(false))
-        {
-            sensors[existingIndex] = previous;
-            logger.error("Sensor update rolled back because persistence failed");
-            return -1;
-        }
-        return existingIndex;
+        logger.warning("Failed to add sensor: SN " + formatSN(serialNumber) + " already exists");
+        return -2;
     }
 
-    // Find first free slot
+    // First free slot (deleted sensors leave free slots below sensorCount)
     int newIndex = -1;
     for (size_t i = 0; i < MAX_SENSORS; i++)
     {
@@ -106,45 +97,46 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
             break;
         }
     }
-
-    if (newIndex == -1)
+    if (newIndex < 0)
     {
         logger.error("Failed to add sensor: maximum number of sensors reached");
         return -1;
     }
-
-    const size_t previousCount = sensorCount;
-    const SensorData previousSlot = sensors[newIndex];
-    if (newIndex >= static_cast<int>(sensorCount))
+    if ((size_t)newIndex >= sensorCount)
     {
         sensorCount = newIndex + 1;
     }
 
-    // Initialize new sensor
+    // Fresh state - a reused slot must not inherit the deleted sensor's
+    // health counters, rain totals or corrections
+    sensors[newIndex] = SensorData();
     sensors[newIndex].deviceType = deviceType;
     sensors[newIndex].serialNumber = serialNumber;
     sensors[newIndex].deviceKey = deviceKey;
     sensors[newIndex].name = name;
-    sensors[newIndex].customUrl = "";
-    sensors[newIndex].lastSeen = 0;
-    sensors[newIndex].temperature = 0.0f;
-    sensors[newIndex].humidity = 0.0f;
-    sensors[newIndex].pressure = 0.0f;
-    sensors[newIndex].ppm = 0.0f;
-    sensors[newIndex].lux = 0.0f;
-    sensors[newIndex].batteryVoltage = 0.0f;
-    sensors[newIndex].rssi = 0;
     sensors[newIndex].configured = true;
+    pendingAdds[newIndex] = true;
 
+    // Not saved yet: the web form's updateSensorConfig() saves the complete
+    // sensor once (no half-configured sensor on flash if that fails)
     logger.info("Added new sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    if (!saveSensors(false))
-    {
-        sensors[newIndex] = previousSlot;
-        sensorCount = previousCount;
-        logger.error("Sensor add rolled back because persistence failed");
-        return -1;
-    }
     return newIndex;
+}
+
+bool SensorManager::discardUnsavedSensor(int index)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (index < 0 || static_cast<size_t>(index) >= sensorCount || !pendingAdds[index])
+    {
+        return false;
+    }
+    sensors[index] = SensorData();
+    pendingAdds[index] = false;
+    while (sensorCount > 0 && !sensors[sensorCount - 1].configured)
+    {
+        --sensorCount;
+    }
+    return true;
 }
 
 // Find sensor by serial number
@@ -397,7 +389,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
             time_t now;
             time(&now);
 
-            if (getLocalTime(&timeinfo))
+            if (getLocalTime(&timeinfo, 0))
             {
                 // Create timestamps for comparing dates
                 // Date of last reset
@@ -426,7 +418,7 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
         // Log the updated daily total if it has changed
         if (rainAmount > 0)
         {
-           saveSensors(false); // Save immediately after updating daily total
+            rainDirty = true; // saved from process(), not on every packet
         }
     }
 
@@ -440,46 +432,23 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
     sensors[index].rssi = rssi;
     sensors[index].lastSeen = millis();
 
-    const bool shouldForward = WiFi.status() == WL_CONNECTED;
-    SensorData forwardSnapshot;
-    if (shouldForward)
+    if (sensors[index].customUrl.length() == 0)
     {
-        // Copy the exact values produced by this packet, then release the
-        // sensor lock before DNS/connect/read can block.
-        forwardSnapshot = sensors[index];
+        return true;
     }
+    if (!uplink->isOnline())
+    {
+        logger.debug("Not forwarding data - offline");
+        return true;
+    }
+    // The HTTP request blocks for up to seconds; web handlers wait on the lock
+    SensorData copy = sensors[index];
     lock.unlock();
-
-    if (shouldForward)
-    {
-        forwardSensorSnapshot(forwardSnapshot);
-    }
-    else
-    {
-        logger.debug("Not forwarding data - WiFi not connected");
-    }
-
+    forwardSensorData(copy);
     return true;
 }
 
-bool SensorManager::forwardSensorData(int index)
-{
-    SensorData snapshot;
-    {
-        std::lock_guard<std::mutex> lock(sensorMutex);
-        if (index < 0 || static_cast<size_t>(index) >= sensorCount ||
-            !sensors[index].configured)
-        {
-            logger.warning("Attempt to forward data for non-existent sensor at index " + String(index));
-            return false;
-        }
-        snapshot = sensors[index];
-    }
-
-    return forwardSensorSnapshot(snapshot);
-}
-
-bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
+bool SensorManager::forwardSensorData(const SensorData &sensor)
 {
     if (!sensor.configured)
     {
@@ -493,11 +462,17 @@ bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
         return true;
     }
 
-    // Create a WiFi client for HTTP request
-    HTTPClient http;
-    http.setTimeout(3000); // keep operations short to avoid WDT/starvation
+    // DNS has no timeout of its own and a TLS handshake can be slow; the
+    // loop task stays off the watchdog for this request
+    WatchdogPause pause;
+
+    // Clients first: ~HTTPClient() may still touch its client (stop()), so
+    // they must outlive it
     WiFiClient plainClient;
-    WiFiClientSecure *secureClientPtr = nullptr; // allocated only for HTTPS and deleted after use
+    std::unique_ptr<WiFiClientSecure> secureClient; // only for HTTPS
+    HTTPClient http;
+    http.setTimeout(3000);
+    http.setConnectTimeout(3000);
     http.setReuse(false);
 
     // Format the custom URL by replacing placeholders
@@ -565,9 +540,16 @@ bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
     // For HTTPS, use a secure client, but ensure we delete it after the request
     if (isHttps)
     {
-        secureClientPtr = new WiFiClientSecure();
-        configurePublicCaTls(*secureClientPtr);
-        http.begin(*secureClientPtr, url);
+        // A TLS session needs ~40 kB (Pro: next to an MQTT TLS session)
+        if (ESP.getFreeHeap() < 48000 || ESP.getMaxAllocHeap() < 24000)
+        {
+            logger.warning("Not forwarding sensor data - not enough memory for HTTPS");
+            return false;
+        }
+        secureClient.reset(new WiFiClientSecure());
+        configurePublicCaTls(*secureClient);
+        secureClient->setHandshakeTimeout(5);
+        http.begin(*secureClient, url);
     }
     else
     {
@@ -581,11 +563,8 @@ bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
     if (httpCode > 0)
     {
         logger.debug("HTTP request sent, response code: " + String(httpCode));
-        if (httpCode == HTTP_CODE_OK)
-        {
-            String payload = http.getString();
-            logger.debug("Response: " + payload.substring(0, 100)); // Only log first 100 chars
-        }
+        // The body is not read: only the status matters, and an endpoint
+        // could send an unbounded (chunked) reply
     }
     else
     {
@@ -593,11 +572,6 @@ bool SensorManager::forwardSensorSnapshot(const SensorData &sensor)
     }
 
     http.end();
-    if (secureClientPtr)
-    {
-        delete secureClientPtr;
-        secureClientPtr = nullptr;
-    }
 
     return (httpCode == HTTP_CODE_OK);
 }
@@ -637,6 +611,15 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     }
 
     const SensorData previous = sensors[index];
+    const bool wasPendingAdd = pendingAdds[index];
+    // Another sensor now (type or serial number changed): its readings, rain
+    // totals and health counters do not belong to it
+    if (sensors[index].deviceType != deviceType || sensors[index].serialNumber != serialNumber)
+    {
+        SensorData fresh;
+        fresh.configured = true;
+        sensors[index] = fresh;
+    }
 
     // Update basic configuration
     sensors[index].name = name;
@@ -657,10 +640,12 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     sensors[index].rainAmountCorrection = rainAmountCorr;
     sensors[index].rainRateCorrection = rainRateCorr;
 
+    pendingAdds[index] = false; // This save includes the complete new configuration.
     logger.info("Updated configuration for sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
     if (!saveSensors(false))
     {
         sensors[index] = previous;
+        pendingAdds[index] = wasPendingAdd;
         logger.error("Sensor configuration update rolled back because persistence failed");
         return false;
     }
@@ -720,6 +705,7 @@ std::vector<SensorData> SensorManager::getAllSensors() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<SensorData> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; i++)
     {
         result.push_back(sensors[i]);
@@ -732,6 +718,7 @@ std::vector<ActiveSensorEntry> SensorManager::getActiveSensorEntries() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<ActiveSensorEntry> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; ++i)
     {
         if (sensors[i].configured)
@@ -748,6 +735,7 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     std::vector<SensorData> result;
+    result.reserve(sensorCount);
     for (size_t i = 0; i < sensorCount; i++)
     {
         if (sensors[i].configured)
@@ -758,6 +746,31 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
     return result;
 }
 
+bool SensorManager::getSensorCopy(int index, SensorData &out) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (index < 0 || index >= (int)sensorCount || !sensors[index].configured)
+    {
+        return false;
+    }
+    out = sensors[index];
+    return true;
+}
+
+// Rain totals: at most one flash write per interval
+static constexpr unsigned long RAIN_SAVE_INTERVAL = 600000;
+
+void SensorManager::process(unsigned long now)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (rainDirty && now - lastRainSave > RAIN_SAVE_INTERVAL)
+    {
+        // Next attempt after a full interval even when this one fails
+        lastRainSave = now;
+        saveSensorsLocked();
+    }
+}
+
 // Save sensor configuration to file
 bool SensorManager::saveSensors(bool lockMutex)
 {
@@ -766,10 +779,17 @@ bool SensorManager::saveSensors(bool lockMutex)
     {
         lock.lock();
     }
+    return saveSensorsLocked();
+}
 
+// Caller holds sensorMutex; the previous file survives every failed save.
+bool SensorManager::saveSensorsLocked()
+{
     // A parse/open failure must not turn a recoverable sensors.json into an
     // empty or partial file on the next web request.
-    if (!storageLoadedSuccessfully && LittleFS.exists(sensorsFile))
+    const String temporaryPath = String(sensorsFile) + ".tmp";
+    if (!storageLoadedSuccessfully &&
+        (LittleFS.exists(sensorsFile) || LittleFS.exists(temporaryPath.c_str())))
     {
         logger.error("Refusing to overwrite sensor configuration after a failed load");
         return false;
@@ -779,7 +799,7 @@ bool SensorManager::saveSensors(bool lockMutex)
     size_t copiedStringBytes = 0;
     for (size_t i = 0; i < sensorCount; ++i)
     {
-        if (!sensors[i].configured)
+        if (!sensors[i].configured || pendingAdds[i])
         {
             continue;
         }
@@ -790,12 +810,17 @@ bool SensorManager::saveSensors(bool lockMutex)
 
     DynamicJsonDocument doc(
         SensorStoragePolicy::documentCapacity(configuredCount, copiedStringBytes));
+    if (doc.capacity() == 0)
+    {
+        logger.error("Not enough memory to save the sensor configuration");
+        return false;
+    }
     JsonArray sensorArray = doc.createNestedArray("sensors");
 
     // Add sensors to JSON
     for (size_t i = 0; i < sensorCount; i++)
     {
-        if (sensors[i].configured)
+        if (sensors[i].configured && !pendingAdds[i])
         {
             JsonObject sensor = sensorArray.createNestedObject();
             sensor["deviceType"] = static_cast<uint8_t>(sensors[i].deviceType);
@@ -840,7 +865,6 @@ bool SensorManager::saveSensors(bool lockMutex)
     // Write a complete temporary file first. LittleFS rename uses the
     // filesystem's atomic replacement operation, so the previous file remains
     // valid until the new file has been fully flushed and closed.
-    const String temporaryPath = String(sensorsFile) + ".tmp";
     File file = LittleFS.open(temporaryPath.c_str(), "w");
     if (!file)
     {
@@ -867,6 +891,8 @@ bool SensorManager::saveSensors(bool lockMutex)
     }
 
     storageLoadedSuccessfully = true;
+    rainDirty = false;
+    lastRainSave = millis();
     logger.info("Saved " + String(sensorArray.size()) + " sensors to " + String(sensorsFile));
     return true;
 }
@@ -876,6 +902,19 @@ bool SensorManager::loadSensors()
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
 
+    // Power lost between removing the old file and renaming the new one
+    String tmpFile = String(sensorsFile) + ".tmp";
+    if (!LittleFS.exists(sensorsFile) && LittleFS.exists(tmpFile))
+    {
+        logger.warning("Recovering sensor configuration from " + tmpFile);
+        if (!LittleFS.rename(tmpFile, sensorsFile))
+        {
+            logger.error("Failed to recover temporary sensor configuration; preserving it");
+            storageLoadedSuccessfully = false;
+            return false;
+        }
+    }
+
     // Check if file exists
     if (!LittleFS.exists(sensorsFile))
     {
@@ -883,6 +922,7 @@ bool SensorManager::loadSensors()
         for (size_t i = 0; i < MAX_SENSORS; ++i)
         {
             sensors[i] = SensorData();
+            pendingAdds[i] = false;
         }
         storageLoadedSuccessfully = true;
         logger.info("Sensors file not found: " + String(sensorsFile) + ", starting with empty configuration");
@@ -1000,6 +1040,7 @@ bool SensorManager::loadSensors()
     for (size_t i = 0; i < MAX_SENSORS; ++i)
     {
         sensors[i] = SensorData();
+        pendingAdds[i] = false;
     }
     sensorCount = loadedSensors.size();
     for (size_t i = 0; i < sensorCount; ++i)
@@ -1046,6 +1087,7 @@ void SensorManager::tickSensorHealth(unsigned long nowMillis)
         if (sensors[i].configured)
         {
             SensorHealth::advanceBucketsIfNeeded(sensors[i].health, nowMillis);
+            SensorHealth::latchStale(sensors[i].health, nowMillis);
         }
     }
 }

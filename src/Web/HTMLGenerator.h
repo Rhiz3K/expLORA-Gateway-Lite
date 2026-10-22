@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * HTML content generator header file
  *
@@ -22,10 +22,10 @@
 #pragma once
 
 #include <Arduino.h>
-#include <mutex>
 #include <vector>
 #include "../Data/SensorData.h"
 #include "../Data/Logging.h"
+#include "../Storage/ConfigManager.h"
 
 /**
  * Class for generating HTML content
@@ -36,20 +36,9 @@
 class HTMLGenerator
 {
 private:
-    // Buffer for generating HTML content
-    static char *htmlBuffer;
-    static size_t htmlBufferSize;
-    static bool usePSRAM;
-    static std::mutex htmlBufferMutex;
-
-    // Buffer initialization
-    static bool initBuffer();
-
-    // Free buffer
-    static void freeBuffer();
 
     // Add HTML opening code
-    static void addHtmlHeader(String &html, const String &title, bool isAPMode = false);
+    static void addHtmlHeader(String &html, const String &title, bool isAPMode = false, bool navigation = true);
 
     // Add HTML closing code
     static void addHtmlFooter(String &html, bool isAPMode = false);
@@ -64,21 +53,27 @@ private:
     static void addNavigation(String &html, const String &activePage);
 
 public:
-    // Initialize generator
-    static bool init(bool usePsram = true, size_t bufferSize = 32768);
-
-    // Free resources
-    static void deinit();
+    // Escape text for HTML content and quoted attributes
+    static String htmlEscape(const String &text);
 
     // Generate home page
     static String generateHomePage(const std::vector<SensorData> &sensors);
 
     // Generate configuration page
+    static void addWiFiForm(String &html, const String &ssid, bool hasPassword, const String &timezone);
     static String generateConfigPage(const String &ssid, bool hasPassword, bool configMode, const String &ip, const String &timezone);
 
     // Generate MQTT settings page
     static String generateMqttPage(const String &host, int port, const String &user, bool hasPassword, bool enabled, bool tls,
                                     const String &prefix, bool haEnabled, String &haPrefix);
+
+    // Login and admin password pages
+    static String generateLoginPage(bool hasPassword, const String &error, const String &next);
+    static String generatePasswordPage(bool hasPassword, const String &error, bool apMode);
+
+    // Generating network page (uplink status, WiFi, ethernet and LTE settings)
+    static String generateNetworkPage(const ConfigManager &config, const String &ssid, bool hasPassword,
+                                      const String &timezone, bool apMode);
 
     // Generate sensor list page
     static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors);
@@ -90,22 +85,23 @@ public:
     static String generateSensorEditPage(const SensorData &sensor, int index);
 
     // Generate logs page
-    static String generateLogsPage(const std::vector<LogEntry> &logs, LogLevel currentLevel);
+    // Logs page in pieces, streamed by the web server (see handleLogs)
+    static String generateLogsPageHead(LogLevel currentLevel);
+    static String generateLogEntry(const LogEntry &entry);
+    static String generateLogsPageTail();
 
     // Generate API page
     static String generateAPIPage(const std::vector<SensorData> &sensors);
 
     // Generate JSON for API
-    static String generateAPIJson(const std::vector<SensorData> &sensors);
+    // JSON document for /api (serialized by the caller into a sized buffer)
+    static DynamicJsonDocument buildAPIJson(const std::vector<SensorData> &sensors);
 
     // Generate firmware update page
     static String generateFirmwarePage();
-
-    // Generate credential rotation page
     static String generateSecurityPage(const String &apName);
 
-    // Optimized log rendering using a bounded buffer
-    static void generateLogTable(char *buffer, size_t &maxLen, const std::vector<LogEntry> &logs);
+    // Optimized versions using buffer
 
     // Additional helper methods
     static String getWifiNetworkOptions(const String &currentSSID);

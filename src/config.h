@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite
+ * expLORA Gateway
  *
  * Main configuration file for the expLORA Gateway
  *
@@ -23,69 +23,29 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.14-dev-correctness.6"
+#define FIRMWARE_VERSION "1.2.1-dev-security.1"
 
-// OTA Configuration
-// NOTE: The manifest lives at the legacy flat path on the official server
-// (verified 2026-07-25). `SecurityPolicy::isAllowedFirmwareUrl` accepts the
-// manifest's `url` field only if it points under /webflash/explora-gw-lite/,
-// so the manifest's `url` is intentionally NOT hard-coded here.
-#define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
-#define HTTP_ADMIN_USERNAME "admin"
+// OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
+#include "board_config.h"
 
-// LoRa registers
-#define REG_FIFO 0x00
-#define REG_OP_MODE 0x01
-#define REG_FRF_MSB 0x06
-#define REG_FRF_MID 0x07
-#define REG_FRF_LSB 0x08
-#define REG_PA_CONFIG 0x09
-#define REG_OCP 0x0B
-#define REG_LNA 0x0C
-#define REG_FIFO_ADDR_PTR 0x0D
-#define REG_FIFO_TX_BASE_ADDR 0x0E
-#define REG_FIFO_RX_BASE_ADDR 0x0F
-#define REG_FIFO_RX_CURRENT_ADDR 0x10
-#define REG_IRQ_FLAGS 0x12
-#define REG_RX_NB_BYTES 0x13
-#define REG_PKT_SNR_VALUE 0x19
-#define REG_PKT_RSSI_VALUE 0x1A
-#define REG_MODEM_CONFIG_1 0x1D
-#define REG_MODEM_CONFIG_2 0x1E
-#define REG_SYMB_TIMEOUT_LSB 0x1F
-#define REG_PREAMBLE_MSB 0x20
-#define REG_PREAMBLE_LSB 0x21
-#define REG_PAYLOAD_LENGTH 0x22
-#define REG_MODEM_CONFIG_3 0x26
-#define REG_FREQ_ERROR_MSB 0x28
-#define REG_FREQ_ERROR_MID 0x29
-#define REG_FREQ_ERROR_LSB 0x2A
-#define REG_RSSI_WIDEBAND 0x2C
-#define REG_DETECTION_OPTIMIZE 0x31
-#define REG_INVERTIQ 0x33
-#define REG_DETECTION_THRESHOLD 0x37
-#define REG_SYNC_WORD 0x39
-#define REG_INVERTIQ2 0x3B
-#define REG_DIO_MAPPING_1 0x40
-#define REG_VERSION 0x42
-#define REG_PA_DAC 0x4D
-
-// LoRa modes
-#define MODE_LONG_RANGE_MODE 0x80
-#define MODE_SLEEP 0x00
-#define MODE_STDBY 0x01
-#define MODE_TX 0x03
-#define MODE_RX_CONTINUOUS 0x05
-#define MODE_RX_SINGLE 0x06
-#define MODE_CAD 0x07
+// LoRa radio parameters - must match the sensors (receive only)
+#define LORA_FREQUENCY_MHZ 868.0
+#define LORA_BANDWIDTH_KHZ 125.0
+#define LORA_SPREADING_FACTOR 9
+#define LORA_CODING_RATE 5      // 4/5
+#define LORA_SYNC_WORD 0x12     // private network (SX126x: 0x1424)
+#define LORA_PREAMBLE_LENGTH 16
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
 #define MAX_SENSOR_NAME_LENGTH 96     // Persisted sensor display name
 #define MAX_SENSOR_CUSTOM_URL_LENGTH 512 // Persisted forwarding URL
-#define LOG_BUFFER_SIZE 150           // Size of log buffer
+#ifndef LOG_BUFFER_SIZE
+#define LOG_BUFFER_SIZE 150           // Size of log buffer (entries)
+#endif
 #define AP_TIMEOUT 300000             // AP mode timeout (5 minutes in milliseconds)
 #define WIFI_RECONNECT_INTERVAL 60000 // WiFi reconnect attempt interval (1 minute in milliseconds)
 #define WDT_TIMEOUT 10                // Watchdog timeout in seconds
@@ -110,16 +70,40 @@ inline String formatHex(uint32_t value, uint8_t width)
 #define formatSN(val) formatHex(val, 6)
 #define formatKey(val) formatHex(val, 8)
 
+// WiFi station MAC from eFuse. Unlike WiFi.macAddress() it is valid before
+// the WiFi driver starts (Arduino core 3.x returns zeros until then).
+inline void getStationMac(uint8_t mac[6])
+{
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+}
+
 // Generate the unique AP SSID for this device from its MAC address.
 // Format: "expLORA-GW-XXXXXX" where XXXXXX is the last 3 bytes of the MAC in uppercase hex.
 inline String makeApName()
 {
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    return "expLORA-GW-" + mac.substring(6);
+    uint8_t mac[6];
+    getStationMac(mac);
+    char suffix[7];
+    snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    return "expLORA-GW-" + String(suffix);
 }
 
-#define NTP_SERVER "pool.ntp.org"
+// NTP: up to three servers; a server announced by DHCP takes the first slot.
+// SNTP re-syncs every 3 h (CONFIG_LWIP_SNTP_UPDATE_DELAY); between syncs and
+// when a sync fails the clock keeps running.
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.cloudflare.com"
+#define NTP_SERVER_3 "time.google.com"
+#define TIME_STALE_AFTER_S (24 * 3600) // no successful sync for this long = stale
+// Timezones offered in the WiFi form (POSIX TZ, label)
+#define TIMEZONE_OPTIONS                                                  \
+    {                                                                     \
+        {"GMT0", "GMT/UTC (00:00)"},                                      \
+        {"WET0WEST,M3.5.0/1,M10.5.0", "Western European (WET/WEST)"},     \
+        {"CET-1CEST,M3.5.0,M10.5.0/3", "Central European (CET/CEST)"},    \
+        {"EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern European (EET/EEST)"},  \
+        {"MSK-3", "Moscow Time (MSK)"},                                   \
+    }
 #define DEFAULT_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3" // Central European Time with auto DST
 
 // MQTT Configuration
@@ -134,6 +118,10 @@ inline String makeApName()
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"
 
+// LTE defaults (boards with HAS_LTE)
+#define LTE_DEFAULT_ENABLED false
+#define LTE_DEFAULT_APN "" // empty = APN assigned by the network
+
 // Webserver ports
 #define HTTP_PORT 80 // HTTP server port
 #define DNS_PORT 53  // DNS server port
@@ -144,8 +132,6 @@ inline String makeApName()
 #define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2
 #define SENSOR_TYPE_METEO    0x03  // Meteorological station
 #define SENSOR_TYPE_VEML7700 0x04  // Light sensor (LUX)
+#define SENSOR_TYPE_SHT40    0x05  // Temperature, humidity
 #define SENSOR_TYPE_DIY_TEMP 0x51  // Temperature
 // Add additional sensor types here...
-
-// PSRAM configuration for web server
-#define WEB_BUFFER_SIZE 16384 // Reduced to 16KB

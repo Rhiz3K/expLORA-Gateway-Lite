@@ -48,6 +48,16 @@ void test_illuminance_discovery_plan()
         {"illuminance", "battery", "rssi"});
 }
 
+void test_sht40_discovery_plan()
+{
+    MQTTDiscoveryPlan::Capabilities capabilities;
+    capabilities.temperature = true;
+    capabilities.humidity = true;
+    assertValues(
+        valuesFor(capabilities),
+        {"temperature", "humidity", "battery", "rssi"});
+}
+
 void test_meteo_discovery_plan()
 {
     MQTTDiscoveryPlan::Capabilities capabilities;
@@ -74,6 +84,7 @@ int main(int, char **)
 {
     UNITY_BEGIN();
     RUN_TEST(test_clima_discovery_plan);
+    RUN_TEST(test_sht40_discovery_plan);
     RUN_TEST(test_illuminance_discovery_plan);
     RUN_TEST(test_meteo_discovery_plan);
     return UNITY_END();

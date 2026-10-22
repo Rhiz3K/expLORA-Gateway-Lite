@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration smoke test for an expLORA Gateway Lite device.
+Integration smoke test for an expLORA Gateway device (Lite or Pro).
 
 Two operating modes:
 
@@ -9,11 +9,11 @@ Two operating modes:
    Reads everything from an INI file: home WiFi credentials, sensor key,
    sensor SN, gateway IP, serial port. If the gateway's IP from the config
    responds, the script jumps straight to the test phase. If not, the script
-   provisions the device automatically:
+   provisions the device only when --provision is supplied:
      - reads UART to discover the gateway's AP SSID and separate AP/admin credentials
      - (macOS) switches WiFi to that AP via `networksetup`
        (non-macOS) prints instructions and waits for ENTER
-     - joins the protected AP and uses HTTP Basic auth for /config
+     - joins the protected AP and logs in with a session cookie for /config
      - watches UART for "WiFi connected! IP: x.x.x.x" after the reboot
      - switches back to the home WiFi
      - runs the full HTTP test suite against the discovered IP
@@ -62,6 +62,8 @@ except ImportError:
     print("ERROR: this script needs 'requests'. Run:  pip install requests")
     sys.exit(2)
 
+from gateway_auth import ensure_login
+
 # pyserial is only required when the config-file flow needs UART access.
 # Import lazily so the CLI-args legacy mode still works without it.
 try:
@@ -103,6 +105,7 @@ class Config:
     wifi_interface: str = "en0"
     admin_username: str = "admin"
     admin_credential: str = ""
+    admin_password: str = ""
     ap_credential: str = ""
     # Backward-compatible alias for pre-split private config files.
     access_credential: str = ""
@@ -122,7 +125,7 @@ class Config:
     flash_before_test: bool = False
     rebuild_before_flash: bool = False
     erase_before_flash: bool = False
-    pio_env: str = "esp32-s3-devkitc-1"
+    pio_env: str = "lite"
 
 
 def load_config(path: str) -> Config:
@@ -149,6 +152,9 @@ def load_config(path: str) -> Config:
         cfg.ap_credential = parser.get(
             "gateway", "ap_credential", fallback=cfg.access_credential
         ).strip()
+        cfg.admin_password = parser.get(
+            "gateway", "admin_password", fallback=cfg.admin_credential
+        ).strip() or cfg.admin_credential
     if parser.has_section("wifi"):
         cfg.home_ssid     = parser.get("wifi", "ssid", fallback="").strip()
         cfg.home_password = parser.get("wifi", "password", fallback="").strip()
@@ -165,11 +171,7 @@ def load_config(path: str) -> Config:
         cfg.flash_before_test    = parser.getboolean("flash", "before_test", fallback=False)
         cfg.rebuild_before_flash = parser.getboolean("flash", "rebuild", fallback=False)
         cfg.erase_before_flash   = parser.getboolean("flash", "erase", fallback=False)
-        cfg.pio_env              = parser.get("flash", "pio_env", fallback="esp32-s3-devkitc-1").strip()
-
-    if not cfg.home_ssid:
-        print(f"{RED}ERROR:{RESET} [wifi].ssid is required in {path}")
-        sys.exit(2)
+        cfg.pio_env              = parser.get("flash", "pio_env", fallback="lite").strip()
 
     return cfg
 
@@ -466,7 +468,7 @@ def flash_device(env: str, rebuild: bool, erase: bool) -> None:
 # Regex patterns matching the firmware's serial log. We try several places
 # the SSID can show up because exact timing relative to when we start
 # reading is fragile — whichever line we catch first wins.
-RE_BOOT_BANNER = r"expLORA Gateway Lite starting up"
+RE_BOOT_BANNER = r"expLORA Gateway \w+ starting up"  # Lite / Pro
 RE_STA_IP      = r"WiFi connected[^!]*! IP: (\d+\.\d+\.\d+\.\d+)"
 
 # Each of these has the SSID as the first capture group. Order matters
@@ -609,12 +611,10 @@ def discover_bootstrap(
 
 def _http_alive(
     url: str,
-    username: str,
-    credential: str,
     timeout: float = 3.0,
 ) -> bool:
     try:
-        resp = requests.get(url, auth=(username, credential), timeout=timeout)
+        resp = requests.get(url, timeout=timeout)
         return resp.status_code == 200
     except requests.exceptions.RequestException:
         return False
@@ -636,6 +636,9 @@ def provision_gateway(cfg: Config) -> str:
     """
     print(f"\n{BOLD}{CYAN}== Provisioning gateway =={RESET}")
 
+    if not cfg.home_ssid:
+        raise RuntimeError("[wifi].ssid is required for provisioning")
+
     port = cfg.serial_port or autodetect_serial_port()
     if not port:
         raise RuntimeError(
@@ -645,6 +648,17 @@ def provision_gateway(cfg: Config) -> str:
 
     monitor = SerialMonitor(port, baud=cfg.serial_baud, echo=True)
     monitor.start()
+    on_gateway_ap = False
+
+    def switch_home():
+        nonlocal on_gateway_ap
+        if cfg.home_password:
+            wifi_switch(cfg.wifi_interface, cfg.home_ssid, cfg.home_password)
+        else:
+            # Even for open home networks, the user just specified the SSID
+            wifi_switch(cfg.wifi_interface, cfg.home_ssid)
+        on_gateway_ap = False
+
     try:
         # 1. Trigger a clean reset so we know we're catching the boot
         # output from line one (not mid-way through it). On boards without
@@ -658,7 +672,7 @@ def provision_gateway(cfg: Config) -> str:
             monitor,
             prefix=cfg.ap_ssid_prefix,
             configured_ap_credential=cfg.ap_credential,
-            configured_admin_credential=cfg.admin_credential,
+            configured_admin_credential=cfg.admin_password or cfg.admin_credential,
             timeout=20,
         )
         if not ap_ssid:
@@ -674,18 +688,18 @@ def provision_gateway(cfg: Config) -> str:
             )
         cfg.ap_credential = ap_credential
         cfg.admin_credential = admin_credential
+        cfg.admin_password = admin_credential
         cfg.access_credential = admin_credential
         info_(f"  using AP SSID: {ap_ssid}")
 
         # 3. Switch host WiFi to the gateway AP
+        on_gateway_ap = True
         if not wifi_switch(cfg.wifi_interface, ap_ssid, ap_credential):
             raise RuntimeError(f"failed to switch WiFi to {ap_ssid!r}")
 
         # 4. Confirm the AP is reachable
         if not _http_alive(
-            "http://192.168.4.1/config",
-            cfg.admin_username,
-            admin_credential,
+            "http://192.168.4.1/firmware/version",
         ):
             raise RuntimeError(
                 "WiFi switched but http://192.168.4.1 unreachable — is the "
@@ -696,17 +710,20 @@ def provision_gateway(cfg: Config) -> str:
         # 5. POST credentials. Don't worry about response — device reboots
         # ~1.5 s later (handleClient deferred restart) so the response may
         # not finish cleanly.
+        info_("  logging in")
+        session = requests.Session()
+        ensure_login(session, "http://192.168.4.1", cfg.admin_password)
+
         info_("  POSTing /config (WiFi creds)")
         monitor.drain()
         try:
-            requests.post(
+            session.post(
                 "http://192.168.4.1/config",
                 data={
                     "ssid": cfg.home_ssid,
                     "password": cfg.home_password,
                     "timezone": cfg.timezone,
                 },
-                auth=(cfg.admin_username, admin_credential),
                 timeout=5,
             )
         except requests.exceptions.RequestException as e:
@@ -729,11 +746,7 @@ def provision_gateway(cfg: Config) -> str:
 
         # 7. Switch host back to home WiFi
         info_("\n  switching host WiFi back to home network …")
-        if cfg.home_password:
-            wifi_switch(cfg.wifi_interface, cfg.home_ssid, cfg.home_password)
-        else:
-            # Even for open home networks, the user just specified the SSID
-            wifi_switch(cfg.wifi_interface, cfg.home_ssid)
+        switch_home()
 
         # 8. Confirm we can reach the device on the home network
         info_("  confirming gateway is reachable from host …")
@@ -741,8 +754,6 @@ def provision_gateway(cfg: Config) -> str:
         while time.time() < ok_deadline:
             if _http_alive(
                 f"http://{new_ip}/firmware/version",
-                cfg.admin_username,
-                admin_credential,
             ):
                 info_(f"  reachable at http://{new_ip}")
                 return new_ip
@@ -753,6 +764,10 @@ def provision_gateway(cfg: Config) -> str:
 
     finally:
         monitor.stop()
+        # Never leave the host on the gateway AP after an error
+        if on_gateway_ap:
+            info_("\n  provisioning failed - switching host WiFi back to home network …")
+            switch_home()
 
 
 def pass_(name: str, detail: str = ""):
@@ -806,15 +821,13 @@ class Runner:
     def __init__(
         self,
         base_url: str,
-        username: str,
-        access_credential: str,
         verbose: bool = False,
     ):
         self.base = base_url.rstrip("/")
         self.verbose = verbose
         self.failures: List[str] = []
         self.session = requests.Session()
-        self.session.auth = (username, access_credential)
+        self.admin_password = ""
         # short timeout — device on local network should respond fast
         self.session.headers.update({"User-Agent": "explora-integration-test/1.0"})
 
@@ -925,11 +938,10 @@ def t_config_page(r: Runner) -> str:
 
 
 def t_unauthorized_management_is_rejected(r: Runner) -> str:
-    resp = requests.get(f"{r.base}/config", timeout=5)
-    assert_status(resp, [401])
-    if "basic" not in resp.headers.get("WWW-Authenticate", "").lower():
-        raise TestFailed("401 response does not advertise HTTP Basic authentication")
-    return "401 + Basic challenge"
+    resp = requests.get(f"{r.base}/config", allow_redirects=False, timeout=5)
+    assert_status(resp, [302, 303])
+    assert_in("/login", resp.headers.get("Location", ""), "management login redirect")
+    return "redirected to login"
 
 
 def t_unauthorized_firmware_upload_rejected(r: Runner) -> str:
@@ -937,21 +949,23 @@ def t_unauthorized_firmware_upload_rejected(r: Runner) -> str:
     a tiny unauthorized upload must be rejected with 401 and must not leave
     the global Update state in a half-open condition."""
     files = {"file": ("firmware.bin", b"unauthorized-firmware-bytes", "application/octet-stream")}
-    resp = requests.post(f"{r.base}/firmware", files=files, timeout=5)
+    resp = requests.post(f"{r.base}/firmware", files=files, allow_redirects=False, timeout=5)
     assert_status(resp, [401])
-    if "basic" not in resp.headers.get("WWW-Authenticate", "").lower():
-        raise TestFailed("401 response does not advertise HTTP Basic authentication")
     # The very next authenticated /firmware/version probe should still work
     # (i.e. the rejected upload must not have left the server wedged).
-    follow = requests.get(
-        f"{r.base}/firmware/version", auth=r.session.auth, timeout=5
-    )
+    follow = r.get("/firmware/status")
     assert_status(follow, [200])
-    return "401 + Basic challenge; server still healthy"
+    if follow.json().get("inProgress"):
+        raise TestFailed("unauthorized upload acquired the OTA lock")
+    return "401; authenticated OTA status remains idle"
 
 
 def t_firmware_manifest_check(r: Runner) -> str:
     resp = r.get("/firmware/check", timeout=10)
+    deadline = time.monotonic() + 30
+    while resp.status_code == 202 and time.monotonic() < deadline:
+        time.sleep(0.25)
+        resp = r.get("/firmware/check", timeout=10)
     assert_status(resp, [200])
     body = resp.json()
     for key in ("version", "currentVersion", "installable"):
@@ -1002,7 +1016,7 @@ def t_invalid_digest_upload_cleans_up(r: Runner) -> str:
     if status.get("inProgress"):
         raise TestFailed(f"rejected upload left OTA busy: {status}")
     assert_status(r.get("/firmware/version"), [200])
-    return "bad digest rejected; OTA lock released"
+    return "invalid image/digest rejected; OTA lock released"
 
 
 def t_root(r: Runner) -> str:
@@ -1293,6 +1307,32 @@ def t_sensor_health_badge_after_packet(r: Runner, sn: str) -> str:
     return "Healthy badge present in HTML"
 
 
+# ----------------------------------------------------------------- login
+
+def t_login_required(r: Runner) -> str:
+    resp = requests.get(r.base + "/sensors", allow_redirects=False, timeout=5)
+    assert_status(resp, [302, 303])
+    location = resp.headers.get("Location", "")
+    if "/login" not in location:
+        raise TestFailed(f"redirect to {location!r}, expected /login")
+    resp = requests.post(r.base + "/sensors/add", data={"name": "x"}, allow_redirects=False, timeout=5)
+    assert_status(resp, [401])
+    return "OK"
+
+
+def t_api_public(r: Runner) -> str:
+    resp = requests.get(r.base + "/api?format=json", allow_redirects=False, timeout=5)
+    assert_status(resp, [200])
+    return "OK"
+
+
+def t_wrong_password_rejected(r: Runner) -> str:
+    resp = requests.post(r.base + "/login", data={"password": "definitely-wrong-password"},
+                         allow_redirects=False, timeout=10)
+    assert_status(resp, [401])
+    return "OK"
+
+
 # --------------------------------------------------------------- reboot
 
 def t_reboot_round_trip(r: Runner, current_version: str) -> str:
@@ -1343,6 +1383,8 @@ def t_reboot_round_trip(r: Runner, current_version: str) -> str:
                 body = resp.json()
                 returned = body.get("version")
                 if returned == current_version:
+                    # Sessions live in RAM - log in again for later tests
+                    ensure_login(r.session, r.base, r.admin_password)
                     return f"back after reboot, version={returned}"
                 else:
                     raise TestFailed(
@@ -1365,13 +1407,17 @@ def main():
     # In legacy mode, --url is required.
     parser.add_argument(
         "--config",
-        help="INI config file (recommended). When set, --url becomes optional "
-        "and the script can auto-provision via UART + WiFi switching.",
+        help="INI config file (recommended). --url becomes optional; "
+        "USB/WiFi provisioning additionally requires --provision.",
     )
     parser.add_argument(
         "--url",
         help="Base URL of the gateway (legacy mode). Ignored when --config is given "
         "and the configured IP responds.",
+    )
+    parser.add_argument(
+        "--provision", action="store_true",
+        help="Explicitly allow USB provisioning and host WiFi switching when the gateway is unreachable",
     )
     parser.add_argument(
         "--admin-username",
@@ -1425,7 +1471,12 @@ def main():
         type=int,
         default=1,
         help="Sensor type code: 1=BME280, 2=SCD40, 3=METEO, "
-        "4=VEML7700 (reserved, not in UI), 0x51=DIY_TEMP (default: 1)",
+        "4=VEML7700 (reserved, not in UI), 5=SHT40, 0x51=DIY_TEMP (default: 1)",
+    )
+    parser.add_argument(
+        "--admin-password",
+        default="",
+        help="Web administrator password used for cookie login",
     )
     parser.add_argument(
         "--packet-timeout",
@@ -1471,10 +1522,13 @@ def main():
         if args.ap_credential:
             cfg.ap_credential = args.ap_credential
         access_credential = (
-            args.admin_credential
+            args.admin_password
+            or args.admin_credential
             or args.access_credential
+            or cfg.admin_password
             or cfg.admin_credential
         )
+        cfg.admin_password = access_credential
     else:
         # Legacy CLI-args mode: --url is required
         if not args.url:
@@ -1487,7 +1541,7 @@ def main():
         packet_timeout = args.packet_timeout
         skip_reboot    = args.skip_reboot
         admin_username = args.admin_username or "admin"
-        access_credential = args.admin_credential or args.access_credential
+        access_credential = args.admin_password or args.admin_credential or args.access_credential
 
     if sensor_sn and not sensor_key:
         print(f"{RED}ERROR:{RESET} sensor key required when SN is set (CLI: --test-sensor-key, config: [test_sensor].key)")
@@ -1498,7 +1552,7 @@ def main():
     flash_now   = args.flash or args.rebuild or args.erase or (cfg.flash_before_test if cfg else False)
     rebuild_now = args.rebuild or (cfg.rebuild_before_flash if cfg else False)
     erase_now   = args.erase or (cfg.erase_before_flash if cfg else False)
-    pio_env     = cfg.pio_env if cfg else "esp32-s3-devkitc-1"
+    pio_env     = cfg.pio_env if cfg else "lite"
     if flash_now:
         try:
             flash_device(pio_env, rebuild=rebuild_now, erase=erase_now)
@@ -1517,20 +1571,21 @@ def main():
         if cfg.ip:
             candidate = f"http://{cfg.ip}"
             info_(f"trying configured gateway IP: {candidate}")
-            if access_credential and _http_alive(
+            if _http_alive(
                 f"{candidate}/firmware/version",
-                admin_username,
-                access_credential,
             ):
                 url = candidate
             else:
-                info_("  not reachable/authenticated — USB bootstrap discovery needed")
+                info_("  gateway not reachable at configured IP")
         if not url:
+            if not args.provision:
+                print(f"{RED}ERROR:{RESET} gateway unreachable; use --provision to explicitly allow WiFi switching")
+                return 2
             try:
                 discovered = provision_gateway(cfg)
                 url = f"http://{discovered}"
                 admin_username = cfg.admin_username
-                access_credential = cfg.admin_credential
+                access_credential = cfg.admin_password or cfg.admin_credential
             except Exception as e:  # noqa: BLE001
                 print(f"\n{RED}ERROR during provisioning:{RESET} {e}")
                 return 2
@@ -1542,16 +1597,12 @@ def main():
     if not access_credential:
         print(
             f"{RED}ERROR:{RESET} admin credential is required "
-            "(--admin-credential or [gateway].admin_credential)"
+            "(--admin-password or [gateway].admin_password)"
         )
         return 2
 
-    r = Runner(
-        url,
-        username=admin_username,
-        access_credential=access_credential,
-        verbose=args.verbose,
-    )
+    r = Runner(url, verbose=args.verbose)
+    r.admin_password = access_credential
 
     # Sanity ping
     try:
@@ -1571,6 +1622,17 @@ def main():
     except Exception:
         has_configured_sensor = bool(sensor_sn)
 
+    section("Login")
+    r.run("pages require a login", lambda: t_login_required(r))
+    r.run("/api is public", lambda: t_api_public(r))
+    r.run("wrong password rejected", lambda: t_wrong_password_rejected(r))
+    try:
+        ensure_login(r.session, r.base, r.admin_password)
+        pass_("log in with the admin password")
+    except RuntimeError as e:
+        fail_("log in with the admin password", str(e))
+        return 1
+
     # ----------------------------------------------- Phase 1: setup (mutates)
     # Adding the sensor first means downstream smoke tests see the table
     # rendered (so they can assert the new health columns are present), and
@@ -1586,7 +1648,7 @@ def main():
 
     # ----------------------------------------------- Phase 2: read-only smoke
     section("Read-only smoke")
-    r.run("unauthenticated management request → 401", lambda: t_unauthorized_management_is_rejected(r))
+    r.run("unauthenticated management request → login", lambda: t_unauthorized_management_is_rejected(r))
     r.run("unauthenticated firmware upload → 401", lambda: t_unauthorized_firmware_upload_rejected(r))
     r.run("firmware version JSON", lambda: t_firmware_version(r))
     r.run("firmware manifest policy", lambda: t_firmware_manifest_check(r))

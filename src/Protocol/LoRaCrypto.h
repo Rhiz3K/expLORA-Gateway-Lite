@@ -1,5 +1,5 @@
 /**
- * expLORA Gateway Lite — LoRaCrypto
+ * expLORA Gateway — LoRaCrypto
  *
  * Pure, header-only implementations of the LoRa packet crypto primitives.
  * Intentionally free of Arduino / ESP32 dependencies so it can be linked
